@@ -35,6 +35,32 @@ class KhTradeManager:
             "tick_count": 2,  # 默认跳数为2，即买入时上浮0.02元，卖出时下调0.02元
             "ratio": 0.001  # 默认滑点比例0.1%
         })
+        
+        # 价格精度设置（小数位数），默认为2（股票），ETF为3
+        self.price_decimals = 2
+        
+        # T+0交易模式标识（默认关闭）
+        self.t0_mode = False
+    
+    def set_price_decimals(self, decimals: int):
+        """设置价格精度
+        
+        Args:
+            decimals: 小数位数，股票为2，ETF为3
+        """
+        self.price_decimals = decimals
+    
+    def set_t0_mode(self, enabled: bool):
+        """设置T+0交易模式
+        
+        Args:
+            enabled: True启用T+0模式（当天买入可当天卖出），False使用T+1模式
+        """
+        self.t0_mode = enabled
+        if enabled:
+            print("T+0交易模式已启用：当天买入的股票可当天卖出")
+        else:
+            print("T+1交易模式：当天买入的股票需等下一交易日才能卖出")
 
     def init(self):
         """初始化交易管理"""
@@ -64,6 +90,7 @@ class KhTradeManager:
             float: 考虑滑点后的价格
         """
         slippage_type = self.slippage["type"]
+        decimals = self.price_decimals  # 使用动态精度
         
         if slippage_type == "tick":
             # 按最小变动价跳数计算
@@ -72,20 +99,20 @@ class KhTradeManager:
             slippage = tick_size * tick_count
             
             if direction == "buy":
-                return round(price + slippage, 2)  # 确保结果精确到小数点后两位
+                return round(price + slippage, decimals)
             else:  # sell
-                return round(price - slippage, 2)  # 确保结果精确到小数点后两位
+                return round(price - slippage, decimals)
                 
         elif slippage_type == "ratio":
             # 按可变滑点百分比计算
             ratio = self.slippage["ratio"] / 2  # 滑点比例除以2
             
             if direction == "buy":
-                return round(price * (1 + ratio), 2)  # 确保结果精确到小数点后两位
+                return round(price * (1 + ratio), decimals)
             else:  # sell
-                return round(price * (1 - ratio), 2)  # 确保结果精确到小数点后两位
+                return round(price * (1 - ratio), decimals)
         
-        return round(price, 2)  # 如果没有设置滑点，返回原价格（保留两位小数）
+        return round(price, decimals)  # 如果没有设置滑点，返回原价格
 
     def calculate_commission(self, price, volume):
         """计算佣金"""
@@ -260,10 +287,11 @@ class KhTradeManager:
             # 买入时检查资金是否足够 (使用所需总资金进行检查)
             if signal["action"] == "buy":
                 if self.assets["cash"] < required_cash: # 使用 required_cash 进行比较
+                    decimals = self.price_decimals
                     error_msg = (
                         f"资金不足 - "
-                        f"所需资金: {required_cash:.2f} (含成本:{trade_cost:.2f}) | " # 显示包含成本的所需资金
-                        f"可用资金: {self.assets['cash']:.2f}"
+                        f"所需资金: {required_cash:.{decimals}f} (含成本:{trade_cost:.{decimals}f}) | "
+                        f"可用资金: {self.assets['cash']:.{decimals}f}"
                     )
                     # 记录错误信息到日志
                     print(f"[ERROR] {error_msg}")
@@ -300,6 +328,7 @@ class KhTradeManager:
             # -- 资金/持仓检查通过后，继续执行交易 --
             
             # 创建委托订单 (使用原始信号价格作为委托价)
+            decimals = self.price_decimals
             order = {
                 "account_type": xtconstant.SECURITY_ACCOUNT,
                 "account_id": self.config.account_id,
@@ -310,9 +339,9 @@ class KhTradeManager:
                 "order_type": xtconstant.STOCK_BUY if signal["action"] == "buy" else xtconstant.STOCK_SELL,
                 "order_volume": signal["volume"],
                 "price_type": xtconstant.FIX_PRICE,  # 默认限价单
-                "price": round(signal["price"], 2), # 委托价格使用信号中的价格，保留两位小数
+                "price": round(signal["price"], decimals), # 委托价格使用信号中的价格
                 "traded_volume": signal["volume"],  # 回测假设全部成交
-                "traded_price": round(actual_price, 2), # 成交价格使用计算出的实际价格，保留两位小数
+                "traded_price": round(actual_price, decimals), # 成交价格使用计算出的实际价格
                 "order_status": xtconstant.ORDER_SUCCEEDED,  # 回测假设立即成交
                 "status_msg": signal.get("reason", "策略交易"),
                 "strategy_name": signal.get("strategy_name", "backtest"),
@@ -332,9 +361,9 @@ class KhTradeManager:
                 "order_type": order["order_type"],
                 "traded_id": f"T{order_id}",
                 "traded_time": order["order_time"],  # 使用相同的时间戳
-                "traded_price": round(actual_price, 2),  # 使用考虑了滑点的实际价格，保留两位小数
+                "traded_price": round(actual_price, decimals),  # 使用考虑了滑点的实际价格
                 "traded_volume": signal["volume"],
-                "traded_amount": round(actual_price * signal["volume"], 2),  # 使用实际价格计算成交金额，保留两位小数
+                "traded_amount": round(actual_price * signal["volume"], decimals),  # 使用实际价格计算成交金额
                 "order_id": order_id,
                 "order_sysid": order["order_sysid"],
                 "strategy_name": order["strategy_name"],
@@ -356,19 +385,21 @@ class KhTradeManager:
                 
                 # 更新或创建持仓
                 if signal["code"] not in self.positions:
+                    # T+0模式下当天买入可当天卖出，T+1模式下当天买入不可卖
+                    can_use_vol = signal["volume"] if self.t0_mode else 0
                     self.positions[signal["code"]] = {
                         "account_type": xtconstant.SECURITY_ACCOUNT,
                         "account_id": self.config.account_id,
                         "stock_code": signal["code"],
                         "volume": signal["volume"],
-                        "can_use_volume": signal["volume"], # 买入当天不可卖
-                        "open_price": round(actual_price, 2), # 记录开仓时的实际成交价，保留两位小数
-                        "market_value": round(actual_price * signal["volume"], 2), # 初始市值，保留两位小数
+                        "can_use_volume": can_use_vol,
+                        "open_price": round(actual_price, decimals), # 记录开仓时的实际成交价
+                        "market_value": round(actual_price * signal["volume"], decimals), # 初始市值
                         "frozen_volume": 0,
                         "on_road_volume": 0,
                         "yesterday_volume": 0,
-                        "avg_price": round(actual_price, 2), # 初始持仓均价，保留两位小数
-                        "current_price": round(actual_price, 2), # 当前价格，保留两位小数
+                        "avg_price": round(actual_price, decimals), # 初始持仓均价
+                        "current_price": round(actual_price, decimals), # 当前价格
                         "direction": xtconstant.DIRECTION_FLAG_LONG
                     }
                     # 新建仓位时触发持仓变动回调
@@ -380,11 +411,14 @@ class KhTradeManager:
                     # 计算新的持仓均价
                     total_cost_value = pos["avg_price"] * pos["volume"] + actual_price * signal["volume"] # 注意：这里用的是成交金额，不是包含费用的成本
                     total_volume = pos["volume"] + signal["volume"]
-                    pos["avg_price"] = round(total_cost_value / total_volume if total_volume > 0 else 0, 2) # 保留两位小数
+                    pos["avg_price"] = round(total_cost_value / total_volume if total_volume > 0 else 0, decimals)
                     pos["volume"] += signal["volume"]
-                    pos["can_use_volume"] += signal["volume"] # 买入当天不可卖，T+1才可用
-                    pos["market_value"] = round(pos["volume"] * actual_price, 2) # 更新市值，保留两位小数
-                    pos["current_price"] = round(actual_price, 2) # 更新当前价，保留两位小数
+                    # T+0模式下当天买入可当天卖出，T+1模式下当天买入不可卖
+                    if self.t0_mode:
+                        pos["can_use_volume"] += signal["volume"]  # T+0：买入即可卖出
+                    # T+1模式下不增加can_use_volume，需等待框架在下一交易日更新
+                    pos["market_value"] = round(pos["volume"] * actual_price, decimals) # 更新市值
+                    pos["current_price"] = round(actual_price, decimals) # 更新当前价
                     
                     # 持仓数量变化时触发回调
                     if pos["volume"] != old_volume and self.callback:
@@ -402,7 +436,7 @@ class KhTradeManager:
                 pos["volume"] -= signal["volume"]
                 pos["can_use_volume"] -= signal["volume"] # 可用数量减少
                 # pos["market_value"] = pos["volume"] * actual_price # 更新市值
-                pos["current_price"] = round(actual_price, 2) # 更新当前价，保留两位小数
+                pos["current_price"] = round(actual_price, decimals) # 更新当前价
                 
                 # 持仓数量变化时触发回调
                 if pos["volume"] != old_volume and self.callback:
@@ -438,8 +472,8 @@ class KhTradeManager:
                     f"股票代码: {signal['code']} | "
                     f"交易方向: {'买入' if signal['action'] == 'buy' else '卖出'} | "
                     f"成交数量: {signal['volume']} | "
-                    f"成交价格: {actual_price:.2f} | "
-                    f"交易金额: {actual_price * signal['volume']:.2f} | "
+                    f"成交价格: {actual_price:.{decimals}f} | "
+                    f"交易金额: {actual_price * signal['volume']:.{decimals}f} | "
                     f"佣金: {commission:.2f} | "
                     f"印花税: {stamp_tax:.2f} | "
                     f"过户费: {transfer_fee:.2f} | "
@@ -450,7 +484,7 @@ class KhTradeManager:
             
             print(f"回测下单完成: {signal}")
             print(f"交易成本: {trade_cost:.2f}")
-            print(f"当前资产 (现金): {self.assets['cash']:.2f}") # 只打印现金，总资产依赖市值
+            print(f"当前资产 (现金): {self.assets['cash']:.{decimals}f}") # 只打印现金，总资产依赖市值
             print(f"当前持仓: {self.positions}")
             
             # 触发回调 (委托和成交)
@@ -524,15 +558,16 @@ class KhTradeManager:
                 self.callback.on_stock_order(SimpleNamespace(**order))
             
             # 创建成交对象并触发回调
+            decimals = self.price_decimals
             trade = {
                 "account_type": xtconstant.SECURITY_ACCOUNT,
                 "account_id": self.config.account_id,
                 "stock_code": signal["code"],
                 "trade_id": f"T{order_id}",
                 "order_id": order_id,
-                "price": round(signal.get("actual_price", signal["price"]), 2),  # 优先使用实际成交价格，保留两位小数
+                "price": round(signal.get("actual_price", signal["price"]), decimals),  # 优先使用实际成交价格
                 "volume": signal["volume"],
-                "turnover": round(signal.get("actual_price", signal["price"]) * signal["volume"], 2),  # 使用实际价格计算成交金额，保留两位小数
+                "turnover": round(signal.get("actual_price", signal["price"]) * signal["volume"], decimals),  # 使用实际价格计算成交金额
                 "order_direction": "STOCK_BUY" if signal["action"] == "buy" else "STOCK_SELL",
                 "order_remark": signal["remark"]
             }

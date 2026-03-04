@@ -6,8 +6,24 @@ import time
 import traceback
 import json
 import subprocess
+import shutil
 from datetime import datetime
-from PyQt5.QtCore import Qt, QSettings, QTimer, QThread, pyqtSignal, QMetaType, pyqtSlot, QDateTime, QDate, Q_ARG, QTime, QEvent, QUrl
+from PyQt5.QtCore import (
+    Qt,
+    QSettings,
+    QTimer,
+    QThread,
+    pyqtSignal,
+    QMetaType,
+    pyqtSlot,
+    QDateTime,
+    QDate,
+    Q_ARG,
+    QTime,
+    QEvent,
+    QUrl,
+    QMetaObject,
+)
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
                            QTableWidget, QTableWidgetItem, QMenu, QAction, QFileDialog, QMessageBox, QSplitter,
                            QTabWidget, QTextEdit, QComboBox, QGroupBox, QLineEdit, QDateEdit, QCheckBox, QProgressDialog,
@@ -39,6 +55,8 @@ except ImportError:
     logging.error("无法导入数据定时补充模块")
     GUIScheduler = None
 
+
+
 # 导入其他必要的模块
 try:
     from khFrame import KhQuantFramework, MyTraderCallback
@@ -55,40 +73,21 @@ from version import get_version_info  # 导入版本信息
 # 配置日志系统
 def get_logs_dir():
     """获取日志目录的正确路径"""
-    # 开发环境
-    base_dir = os.path.dirname(os.path.dirname(__file__))
-    
-    # 尝试多个可能的日志目录位置
-    possible_dirs = [
-        os.path.join(base_dir, 'logs'),  # 首选：程序目录下的logs
-        os.path.join(os.path.expanduser('~'), 'KhQuant', 'logs'),  # 备选：用户目录
-        os.path.join(os.environ.get('TEMP', '/tmp'), 'KhQuant', 'logs')  # 最后：临时目录
-    ]
-    
-    for logs_dir in possible_dirs:
-        try:
-            os.makedirs(logs_dir, exist_ok=True)
-            # 测试写入权限
-            test_file = os.path.join(logs_dir, 'test_write.tmp')
-            with open(test_file, 'w') as f:
-                f.write('test')
-            os.remove(test_file)
-            print(f"使用日志目录: {logs_dir}")
-            return logs_dir
-        except (OSError, PermissionError) as e:
-            print(f"无法使用日志目录 {logs_dir}: {e}")
-            continue
-    
-    # 如果所有目录都失败，使用临时目录
-    import tempfile
-    logs_dir = os.path.join(tempfile.gettempdir(), 'KhQuant_logs')
+    base_dir = os.path.dirname(__file__)
+    logs_dir = os.path.join(base_dir, 'logs')
+
     try:
+        os.makedirs(logs_dir, exist_ok=True)
+        print(f"使用日志目录: {logs_dir}")
+        return logs_dir
+    except (OSError, PermissionError) as e:
+        print(f"无法使用日志目录 {logs_dir}: {e}")
+        # 备用目录
+        import tempfile
+        logs_dir = os.path.join(tempfile.gettempdir(), 'KhQuant_logs')
         os.makedirs(logs_dir, exist_ok=True)
         print(f"使用临时日志目录: {logs_dir}")
         return logs_dir
-    except Exception as e:
-        print(f"创建临时日志目录失败: {e}")
-        return tempfile.gettempdir()
 
 LOGS_DIR = get_logs_dir()
 
@@ -110,12 +109,14 @@ except Exception as e:
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
-# 添加控制台日志处理器
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
-logging.getLogger('').addHandler(console_handler)
+# 添加控制台日志处理器（仅在标准错误可用时）
+_stderr_stream = getattr(sys, 'stderr', None)
+if _stderr_stream and hasattr(_stderr_stream, 'write'):
+    console_handler = logging.StreamHandler(_stderr_stream)
+    console_handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(formatter)
+    logging.getLogger('').addHandler(console_handler)
 
 # 定义StockAccount类
 class StockAccount:
@@ -134,7 +135,7 @@ class StrategyThread(QThread):
     error_signal = pyqtSignal(str, Exception)  # 错误信号
     status_signal = pyqtSignal(str)  # 状态信号
     finished_signal = pyqtSignal()  # 完成信号
-    
+
     def __init__(self, config_path, strategy_file, trader_callback):
         super().__init__()
         self.config_path = config_path
@@ -142,7 +143,7 @@ class StrategyThread(QThread):
         self.trader_callback = trader_callback
         self.framework = None
         self._is_running = True
-        
+
     def run(self):
         """线程运行函数"""
         try:
@@ -152,13 +153,13 @@ class StrategyThread(QThread):
                 self.strategy_file,
                 trader_callback=self.trader_callback
             )
-            
+
             # 发送状态信号
             self.status_signal.emit("框架实例创建成功")
-            
+
             # 运行策略
             self.framework.run()
-            
+
         except Exception as e:
             # 发送错误信号
             self.error_signal.emit("策略运行异常", e)
@@ -169,13 +170,13 @@ class StrategyThread(QThread):
             self.finished_signal.emit()
             # 现在设置运行状态为False
             self._is_running = False
-            
+
     def stop(self):
         """停止策略"""
         self._is_running = False
         if self.framework:
             self.framework.stop()
-            
+
     @property
     def is_running(self):
         return self._is_running
@@ -211,10 +212,11 @@ class KhQuantGUI(QMainWindow):
         self.settings = QSettings('KHQuant', 'StockAnalyzer')
         
         # 初始化延迟日志显示相关属性（需要在早期初始化，避免AttributeError）
-        self.delay_log_display = self.settings.value('delay_log_display', False, type=bool)
+        self.delay_log_display = self.settings.value('delay_log_display', True, type=bool)
         self.delayed_logs = []
         self.strategy_is_running = False
-        
+        self.max_log_lines = self.settings.value('max_log_lines', 1000, type=int)  # 最大日志显示行数
+
         # 检测屏幕分辨率并设置字体缩放
         self.font_scale = self.detect_screen_resolution()
         
@@ -261,28 +263,35 @@ class KhQuantGUI(QMainWindow):
         # 更新实盘数据获取模块状态
         self.update_realtime_data_group_status()
         
-        # 连接信号到槽
-        self.log_signal.connect(self._log_message)
-        self.update_status_signal.connect(self._update_status_table)
-        self.show_backtest_result_signal.connect(self.show_backtest_result)
-        self.progress_signal.connect(self.update_progress_bar) # 连接进度条信号
-        
-        # 现有的初始化代码
-        self.show_backtest_result_signal.connect(self.show_backtest_result)
+        # 连接信号到槽（使用QueuedConnection确保跨线程调用不阻塞）
+        self.log_signal.connect(self._log_message, Qt.QueuedConnection)
+        self.update_status_signal.connect(self._update_status_table, Qt.QueuedConnection)
+        self.show_backtest_result_signal.connect(self.show_backtest_result, Qt.QueuedConnection)
+        self.progress_signal.connect(self.update_progress_bar, Qt.QueuedConnection)
         
         # 设置定时器定期刷新日志缓冲区
         self.log_flush_timer = QTimer()
         self.log_flush_timer.timeout.connect(self.flush_logs)
         self.log_flush_timer.start(5000)  # 每5秒刷新一次日志
         
+        # 初始化代码编辑器模块（已废弃，现在使用EmbeddedVSCodeManager）
+        self.editor_module = None
+        # if get_editor_module is not None:
+        #     try:
+        #         self.editor_module = get_editor_module(self)
+        #         logging.info("代码编辑器模块初始化成功")
+        # 调试模式相关属性（开源版本不支持内置调试）
+        self.debug_mode_enabled = False
+        self.debug_manager = None
+
         # 记录启动信息到日志
         logging.info(f"软件启动时间: {self.start_time}")
         logging.info(f"当前版本: {get_version_info()['version']}")
         logging.info(f"日志文件路径: {os.path.join(LOGS_DIR, 'app.log')}")
-        logging.info(f"程序运行环境: 开发环境")
         
-        # 最后确保窗口最大化显示（放在初始化的最末尾）
-        self.showMaximized()
+        # 最后确保窗口在主屏幕居中显示（放在初始化的最末尾）
+        self.center_window()
+        self.show()
 
 
         # 初始化数据管理窗口实例变量
@@ -292,12 +301,10 @@ class KhQuantGUI(QMainWindow):
 
     def get_icon_path(self, icon_name):
         """获取图标文件的正确路径"""
-        # 开发环境
         return os.path.join(os.path.dirname(__file__), 'icons', icon_name)
-    
+
     def get_data_path(self, filename):
         """获取数据文件的正确路径"""
-        # 开发环境
         return os.path.join(os.path.dirname(__file__), 'data', filename)
 
     def detect_screen_resolution(self):
@@ -665,7 +672,7 @@ class KhQuantGUI(QMainWindow):
             
             /* 文本编辑器样式 */
             QTextEdit, QPlainTextEdit {{
-                background-color: #333333;
+                background-color: #2b2b2b;
                 border: 1px solid #404040;
                 border-radius: 4px;
                 color: #e8e8e8;
@@ -834,9 +841,9 @@ class KhQuantGUI(QMainWindow):
             print(f"刷新日志时出错: {e}")
         
     def showEvent(self, event):
-        """窗口显示事件，确保窗口最大化"""
+        """窗口显示事件"""
         super().showEvent(event)
-        self.showMaximized()
+        # 移除强制最大化，让窗口保持居中显示
         
     def changeEvent(self, event):
         """窗口状态变化事件，处理窗口还原时居中显示"""
@@ -847,16 +854,19 @@ class KhQuantGUI(QMainWindow):
                 self.center_window()
                 
     def center_window(self):
-        """将窗口居中显示"""
+        """将窗口居中显示在主屏幕"""
         # 设置窗口大小为屏幕尺寸的80%
-        screen = QDesktopWidget().availableGeometry()
+        # 使用主屏幕而不是跟随鼠标位置
+        desktop = QDesktopWidget()
+        primary_screen = desktop.primaryScreen()
+        screen = desktop.availableGeometry(primary_screen)
         width = int(screen.width() * 0.7)
         height = int(screen.height() * 0.7)
         self.resize(width, height)
         
-        # 计算居中位置
+        # 计算居中位置（基于主屏幕）
         qr = self.frameGeometry()
-        cp = QDesktopWidget().availableGeometry().center()
+        cp = screen.center()
         qr.moveCenter(cp)
         self.move(qr.topLeft())
         
@@ -1088,30 +1098,32 @@ class KhQuantGUI(QMainWindow):
         data_module_action.setToolTip("打开CSV数据下载、清洗和管理界面")
         data_module_action.triggered.connect(self.open_data_module)
         
+
+        
         # 添加分隔符
         toolbar.addSeparator()
-        
+
         # 添加设置按钮
         settings_action = toolbar.addAction("设置")
         settings_action.triggered.connect(self.show_settings)
-        
+
         # 添加弹性空间
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         toolbar.addWidget(spacer)
-        
+
         # 创建状态指示灯
         self.status_indicator = QLabel()
         self.status_indicator.setFixedSize(16, 16)
         self.status_indicator.setToolTip("MiniQMT状态")
-        
+
         # 创建一个容器来包装状态指示灯，并添加边距
         indicator_container = QWidget()
         indicator_layout = QHBoxLayout(indicator_container)
         indicator_layout.setContentsMargins(0, 0, 10, 0)  # 右边距为10像素
         indicator_layout.addWidget(self.status_indicator)
         toolbar.addWidget(indicator_container)
-        
+
         # 添加帮助按钮
         help_btn = QToolButton()
         help_btn.setText("?")
@@ -1231,12 +1243,12 @@ class KhQuantGUI(QMainWindow):
         try:
             # 检查进程是否存在
             is_running = self.is_software_running("XtMiniQmt.exe")
-            
+
             if is_running:
                 self.update_status_indicator("green", "MiniQMT已启动")
             else:
                 self.update_status_indicator("red", "MiniQMT未启动")
-                
+
         except Exception as e:
             logging.error(f"检查软件状态时出错: {str(e)}")
             self.update_status_indicator("red", "状态检查失败")
@@ -1515,14 +1527,15 @@ class KhQuantGUI(QMainWindow):
         
         # 在回测参数配置组中添加股票池设置
         # 股票池设置
-        stock_pool_group = QGroupBox("股票池设置")
+        self.stock_pool_group = QGroupBox("股票池设置")
+        self.stock_pool_group_default_title = "股票池设置"  # 保存默认标题
         stock_pool_layout = QVBoxLayout()
         
         # 常用股票池选择
         common_pool_layout = QGridLayout()
         self.pool_checkboxes = {}
         common_pools = {
-            "上证50": "sh.000016", 
+            "上证50": "sh.000016",
             "沪深300": "sh.000300",
             "中证500": "sh.000905",
             "创业板指": "sz.399006",
@@ -1619,13 +1632,13 @@ class KhQuantGUI(QMainWindow):
         custom_pool_layout.addLayout(btn_layout)
         
         stock_pool_layout.addLayout(custom_pool_layout)
-        stock_pool_group.setLayout(stock_pool_layout)
+        self.stock_pool_group.setLayout(stock_pool_layout)
         
         # 为股票池组设置大小策略，让它能够扩展
-        stock_pool_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.stock_pool_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         
         # 添加股票池组到回测布局时，为其分配更大的伸展因子
-        backtest_layout.addWidget(stock_pool_group, 1)  # 伸展因子为1，让它占据更多空间
+        backtest_layout.addWidget(self.stock_pool_group, 1)  # 伸展因子为1，让它占据更多空间
         
         backtest_group.setLayout(backtest_layout)
         
@@ -1916,13 +1929,7 @@ class KhQuantGUI(QMainWindow):
         button_layout.addWidget(save_log_btn)
         button_layout.addWidget(test_log_btn)
         button_layout.addStretch()
-        
-        # 添加打开回测指标窗口的按钮
-        self.open_backtest_btn = QPushButton("打开回测指标")
-        self.open_backtest_btn.clicked.connect(self.open_backtest_result)
-        self.open_backtest_btn.setEnabled(False)  # 初始禁用按钮
-        button_layout.addWidget(self.open_backtest_btn)
-        
+
         # 将组件添加到日志布局
         log_layout.addWidget(self.log_text)
         log_layout.addLayout(filter_layout)
@@ -2109,7 +2116,7 @@ class KhQuantGUI(QMainWindow):
             
             # 更新初始化行情数据设置 - 这个设置只存在于QSettings中，不保存到配置文件
             # 记录日志，显示当前的设置值
-            init_data_enabled = self.settings.value('init_data_enabled', True, type=bool)
+            init_data_enabled = self.settings.value('init_data_enabled', False, type=bool)
             logging.info(f"从设置界面读取到 init_data_enabled = {init_data_enabled}")
             self.log_message(f"数据初始化设置: {'启用' if init_data_enabled else '禁用'}", "INFO")
             
@@ -2128,13 +2135,85 @@ class KhQuantGUI(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "错误", f"更新配置时出错: {str(e)}")
 
+    def set_t0_mode_display(self, enabled: bool):
+        """跨线程安全地更新T+0模式显示"""
+        if QThread.currentThread() != self.thread():
+            QMetaObject.invokeMethod(
+                self,
+                "_apply_t0_mode_display",
+                Qt.QueuedConnection,
+                Q_ARG(bool, enabled)
+            )
+            return
+        self._apply_t0_mode_display(enabled)
 
+    @pyqtSlot(bool)
+    def _apply_t0_mode_display(self, enabled: bool):
+        """真正执行界面更新的槽函数"""
+        if not hasattr(self, 'stock_pool_group'):
+            logging.warning("stock_pool_group 属性不存在，跳过T+0模式显示更新")
+            return
+        try:
+            if enabled:
+                self.stock_pool_group.setTitle("股票池设置 - T+0交易模式")
+                self.stock_pool_group.setStyleSheet("""
+                    QGroupBox {
+                        background-color: #332010;
+                        border: 2px solid #5a3d1f;
+                        border-radius: 5px;
+                        margin-top: 10px;
+                        font-weight: bold;
+                    }
+                    QGroupBox::title {
+                        subcontrol-origin: margin;
+                        left: 10px;
+                        padding: 0 5px;
+                        color: #ffa726;
+                        background-color: #332010;
+                    }
+                """)
+            else:
+                default_title = getattr(self, 'stock_pool_group_default_title', '股票池设置')
+                self.stock_pool_group.setTitle(default_title)
+                self.stock_pool_group.setStyleSheet("")
+        except Exception as e:
+            logging.error(f"设置T+0模式显示时出错: {str(e)}")
+    
+    def show_t0_warning(self, message: str):
+        """显示T+0模式混合池警告弹窗
+        
+        Args:
+            message: 警告信息
+        """
+        if QThread.currentThread() != self.thread():
+            QMetaObject.invokeMethod(
+                self,
+                "_show_t0_warning",
+                Qt.QueuedConnection,
+                Q_ARG(str, message)
+            )
+            return
+        self._show_t0_warning(message)
+
+    @pyqtSlot(str)
+    def _show_t0_warning(self, message: str):
+        """在GUI线程中显示T+0提示"""
+        try:
+            QMessageBox.warning(
+                self,
+                "T+0模式提醒",
+                message,
+                QMessageBox.Ok
+            )
+        except Exception as e:
+            logging.error(f"显示T+0警告弹窗时出错: {str(e)}")
 
     def update_status(self, message):
         """更新状态栏信息"""
         try:
-            # 不再显示状态消息，保持状态栏简洁
-            pass
+            # 记录状态消息到日志
+            if message:
+                logging.info(message)
         except Exception as e:
             print(f"状态栏更新失败: {message}")  # 错误时至少输出到控制台
 
@@ -2184,13 +2263,13 @@ class KhQuantGUI(QMainWindow):
             from PyQt5.QtCore import QMetaType
             QMetaType.type("QTextCursor")
             
-            # 连接信号
-            self.strategy_thread.error_signal.connect(self.on_strategy_error)
-            self.strategy_thread.status_signal.connect(self.update_status)
-            self.strategy_thread.finished_signal.connect(self.on_strategy_finished)
+            # 连接信号（使用QueuedConnection确保跨线程调用不阻塞GUI）
+            self.strategy_thread.error_signal.connect(self.on_strategy_error, Qt.QueuedConnection)
+            self.strategy_thread.status_signal.connect(self.update_status, Qt.QueuedConnection)
+            self.strategy_thread.finished_signal.connect(self.on_strategy_finished, Qt.QueuedConnection)
             
             # 启动线程
-            self.strategy_thread.start()  # 使用start()方法启动线程，而不是run()
+            self.strategy_thread.start()  # 正确使用start()启动子线程
             
             # 更新界面状态
             self.start_action.setEnabled(False)
@@ -2198,10 +2277,13 @@ class KhQuantGUI(QMainWindow):
             
             # 设置策略运行状态标志
             self.strategy_is_running = True
-            
+
             # 显示并重置进度条 (只在回测模式下)
             if self.get_run_mode() == "backtest":
                 self.progress_bar.setValue(0)
+                # 记录回测开始时间
+                import time
+                self.backtest_start_time = time.time()
                 self.progress_text.setText("回测进度: 0%")
                 self.progress_container.show()
                 # 强制更新UI
@@ -2221,6 +2303,7 @@ class KhQuantGUI(QMainWindow):
             # 清除策略运行状态标志
             self.strategy_is_running = False
 
+    @pyqtSlot()
     def on_strategy_finished(self):
         """策略完成回调"""
         try:
@@ -2252,6 +2335,10 @@ class KhQuantGUI(QMainWindow):
                     
                 # 清除策略运行状态标志
                 self.strategy_is_running = False
+
+                # 清除回测开始时间记录
+                if hasattr(self, 'backtest_start_time'):
+                    delattr(self, 'backtest_start_time')
                 
                 # 如果启用了延迟显示，现在显示所有延迟的日志
                 if self.delay_log_display and self.delayed_logs:
@@ -2274,34 +2361,41 @@ class KhQuantGUI(QMainWindow):
     def stop_strategy(self):
         """停止策略运行"""
         try:
+            # 清除回测开始时间记录
+            if hasattr(self, 'backtest_start_time'):
+                delattr(self, 'backtest_start_time')
+            
             if getattr(self, 'strategy_thread', None) is not None and self.strategy_thread.isRunning():
                 # 设置停止标志
                 if hasattr(self.strategy_thread, 'framework') and self.strategy_thread.framework:
                     self.strategy_thread.framework.is_running = False
-                
+
                 # 等待线程结束
                 self.strategy_thread.stop()
                 self.strategy_thread.wait()
-                
+
                 # 清理临时配置文件
                 if hasattr(self, 'temp_config_path') and os.path.exists(self.temp_config_path):
                     try:
                         os.remove(self.temp_config_path)
                     except Exception as e:
                         self.log_message(f"清理临时配置文件失败: {str(e)}", "WARNING")
-                
+
                 self.update_status("策略已停止运行")
                 self.stop_action.setEnabled(False)
                 self.start_action.setEnabled(True)
-                
+
                 # 清除策略运行状态标志
                 self.strategy_is_running = False
-                
+
                 # 隐藏进度条
                 self.hide_progress()
                 
+                # 重置T+0模式显示
+                self.set_t0_mode_display(False)
+
                 self.log_message("策略已停止", "INFO")
-                
+
         except Exception as e:
             error_msg = f"停止策略时出错: {str(e)}"
             self.update_status(error_msg)
@@ -2347,6 +2441,10 @@ class KhQuantGUI(QMainWindow):
             if hasattr(self, 'csv_manager_window') and self.csv_manager_window:
                 self.csv_manager_window.close()
                 self.csv_manager_window = None
+                
+            if hasattr(self, 'history_manager_window') and self.history_manager_window:
+                self.history_manager_window.close()
+                self.history_manager_window = None
             
             # 停止日志刷新定时器
             if hasattr(self, 'log_flush_timer'):
@@ -2429,7 +2527,7 @@ class KhQuantGUI(QMainWindow):
             
         except Exception as e:
             QMessageBox.critical(self, "加载失败", f"加载配置文件时出错: {str(e)}")
-            
+
     def update_ui_from_config(self):
         """根据已加载的配置更新UI"""
         if not hasattr(self, 'config') or not self.config:
@@ -2455,9 +2553,9 @@ class KhQuantGUI(QMainWindow):
         if "backtest" in self.config:
             backtest_config = self.config["backtest"]
             if "start_time" in backtest_config:
-                self.start_date.setDate(QDate.fromString(backtest_config["start_time"], "yyyyMMdd"))
+                self.start_date.setDate(QDate.fromString(str(backtest_config["start_time"]), "yyyyMMdd"))
             if "end_time" in backtest_config:
-                self.end_date.setDate(QDate.fromString(backtest_config["end_time"], "yyyyMMdd"))
+                self.end_date.setDate(QDate.fromString(str(backtest_config["end_time"]), "yyyyMMdd"))
             if "init_capital" in backtest_config:
                 self.initial_cash.setText(str(backtest_config["init_capital"]))
             if "min_volume" in backtest_config:
@@ -2747,7 +2845,6 @@ class KhQuantGUI(QMainWindow):
                 
         if stock_codes:
             # 生成股票清单文件
-            # 开发环境
             stock_list_dir = os.path.join(os.path.dirname(__file__), 'data', 'stock_list')
             os.makedirs(stock_list_dir, exist_ok=True)
             stock_list_file = os.path.join(stock_list_dir, f"stock_list_{int(time.time())}.csv")
@@ -3184,7 +3281,10 @@ class KhQuantGUI(QMainWindow):
                     # 添加到文本框
                     self.log_text.moveCursor(self.log_text.textCursor().End)
                     self.log_text.insertHtml(formatted_message)
-                    
+
+                    # 检查并限制日志行数
+                    self._trim_log_lines()
+
                     # 滚动到底部
                     self.log_text.verticalScrollBar().setValue(
                         self.log_text.verticalScrollBar().maximum()
@@ -3204,6 +3304,52 @@ class KhQuantGUI(QMainWindow):
             print(f"记录日志时出错: {str(e)}")
             import traceback
             print(traceback.format_exc())
+
+    def _trim_log_lines(self):
+        """限制日志显示行数，删除最旧的日志行（批量处理以提高性能）"""
+        try:
+            # 获取最大行数设置
+            max_lines = getattr(self, 'max_log_lines', 1000)
+
+            # 使用计数器，避免每次日志都进行检查
+            # 每100条日志检查一次，减少性能开销
+            if not hasattr(self, '_log_trim_counter'):
+                self._log_trim_counter = 0
+            self._log_trim_counter += 1
+
+            # 每100条日志才检查一次（或者在第一条日志时检查）
+            if self._log_trim_counter < 100 and self._log_trim_counter > 1:
+                return
+            self._log_trim_counter = 0
+
+            # 获取当前文档的行数
+            document = self.log_text.document()
+            current_lines = document.blockCount()
+
+            # 设置缓冲区，超过最大行数+缓冲区时才删除
+            buffer_lines = 100
+            if current_lines > max_lines + buffer_lines:
+                # 一次性删除多余的行（包括缓冲区），避免频繁删除
+                lines_to_remove = current_lines - max_lines
+
+                # 获取文档游标
+                cursor = QTextCursor(document)
+                cursor.movePosition(QTextCursor.Start)
+
+                # 选择需要删除的行
+                for _ in range(lines_to_remove):
+                    cursor.movePosition(QTextCursor.Down, QTextCursor.KeepAnchor)
+                cursor.movePosition(QTextCursor.StartOfLine, QTextCursor.KeepAnchor)
+
+                # 删除选中的内容
+                cursor.removeSelectedText()
+
+                # 同时限制内存中的日志条目
+                if len(self.log_entries) > max_lines:
+                    self.log_entries = self.log_entries[-max_lines:]
+        except Exception as e:
+            # 静默处理错误，避免影响正常日志显示
+            pass
 
     def clear_log(self):
         """清空日志"""
@@ -3425,8 +3571,6 @@ class KhQuantGUI(QMainWindow):
             from backtest_result_window import BacktestResultWindow
             # 记录最近的回测目录
             self.last_backtest_dir = backtest_dir
-            # 启用打开回测指标按钮
-            self.open_backtest_btn.setEnabled(True)
             # 确保窗口在主线程创建
             self.result_window = BacktestResultWindow(backtest_dir)
             
@@ -3724,7 +3868,7 @@ class KhQuantGUI(QMainWindow):
     def on_log_filter_changed(self, state):
         """处理日志类型过滤复选框的变化"""
         self.refresh_log_display()
-        
+
     def refresh_log_display(self):
         """根据过滤设置重新显示日志"""
         # 清空当前显示
@@ -3752,10 +3896,13 @@ class KhQuantGUI(QMainWindow):
             # 如果用户点击了保存按钮，更新延迟显示设置并强制更新配置
             if result == QDialog.Accepted:
                 self.update_delay_log_setting()
-                
+
+                # 更新最大日志行数设置
+                self.max_log_lines = self.settings.value('max_log_lines', 1000, type=int)
+
                 # 记录设置变更日志 - init_data_enabled只存在于QSettings中
-                init_data_enabled = self.settings.value('init_data_enabled', True, type=bool)
-                self.log_message(f"设置已更新 - 数据初始化: {'启用' if init_data_enabled else '禁用'}", "INFO")
+                init_data_enabled = self.settings.value('init_data_enabled', False, type=bool)
+                self.log_message(f"设置已更新 - 数据初始化: {'启用' if init_data_enabled else '禁用'}, 最大日志行数: {self.max_log_lines}", "INFO")
             
             # 如果需要，可以在这里处理设置对话框关闭后的操作
             self.check_software_status()
@@ -3780,7 +3927,7 @@ class KhQuantGUI(QMainWindow):
         try:
             # 从设置中重新读取延迟显示状态
             old_setting = self.delay_log_display
-            self.delay_log_display = self.settings.value('delay_log_display', False, type=bool)
+            self.delay_log_display = self.settings.value('delay_log_display', True, type=bool)
             
             # 记录设置变更
             if self.delay_log_display:
@@ -3869,19 +4016,15 @@ class KhQuantGUI(QMainWindow):
                     logging.error(f"使用导入方式打开CSV数据管理模块失败: {str(e)}", exc_info=True)
                     # 继续尝试方法二
             # 方法二：使用子进程运行GUI.py
-            # 确定GUI.py的路径
-            # 开发环境
+            # 确定GUI.py的路径 - 开发环境
             base_dir = os.path.dirname(os.path.abspath(__file__))
-                
             gui_path = os.path.join(base_dir, 'GUI.py')
-            
+
             if os.path.exists(gui_path):
                 self.log_message(f"找到GUI.py文件，路径: {gui_path}", "INFO")
-                
+
                 # 使用子进程启动GUI.py
                 import subprocess
-                
-                # 开发环境中使用Python解释器启动
                 python_executable = sys.executable
                 subprocess.Popen([python_executable, gui_path])
                 self.log_message("CSV数据管理模块已在新进程中启动", "INFO")
@@ -3961,6 +4104,190 @@ class KhQuantGUI(QMainWindow):
             self.log_message(error_message, "ERROR")
             logging.error(error_message, exc_info=True)
             QMessageBox.critical(self, "错误", f"打开数据定时补充模块时出错:\n{str(e)}")
+    
+    def _create_strategy_template(self, file_path: str):
+        """创建策略文件模板"""
+        try:
+            from datetime import datetime
+            
+            template = '''# -*- coding: utf-8 -*-
+"""
+策略名称：新策略
+创建时间：{datetime}
+"""
+
+from khQuantImport import *  # 导入统一工具与指标
+
+
+def init(stocks=None, data=None):
+    """策略初始化（本策略无需特殊初始化）"""
+    pass  # 占位
+
+
+def khHandlebar(data: Dict) -> List[Dict]:
+    """
+    主策略函数
+    
+    参数:
+        data: 包含当前K线数据的字典
+    
+    返回:
+        signals: 信号列表
+    """
+    signals = []  # 信号列表
+    
+    # 在这里编写你的策略逻辑
+    
+    return signals  # 返回信号
+
+
+def khPreMarket(context: Dict) -> List[Dict]:
+    """
+    盘前处理函数（可选）
+    在每日开盘前的指定时间点调用
+    
+    参数:
+        context: 上下文字典
+    
+    返回:
+        signals: 信号列表
+    """
+    signals = []
+    return signals
+
+
+def khPostMarket(context: Dict) -> List[Dict]:
+    """
+    盘后处理函数（可选）
+    在每日收盘后的指定时间点调用
+    
+    参数:
+        context: 上下文字典
+    
+    返回:
+        signals: 信号列表
+    """
+    signals = []
+    return signals
+'''
+            
+            content = template.format(datetime=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            
+            # 确保目录存在
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            
+            # 写入文件
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            self.log_message(f"已创建策略文件: {file_path}", "INFO")
+            
+        except Exception as e:
+            self.log_message(f"创建策略文件失败: {str(e)}", "ERROR")
+            logging.error(f"创建策略文件失败: {e}", exc_info=True)
+            raise
+
+    def get_strategies_directory(self):
+        """获取策略文件目录"""
+        # 获取用户数据目录
+        if os.name == 'nt':  # Windows
+            user_data_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'KhQuant')
+        else:  # Linux/Mac
+            user_data_dir = os.path.join(os.path.expanduser('~'), '.khquant')
+
+        # 策略文件目录
+        strategies_dir = os.path.join(user_data_dir, 'strategies')
+        return strategies_dir
+
+    def open_code_editor(self):
+        """打开代码编辑器"""
+        try:
+            if self.editor_module is not None:
+                # 获取当前选择的策略文件路径
+                strategy_file_path = self.config.get("strategy_file", "")
+                
+                # 检查策略文件是否存在
+                if strategy_file_path and os.path.exists(strategy_file_path):
+                    # 如果策略文件存在，直接打开编辑器并加载文件
+                    self.editor_module.open_editor(strategy_file_path)
+                    self.log_message(f"代码编辑器已打开，加载策略文件: {strategy_file_path}", "INFO")
+                else:
+                    # 如果没有设置策略文件或文件不存在，提示用户选择或创建
+                    msg_box = QMessageBox(self)
+                    msg_box.setWindowTitle("策略文件")
+                    msg_box.setText("当前未设置策略文件或文件不存在。\n\n请选择操作:")
+                    msg_box.addButton("选择现有文件", QMessageBox.YesRole)
+                    msg_box.addButton("创建新文件", QMessageBox.NoRole)
+                    msg_box.addButton("取消", QMessageBox.RejectRole)
+                    reply = msg_box.exec_()
+                    
+                    if reply == 0:  # 选择现有文件
+                        # 选择现有策略文件
+                        file_path, _ = QFileDialog.getOpenFileName(
+                            self, "选择策略文件", 
+                            os.path.expanduser("~/Documents"), 
+                            "Python文件 (*.py);;所有文件 (*.*)"
+                        )
+                        if file_path:
+                            # 更新配置中的策略文件路径
+                            self.config["strategy_file"] = file_path
+                            self.strategy_path.setText(file_path)
+                            self.save_config()
+                            # 打开编辑器并加载文件
+                            self.editor_module.open_editor(file_path)
+                            self.log_message(f"代码编辑器已打开，加载策略文件: {file_path}", "INFO")
+                        else:
+                            return  # 用户取消了文件选择
+                    elif reply == 1:  # 创建新文件
+                        # 创建新策略文件
+                        file_path, _ = QFileDialog.getSaveFileName(
+                            self, "创建新策略文件", 
+                            os.path.expanduser("~/Documents/new_strategy.py"), 
+                            "Python文件 (*.py);;所有文件 (*.*)"
+                        )
+                        if file_path:
+                            # 创建基础策略文件模板
+                            template_content = '''# -*- coding: utf-8 -*-
+"""策略文件模板"""
+
+def init(context):
+    """初始化函数"""
+    pass
+
+def khHandlebar(context):
+    """主要策略逻辑函数"""
+    pass
+'''
+                            try:
+                                with open(file_path, 'w', encoding='utf-8') as f:
+                                    f.write(template_content)
+                                
+                                # 更新配置中的策略文件路径
+                                self.config["strategy_file"] = file_path
+                                self.strategy_path.setText(file_path)
+                                self.save_config()
+                                # 打开编辑器并加载文件
+                                self.editor_module.open_editor(file_path)
+                                self.log_message(f"新策略文件已创建并打开: {file_path}", "INFO")
+                            except Exception as e:
+                                error_message = f"创建策略文件失败: {str(e)}"
+                                self.log_message(error_message, "ERROR")
+                                QMessageBox.critical(self, "错误", error_message)
+                                return
+                        else:
+                            return  # 用户取消了文件保存
+                    else:  # reply == 2 或其他值，表示取消
+                        # 用户选择取消
+                        return
+            else:
+                error_message = "代码编辑器模块未正确初始化"
+                self.log_message(error_message, "ERROR")
+                QMessageBox.critical(self, "错误", error_message)
+        except Exception as e:
+            error_message = f"打开代码编辑器时出错: {str(e)}"
+            self.log_message(error_message, "ERROR")
+            logging.error(error_message, exc_info=True)
+            QMessageBox.critical(self, "错误", f"打开代码编辑器时出错:\n{str(e)}")
 
     def paintEvent(self, event):
         """绘制窗口边框"""
@@ -4004,7 +4331,25 @@ class KhQuantGUI(QMainWindow):
             value = max(0, min(value, 100))
             self.progress_bar.setValue(value)
             if hasattr(self, 'progress_text') and self.progress_text:
-                self.progress_text.setText(f"回测进度: {value}%")
+                # 计算预计剩余时间
+                remaining_time_text = ""
+                if value > 0 and hasattr(self, 'backtest_start_time'):
+                    import time
+                    elapsed_time = time.time() - self.backtest_start_time
+                    # 根据已完成百分比计算预计总时间
+                    estimated_total_time = elapsed_time / (value / 100.0)
+                    # 计算剩余时间
+                    remaining_time = estimated_total_time - elapsed_time
+                    
+                    # 格式化剩余时间
+                    if remaining_time > 0:
+                        hours = int(remaining_time // 3600)
+                        minutes = int((remaining_time % 3600) // 60)
+                        seconds = int(remaining_time % 60)
+                        remaining_time_text = f" | 预计剩余: {hours:02d}:{minutes:02d}:{seconds:02d}"
+                
+                # 更新文本
+                self.progress_text.setText(f"回测进度: {value}%{remaining_time_text}")
             
             # 确保进度条在回测模式下可见
             if self.get_run_mode() == "backtest" and not self.progress_container.isVisible():
@@ -4223,64 +4568,131 @@ class KhQuantGUI(QMainWindow):
         pass
 
     def display_delayed_logs(self):
-        """显示所有延迟的日志"""
+        """显示所有延迟的日志（分批加载，避免界面卡顿）"""
         try:
             if not self.delayed_logs:
                 self.log_message("没有延迟日志需要显示", "INFO")
                 return
-            
+
             log_count = len(self.delayed_logs)
-            
+
             # 统计各种级别的日志数量
             level_counts = {}
             for log_entry in self.delayed_logs:
                 level = log_entry['level']
                 level_counts[level] = level_counts.get(level, 0) + 1
-            
+
             # 显示开始信息和统计
-            self.log_message(f"开始显示{log_count}条延迟日志", "INFO")
+            self.log_message(f"开始显示{log_count}条延迟日志（分批加载中...）", "INFO")
             stats_msg = "延迟日志统计: " + ", ".join([f"{level}={count}" for level, count in sorted(level_counts.items())])
             self.log_message(stats_msg, "INFO")
-            
-            # 禁用文本更新提高性能
-            self.log_text.setUpdatesEnabled(False)
-            
-            # 按时间顺序排序延迟日志（如果需要的话）
-            # self.delayed_logs.sort(key=lambda x: x['time'])
-            
-            # 显示所有延迟日志，不受过滤器影响
-            html_content = ""
-            displayed_count = 0
-            
+
+            # 保存日志副本并清空原队列
+            logs_to_display = self.delayed_logs.copy()
+            self.delayed_logs = []
+
+            # 应用最大日志行数限制
+            max_lines = getattr(self, 'max_log_lines', 1000)
+            if len(logs_to_display) > max_lines:
+                # 只保留最新的max_lines条日志
+                skipped_count = len(logs_to_display) - max_lines
+                logs_to_display = logs_to_display[-max_lines:]
+                self.log_message(f"为减轻UI负担，已跳过最早的 {skipped_count} 条日志，仅显示最新 {max_lines} 条", "WARNING")
+                log_count = max_lines
+
+            # 分批显示参数
+            batch_size = 500  # 每批显示的日志数量
+            self._delayed_logs_queue = logs_to_display
+            self._delayed_logs_index = 0
+            self._delayed_logs_total = log_count
+
             # 添加分隔线标识延迟日志开始
             separator_msg = f'<span style="color: #00FF00">[======== 以下是{log_count}条延迟显示的日志 ========]</span><br>'
-            html_content += separator_msg
-            
-            for log_entry in self.delayed_logs:
-                # 显示所有延迟日志，忽略过滤器设置
-                html_content += log_entry['formatted']
-                displayed_count += 1
-            
-            # 添加分隔线标识延迟日志结束
-            end_separator_msg = f'<span style="color: #00FF00">[======== 延迟日志显示完成 ========]</span><br>'
-            html_content += end_separator_msg
-                    
-            # 一次性插入所有内容
+            self.log_text.moveCursor(QTextCursor.End)
+            self.log_text.insertHtml(separator_msg)
+
+            # 使用定时器分批加载
+            self._display_delayed_logs_batch(batch_size)
+
+        except Exception as e:
+            self.log_error("显示延迟日志时出错", e)
+
+    def _display_delayed_logs_batch(self, batch_size=500):
+        """分批显示延迟日志"""
+        try:
+            if not hasattr(self, '_delayed_logs_queue') or self._delayed_logs_index >= len(self._delayed_logs_queue):
+                # 所有日志已显示完成
+                self._finish_delayed_logs_display()
+                return
+
+            # 获取当前批次的日志
+            start_idx = self._delayed_logs_index
+            end_idx = min(start_idx + batch_size, len(self._delayed_logs_queue))
+
+            # 禁用更新以提高性能
+            self.log_text.setUpdatesEnabled(False)
+
+            # 构建当前批次的HTML
+            html_content = ""
+            for i in range(start_idx, end_idx):
+                html_content += self._delayed_logs_queue[i]['formatted']
+
+            # 插入内容
             cursor = self.log_text.textCursor()
             cursor.movePosition(QTextCursor.End)
             cursor.insertHtml(html_content)
-            
-            # 重新启用更新并滚动到底部
+
+            # 重新启用更新
             self.log_text.setUpdatesEnabled(True)
+
+            # 更新索引
+            self._delayed_logs_index = end_idx
+
+            # 计算进度
+            progress = int((end_idx / self._delayed_logs_total) * 100)
+
+            # 如果还有更多日志，使用定时器继续下一批
+            if self._delayed_logs_index < len(self._delayed_logs_queue):
+                # 更新状态（每隔几批更新一次，避免频繁更新）
+                if progress % 20 == 0 or end_idx == self._delayed_logs_total:
+                    self.status_label.setText(f"加载日志中... {progress}%")
+                # 使用定时器延迟执行下一批，让UI有机会响应
+                QTimer.singleShot(10, lambda: self._display_delayed_logs_batch(batch_size))
+            else:
+                self._finish_delayed_logs_display()
+
+        except Exception as e:
+            self.log_error("分批显示延迟日志时出错", e)
+            self._finish_delayed_logs_display()
+
+    def _finish_delayed_logs_display(self):
+        """完成延迟日志显示"""
+        try:
+            # 添加分隔线标识延迟日志结束
+            end_separator_msg = f'<span style="color: #00FF00">[======== 延迟日志显示完成 ========]</span><br>'
+            self.log_text.moveCursor(QTextCursor.End)
+            self.log_text.insertHtml(end_separator_msg)
+
+            # 滚动到底部
             self.log_text.verticalScrollBar().setValue(
                 self.log_text.verticalScrollBar().maximum()
             )
-            
-            # 清空延迟日志队列
-            self.delayed_logs = []
-            
+
             # 显示完成信息
-            self.log_message(f"延迟日志显示完成，共显示{displayed_count}条日志", "INFO")
+            total = getattr(self, '_delayed_logs_total', 0)
+            self.log_message(f"延迟日志显示完成，共显示{total}条日志", "INFO")
+            self.status_label.setText("日志加载完成")
+
+            # 清理临时变量
+            if hasattr(self, '_delayed_logs_queue'):
+                delattr(self, '_delayed_logs_queue')
+            if hasattr(self, '_delayed_logs_index'):
+                delattr(self, '_delayed_logs_index')
+            if hasattr(self, '_delayed_logs_total'):
+                delattr(self, '_delayed_logs_total')
+
+        except Exception as e:
+            self.log_error("完成延迟日志显示时出错", e)
             
         except Exception as e:
             print(f"显示延迟日志时出错: {str(e)}")
@@ -4294,15 +4706,37 @@ class KhQuantGUI(QMainWindow):
 
     def check_file_in_internal_dir(self, file_path):
         """检测文件是否保存在软件安装目录的_internal文件夹内
-        
+
         Args:
             file_path: 要检测的文件路径
-            
+
         Returns:
             bool: 如果文件在_internal目录内返回True，否则返回False
         """
-        # 开发环境，返回False（不在_internal目录）
-        return False
+        if not file_path:
+            return False
+
+        # 只在打包环境下检测
+        if not getattr(sys, 'frozen', False):
+            return False
+
+        try:
+            # 获取打包环境的_internal目录
+            if hasattr(sys, '_MEIPASS'):
+                internal_dir = sys._MEIPASS
+            else:
+                # 如果没有_MEIPASS，使用可执行文件所在目录的_internal子目录
+                exe_dir = os.path.dirname(sys.executable)
+                internal_dir = os.path.join(exe_dir, '_internal')
+
+            # 标准化路径进行比较
+            file_path_normalized = os.path.normpath(os.path.abspath(file_path)).lower()
+            internal_dir_normalized = os.path.normpath(os.path.abspath(internal_dir)).lower()
+
+            # 检查文件是否在_internal目录下
+            return file_path_normalized.startswith(internal_dir_normalized)
+        except Exception:
+            return False
 
     def show_internal_dir_warning(self, config_file_path, strategy_file_path):
         """显示文件保存在_internal目录的警告对话框
@@ -4392,18 +4826,22 @@ class KhQuantGUI(QMainWindow):
     def init_user_strategies(self):
         """初始化用户策略目录，复制默认策略文件"""
         user_strategies_dir = self.get_user_strategies_dir()
-        
+
         # 获取程序内置的默认策略文件路径
-        # 开发环境
-        default_strategies_dir = os.path.join(os.path.dirname(__file__), 'strategies')
-        
+        if getattr(sys, 'frozen', False):
+            # 打包环境 - 使用_internal目录
+            default_strategies_dir = os.path.join(sys._MEIPASS, 'strategies')
+        else:
+            # 开发环境 - 使用项目目录
+            default_strategies_dir = os.path.join(os.path.dirname(__file__), 'strategies')
+
         # 如果用户策略目录为空，复制默认策略文件
         if os.path.exists(default_strategies_dir):
             for file_name in os.listdir(default_strategies_dir):
                 if file_name.endswith(('.py', '.kh')):
                     src_file = os.path.join(default_strategies_dir, file_name)
                     dst_file = os.path.join(user_strategies_dir, file_name)
-                    
+
                     # 只有文件不存在时才复制（避免覆盖用户修改的文件）
                     if not os.path.exists(dst_file):
                         try:
@@ -4412,7 +4850,7 @@ class KhQuantGUI(QMainWindow):
                             self.log_message(f"复制默认策略文件: {file_name}", "INFO")
                         except Exception as e:
                             self.log_message(f"复制策略文件失败 {file_name}: {str(e)}", "WARNING")
-        
+
         return user_strategies_dir
 
 class CustomSplashScreen(QSplashScreen):
@@ -4483,11 +4921,12 @@ class CustomSplashScreen(QSplashScreen):
         self.center_on_screen()
         
     def center_on_screen(self):
-        """将启动画面居中显示"""
+        """将启动画面居中显示在主屏幕"""
         frame_geo = self.frameGeometry()
-        screen = QApplication.desktop().screenNumber(
-            QApplication.desktop().cursor().pos())
-        center_point = QApplication.desktop().screenGeometry(screen).center()
+        # 使用主屏幕而不是跟随鼠标位置
+        desktop = QApplication.desktop()
+        primary_screen = desktop.primaryScreen()
+        center_point = desktop.screenGeometry(primary_screen).center()
         frame_geo.moveCenter(center_point)
         self.move(frame_geo.topLeft())
     
@@ -4562,14 +5001,37 @@ class NoWheelTimeEdit(QTimeEdit):
 
 class DisclaimerDialog(QDialog):
     """免责声明弹窗"""
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("看海量化回测系统 - 免责声明")
         self.setModal(True)
         self.setFixedSize(800, 600)
         self.center_on_screen()
-        
+
+        # 设置窗口标题栏颜色（仅适用于Windows）
+        if sys.platform == 'win32':
+            try:
+                from ctypes import windll, c_int, byref, sizeof
+                from ctypes.wintypes import DWORD
+                DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                DWMWA_CAPTION_COLOR = 35
+                windll.dwmapi.DwmSetWindowAttribute(
+                    int(self.winId()),
+                    DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    byref(c_int(2)),
+                    sizeof(c_int)
+                )
+                caption_color = DWORD(0x2b2b2b)
+                windll.dwmapi.DwmSetWindowAttribute(
+                    int(self.winId()),
+                    DWMWA_CAPTION_COLOR,
+                    byref(caption_color),
+                    sizeof(caption_color)
+                )
+            except Exception as e:
+                logging.warning(f"设置标题栏深色模式失败: {str(e)}")
+
         # 设置样式
         self.setStyleSheet("""
             QDialog {
@@ -4611,9 +5073,12 @@ class DisclaimerDialog(QDialog):
         self.init_ui()
         
     def center_on_screen(self):
-        """将对话框居中显示"""
+        """将对话框居中显示在主屏幕"""
         from PyQt5.QtWidgets import QApplication
-        screen = QApplication.desktop().screenGeometry()
+        # 使用主屏幕而不是跟随鼠标位置
+        desktop = QApplication.desktop()
+        primary_screen = desktop.primaryScreen()
+        screen = desktop.screenGeometry(primary_screen)
         size = self.geometry()
         self.move(
             (screen.width() - size.width()) // 2,
@@ -4851,9 +5316,13 @@ def main():
         
         # 获取图标路径函数
         def get_app_icon_path(icon_name):
-            # 开发环境
-            return os.path.join(os.path.dirname(__file__), 'icons', icon_name)
-        
+            if getattr(sys, 'frozen', False):
+                # 打包环境 - 使用_internal目录
+                return os.path.join(sys._MEIPASS, 'icons', icon_name)
+            else:
+                # 开发环境 - 使用项目目录
+                return os.path.join(os.path.dirname(__file__), 'icons', icon_name)
+
         # 设置应用程序图标
         icon_file = get_app_icon_path('stock_icon.ico')
         if os.path.exists(icon_file):
@@ -4869,9 +5338,14 @@ def main():
                 logging.info(f"成功加载应用图标(PNG): {icon_file_png}")
             else:
                 logging.warning(f"图标文件不存在: {icon_file} 和 {icon_file_png}")
-        
+
         # 获取图标目录路径（用于启动画面）
-        icon_path = os.path.join(os.path.dirname(__file__), 'icons')
+        if getattr(sys, 'frozen', False):
+            # 打包环境 - 使用_internal目录
+            icon_path = os.path.join(sys._MEIPASS, 'icons')
+        else:
+            # 开发环境 - 使用项目目录
+            icon_path = os.path.join(os.path.dirname(__file__), 'icons')
             
         logging.info(f"图标目录路径: {icon_path}")
             
@@ -4926,8 +5400,9 @@ def main():
                         QApplication.quit()
                         return
                     
-                    # 显示主窗口
-                    window.showMaximized()  # 直接调用showMaximized()而不是show()
+                    # 显示主窗口在主屏幕居中
+                    window.center_window()  # 先居中
+                    window.show()  # 然后显示
                     window.raise_()
                     window.activateWindow()
                 except Exception as e:
@@ -4985,16 +5460,17 @@ def main():
         logging.critical(f"程序异常退出: {str(e)}", exc_info=True)
         return 1
 
+
 if __name__ == "__main__":
-    # 多进程保护，确保只有主进程才能启动GUI
+    # 多进程保护必须最先执行
     import multiprocessing
     multiprocessing.freeze_support()  # Windows多进程支持
-    
+
     # 设置多进程的启动方法
     try:
         multiprocessing.set_start_method('spawn', force=True)
     except RuntimeError:
         # 如果启动方法已经设置过，则跳过
         pass
-    
-    sys.exit(main()) 
+
+    sys.exit(main())

@@ -157,8 +157,8 @@ class SettingsDialog(QDialog):
                 border: 2px solid #5D5D5D;
             }
         """)
-        # 从设置中读取延迟显示状态，如果不存在则使用默认值False
-        delay_log_enabled = self.settings.value('delay_log_display', False, type=bool)
+        # 从设置中读取延迟显示状态，如果不存在则使用默认值True
+        delay_log_enabled = self.settings.value('delay_log_display', True, type=bool)
         self.delay_log_checkbox.setChecked(delay_log_enabled)
         
         delay_log_layout.addWidget(delay_log_label)
@@ -168,7 +168,41 @@ class SettingsDialog(QDialog):
         # 添加说明标签
         delay_log_desc = QLabel("启用后，策略运行期间的日志将在策略完成后统一显示，提升性能并避免干扰")
         delay_log_desc.setStyleSheet("color: #A0A0A0; font-size: 12px;")
-        
+
+        # 添加最大日志显示行数设置
+        max_log_lines_layout = QHBoxLayout()
+        max_log_lines_label = QLabel("最大日志显示行数:")
+        max_log_lines_label.setStyleSheet("color: #E0E0E0;")
+        self.max_log_lines_edit = QLineEdit()
+        self.max_log_lines_edit.setStyleSheet("""
+            QLineEdit {
+                border: 1px solid #3D3D3D;
+                border-radius: 2px;
+                padding: 5px;
+                background-color: #2D2D2D;
+                color: #E0E0E0;
+            }
+            QLineEdit:focus {
+                border: 1px solid #5D5D5D;
+            }
+        """)
+        self.max_log_lines_edit.setFixedWidth(100)
+        # 从设置中读取最大日志行数，默认1000
+        max_log_lines = self.settings.value('max_log_lines', 1000, type=int)
+        self.max_log_lines_edit.setText(str(max_log_lines))
+
+        # 设置验证器，只允许输入正整数
+        from PyQt5.QtGui import QIntValidator
+        self.max_log_lines_edit.setValidator(QIntValidator(100, 100000))
+
+        max_log_lines_layout.addWidget(max_log_lines_label)
+        max_log_lines_layout.addWidget(self.max_log_lines_edit)
+        max_log_lines_layout.addStretch()
+
+        # 添加说明标签
+        max_log_lines_desc = QLabel("限制系统日志显示的最大行数，减少UI负担（范围: 100-100000）")
+        max_log_lines_desc.setStyleSheet("color: #A0A0A0; font-size: 12px;")
+
         # 添加初始化行情数据设置
         init_data_layout = QHBoxLayout()
         init_data_label = QLabel("初始化行情数据:")
@@ -196,8 +230,8 @@ class SettingsDialog(QDialog):
                 border: 2px solid #5D5D5D;
             }
         """)
-        # 从设置中读取初始化行情数据状态
-        init_data_enabled = self.settings.value('init_data_enabled', True, type=bool)
+        # 从设置中读取初始化行情数据状态，默认关闭
+        init_data_enabled = self.settings.value('init_data_enabled', False, type=bool)
         self.init_data_checkbox.setChecked(init_data_enabled)
         
         init_data_layout.addWidget(init_data_label)
@@ -269,6 +303,8 @@ class SettingsDialog(QDialog):
         basic_params_layout.addWidget(risk_free_rate_desc)
         basic_params_layout.addLayout(delay_log_layout)
         basic_params_layout.addWidget(delay_log_desc)
+        basic_params_layout.addLayout(max_log_lines_layout)
+        basic_params_layout.addWidget(max_log_lines_desc)
         basic_params_layout.addLayout(init_data_layout)
         basic_params_layout.addWidget(init_data_desc)
         basic_params_layout.addWidget(account_label)
@@ -548,7 +584,19 @@ class SettingsDialog(QDialog):
             # 保存延迟显示日志状态
             delay_log_enabled = self.delay_log_checkbox.isChecked()
             self.settings.setValue('delay_log_display', delay_log_enabled)
-            
+
+            # 保存最大日志显示行数
+            max_log_lines_text = self.max_log_lines_edit.text().strip()
+            try:
+                max_log_lines = int(max_log_lines_text)
+                if max_log_lines < 100 or max_log_lines > 100000:
+                    QMessageBox.warning(self, "警告", "最大日志显示行数应在100到100000之间")
+                    return
+                self.settings.setValue('max_log_lines', max_log_lines)
+            except ValueError:
+                QMessageBox.warning(self, "警告", "最大日志显示行数必须是有效的整数")
+                return
+
             # 保存初始化行情数据状态
             init_data_enabled = self.init_data_checkbox.isChecked()
             self.settings.setValue('init_data_enabled', init_data_enabled)

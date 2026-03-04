@@ -1,6 +1,6 @@
 {
     "system": {
-        "userdata_path": "I:/Program Files/qmt/国金QMT交易端模拟/userdata_mini"
+        "userdata_path": "I:/国金证券QMT交易端/userdata_mini"
     },
     "run_mode": "backtest",
     "account": {

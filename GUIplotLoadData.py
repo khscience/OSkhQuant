@@ -35,6 +35,30 @@ class HelpDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("帮助")
         self.setFixedSize(400, 300)
+
+        # 设置窗口标题栏颜色（仅适用于Windows）
+        if sys.platform == 'win32':
+            try:
+                from ctypes import windll, c_int, byref, sizeof
+                from ctypes.wintypes import DWORD
+                DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                DWMWA_CAPTION_COLOR = 35
+                windll.dwmapi.DwmSetWindowAttribute(
+                    int(self.winId()),
+                    DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    byref(c_int(2)),
+                    sizeof(c_int)
+                )
+                caption_color = DWORD(0x2b2b2b)
+                windll.dwmapi.DwmSetWindowAttribute(
+                    int(self.winId()),
+                    DWMWA_CAPTION_COLOR,
+                    byref(caption_color),
+                    sizeof(caption_color)
+                )
+            except Exception:
+                pass
+
         layout = QVBoxLayout()
         help_text = QLabel("""
         使用说明：

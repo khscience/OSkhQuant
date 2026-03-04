@@ -89,7 +89,7 @@ class KhConfig:
     def save_config(self):
         """保存配置到文件"""
         try:
-            with open(self.config_path, "w", encoding="utf-8", ensure_ascii=False) as f:
+            with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(self.config_dict, f, indent=4, ensure_ascii=False)
         except Exception as e:
             raise Exception(f"保存配置文件失败: {str(e)}")

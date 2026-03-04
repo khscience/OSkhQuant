@@ -71,9 +71,11 @@ class LoadingDialog(QDialog):
         self.center_on_screen()
         
     def center_on_screen(self):
-        """在屏幕中央显示"""
+        """在主屏幕中央显示"""
         desktop = QDesktopWidget()
-        screen = desktop.screenGeometry()
+        # 使用主屏幕而不是跟随鼠标位置
+        primary_screen = desktop.primaryScreen()
+        screen = desktop.screenGeometry(primary_screen)
         x = (screen.width() - self.width()) // 2
         y = (screen.height() - self.height()) // 2
         self.move(x, y)
@@ -264,9 +266,11 @@ class MiniQMTDataViewer(QMainWindow):
         self.load_data_structure()
     
     def center_main_window(self):
-        """将主窗口居中显示在屏幕上"""
+        """将主窗口居中显示在主屏幕上"""
         desktop = QDesktopWidget()
-        screen = desktop.screenGeometry()
+        # 使用主屏幕而不是跟随鼠标位置
+        primary_screen = desktop.primaryScreen()
+        screen = desktop.screenGeometry(primary_screen)
         x = (screen.width() - self.width()) // 2
         y = (screen.height() - self.height()) // 2
         self.move(x, y)

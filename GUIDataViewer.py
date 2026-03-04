@@ -20,17 +20,40 @@ from xtquant import xtdata
 
 class LoadingDialog(QDialog):
     """加载进度对话框"""
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.initUI()
-        
+
     def initUI(self):
         self.setWindowTitle("正在加载...")
         self.setFixedSize(300, 120)
         self.setModal(True)  # 设置为模态对话框
         self.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)  # 移除关闭按钮
-        
+
+        # 设置窗口标题栏颜色（仅适用于Windows）
+        if sys.platform == 'win32':
+            try:
+                from ctypes import windll, c_int, byref, sizeof
+                from ctypes.wintypes import DWORD
+                DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                DWMWA_CAPTION_COLOR = 35
+                windll.dwmapi.DwmSetWindowAttribute(
+                    int(self.winId()),
+                    DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    byref(c_int(2)),
+                    sizeof(c_int)
+                )
+                caption_color = DWORD(0x2b2b2b)
+                windll.dwmapi.DwmSetWindowAttribute(
+                    int(self.winId()),
+                    DWMWA_CAPTION_COLOR,
+                    byref(caption_color),
+                    sizeof(caption_color)
+                )
+            except Exception:
+                pass
+
         # 设置对话框样式
         self.setStyleSheet("""
             QDialog {
@@ -76,9 +99,11 @@ class LoadingDialog(QDialog):
         self.center_on_screen()
         
     def center_on_screen(self):
-        """在屏幕中央显示"""
+        """在主屏幕中央显示"""
         desktop = QDesktopWidget()
-        screen = desktop.screenGeometry()
+        # 使用主屏幕而不是跟随鼠标位置
+        primary_screen = desktop.primaryScreen()
+        screen = desktop.screenGeometry(primary_screen)
         x = (screen.width() - self.width()) // 2
         y = (screen.height() - self.height()) // 2
         self.move(x, y)
@@ -763,9 +788,11 @@ class GUIDataViewer(QMainWindow):
             return os.path.join(os.path.dirname(__file__), 'icons', icon_name)
     
     def center_main_window(self):
-        """将主窗口居中显示在屏幕上"""
+        """将主窗口居中显示在主屏幕上"""
         desktop = QDesktopWidget()
-        screen = desktop.screenGeometry()
+        # 使用主屏幕而不是跟随鼠标位置
+        primary_screen = desktop.primaryScreen()
+        screen = desktop.screenGeometry(primary_screen)
         x = (screen.width() - self.width()) // 2
         y = (screen.height() - self.height()) // 2
         self.move(x, y)
@@ -1250,7 +1277,7 @@ class GUIDataViewer(QMainWindow):
                 border-right: 1px solid #4d4d4d;
                 border-bottom: 1px solid #4d4d4d;
                 font-weight: bold;
-                font-size: 14px;
+                font-size: 16px;
             }
             QHeaderView::section:hover {
                 background-color: #454545;
@@ -1486,6 +1513,7 @@ class GUIDataViewer(QMainWindow):
     def load_stock_names(self):
         """加载股票名称映射"""
         try:
+            # 加载全部股票列表
             stock_list_file = os.path.join(os.path.dirname(__file__), 'data', '全部股票_股票列表.csv')
             if os.path.exists(stock_list_file):
                 with open(stock_list_file, 'r', encoding='utf-8-sig') as f:
@@ -2621,7 +2649,7 @@ class GUIDataViewer(QMainWindow):
                     border-right: 1px solid #4d4d4d;
                     border-bottom: 1px solid #4d4d4d;
                     font-weight: bold;
-                    font-size: 14px;
+                    font-size: 16px;
                 }
                 QHeaderView::section:hover {
                     background-color: #454545;
@@ -2686,9 +2714,14 @@ class GUIDataViewer(QMainWindow):
             print("===================")
             
             # 重新设置表头项，确保蓝色能正确显示
+            header_font = QFont()
+            header_font.setPixelSize(16)  # 设置字体大小为16px
+            header_font.setBold(True)
+
             for i, (col, chinese_name) in enumerate(zip(df.columns, chinese_headers)):
                 header_item = QTableWidgetItem(chinese_name)
-                
+                header_item.setFont(header_font)  # 设置字体
+
                 if chinese_name in calculated_chinese_names:
                     # 为计算字段的表头设置蓝色样式
                     header_item.setForeground(QColor('#2E6DA4'))  # 深蓝色
@@ -2699,7 +2732,7 @@ class GUIDataViewer(QMainWindow):
                     header_item.setForeground(QColor('#e8e8e8'))  # 默认白色
                     header_item.setBackground(QColor('#404040'))  # 保持背景色一致
                     header_item.setToolTip(f"原始字段: {chinese_name} (市场原始数据)")
-                
+
                 self.table_widget.setHorizontalHeaderItem(i, header_item)
             
             # 强制刷新表头显示

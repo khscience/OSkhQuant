@@ -260,3 +260,10 @@ docs/_build/
 doc/_build/ 
 __pycache__/
 app.log
+__pycache__
+installer copy.iss
+installer.iss
+build_inno.bat
+__pycache__/GUIplotLoadData.cpython-311.pyc
+Output
+app.log

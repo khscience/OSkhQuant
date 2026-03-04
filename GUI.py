@@ -1275,7 +1275,7 @@ class StockDataProcessorGUI(QMainWindow):
             
             /* 文本编辑器样式 */
             QTextEdit, QPlainTextEdit {{
-                background-color: #333333;
+                background-color: #2b2b2b;
                 border: 1px solid #3c3c3c;
                 border-radius: 4px;
                 color: #f0f0f0;
@@ -2421,8 +2421,8 @@ class StockDataProcessorGUI(QMainWindow):
         stock_layout.addWidget(preview_group, 1)  # 伸展因子为1
         
         # 连接复选框信号
-        for checkbox in self.stock_checkboxes.values():
-            checkbox.stateChanged.connect(self.update_stock_files_preview)
+        for stock_type, checkbox in self.stock_checkboxes.items():
+            checkbox.stateChanged.connect(lambda state, st=stock_type: self.on_stock_checkbox_changed(st, state))
         
         stocks_group.setLayout(stock_layout)
         # 为整个股票组设置大小策略，让它能够扩展
@@ -2482,6 +2482,11 @@ class StockDataProcessorGUI(QMainWindow):
             logging.error(f"添加自定义股票列表文件时出错: {str(e)}", exc_info=True)
             QMessageBox.warning(self, "错误", f"添加文件时出错: {str(e)}")
 
+    def on_stock_checkbox_changed(self, stock_type, state):
+        """股票池复选框状态改变处理"""
+        # 更新预览
+        self.update_stock_files_preview()
+    
     def update_stock_files_preview(self):
         """更新选中的股票文件预览"""
         try:
@@ -2498,7 +2503,8 @@ class StockDataProcessorGUI(QMainWindow):
                     # 修改这里：排除所有预定义的文件名，包括自选清单
                     if line.strip() and not any(board_name in line for board_name in [
                         '上证A股', '深证A股', '创业板', '科创板', '沪深A股', '指数',
-                        '中证500成分股', '沪深300成分股', '上证50成分股', '沪深转债', 'otheridx.csv'  # 添加沪深转债和otheridx.csv
+                        '中证500成分股', '沪深300成分股', '上证50成分股', '沪深转债',
+                        'otheridx.csv'
                     ]):
                         custom_files.append(line.strip())
             
@@ -3652,8 +3658,8 @@ class CustomSplashScreen(QSplashScreen):
     def center_on_screen(self):
         """将启动画面居中显示"""
         frame_geo = self.frameGeometry()
-        screen = QApplication.desktop().screenNumber(
-            QApplication.desktop().cursor().pos())
+        # 使用主屏幕（而非鼠标所在屏幕）
+        screen = QApplication.desktop().primaryScreen()
         center_point = QApplication.desktop().screenGeometry(screen).center()
         frame_geo.moveCenter(center_point)
         self.move(frame_geo.topLeft())

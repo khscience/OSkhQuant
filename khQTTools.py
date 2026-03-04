@@ -75,6 +75,215 @@ _trading_periods = [
 ]
 _cn_holidays = holidays.China()
 
+# 默认价格精度（股票为2位，ETF为3位）
+_default_price_decimals = 2
+
+def is_etf(stock_code: str) -> bool:
+    """判断是否为ETF（不包括LOF）
+    
+    Args:
+        stock_code: 股票代码，如 "510300.SH" 或 "159915.SZ"
+        
+    Returns:
+        bool: 是否为ETF
+        
+    说明:
+        上海ETF: 51(主流)、52(跨境)、53(部分)、55(债券)、56(新规)、58(科创)
+        深圳ETF: 159开头（深交所ETF统一为159开头）
+        注意：50/16开头是LOF，不是ETF
+    """
+    # 去除后缀，取前6位数字
+    code = stock_code.split('.')[0]
+    
+    # 上海ETF前缀
+    sh_etf_prefixes = ('51', '52', '53', '55', '56', '58')
+    # 深圳ETF前缀
+    sz_etf_prefix = '159'
+    
+    return code.startswith(sh_etf_prefixes) or code.startswith(sz_etf_prefix)
+
+def determine_pool_type(stock_list: List[str]) -> tuple:
+    """判断股票池类型，返回类型和对应的价格精度
+    
+    Args:
+        stock_list: 股票代码列表
+        
+    Returns:
+        tuple: (pool_type, price_decimals)
+            pool_type: 'stock_only' | 'etf_only' | 'mixed'
+            price_decimals: 2（纯股票）或 3（含ETF或混合）
+    """
+    if not stock_list:
+        return ('stock_only', 2)
+    
+    has_stock = any(not is_etf(code) for code in stock_list)
+    has_etf = any(is_etf(code) for code in stock_list)
+    
+    if has_stock and not has_etf:
+        # 纯股票池，使用2位小数
+        return ('stock_only', 2)
+    elif has_etf and not has_stock:
+        # 纯ETF池，使用3位小数
+        return ('etf_only', 3)
+    else:
+        # 混合池，使用3位小数
+        return ('mixed', 3)
+
+# ==================== T+0交易模式相关函数 ====================
+
+# 全局缓存T0 ETF列表，避免重复读取文件
+_t0_etf_cache = None
+
+def load_t0_etf_list() -> set:
+    """加载T0型ETF列表
+    
+    Returns:
+        set: T0型ETF的股票代码集合
+    """
+    global _t0_etf_cache
+    
+    if _t0_etf_cache is not None:
+        return _t0_etf_cache
+    
+    _t0_etf_cache = set()
+    
+    # 获取T0型ETF.csv文件路径
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    t0_file = os.path.join(current_dir, 'data', 'T0型ETF.csv')
+    
+    if not os.path.exists(t0_file):
+        logging.warning(f"T0型ETF列表文件不存在: {t0_file}")
+        return _t0_etf_cache
+    
+    try:
+        with open(t0_file, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if row and len(row) >= 1:
+                    stock_code = row[0].strip()
+                    if stock_code:
+                        _t0_etf_cache.add(stock_code)
+        logging.info(f"已加载 {len(_t0_etf_cache)} 只T0型ETF")
+    except Exception as e:
+        logging.error(f"加载T0型ETF列表失败: {e}")
+    
+    return _t0_etf_cache
+
+def is_t0_etf(stock_code: str) -> bool:
+    """判断单个股票是否支持T+0交易
+    
+    Args:
+        stock_code: 股票代码，如 '159001.SZ'
+        
+    Returns:
+        bool: 是否支持T+0
+    """
+    t0_list = load_t0_etf_list()
+    return stock_code in t0_list
+
+def check_t0_support(stock_list: List[str]) -> tuple:
+    """检验股票池的T+0支持情况
+    
+    Args:
+        stock_list: 股票代码列表
+        
+    Returns:
+        tuple: (support_type, is_t0_mode)
+            support_type: 'all_t0' | 'mixed' | 'no_t0'
+            is_t0_mode: True（全T+0）/ False（其他情况）
+    """
+    if not stock_list:
+        return ('no_t0', False)
+    
+    t0_list = load_t0_etf_list()
+    t0_count = sum(1 for code in stock_list if code in t0_list)
+    total_count = len(stock_list)
+    
+    if t0_count == total_count:
+        # 全部是T+0 ETF
+        return ('all_t0', True)
+    elif t0_count > 0:
+        # 混合：部分支持T+0，部分不支持
+        return ('mixed', False)
+    else:
+        # 全部不支持T+0
+        return ('no_t0', False)
+
+def get_t0_details(stock_list: List[str]) -> dict:
+    """获取股票池中T+0支持的详细信息
+    
+    Args:
+        stock_list: 股票代码列表
+        
+    Returns:
+        dict: {
+            't0_stocks': List[str],  # 支持T+0的股票
+            'non_t0_stocks': List[str],  # 不支持T+0的股票
+            't0_count': int,
+            'total_count': int
+        }
+    """
+    t0_list = load_t0_etf_list()
+    t0_stocks = [code for code in stock_list if code in t0_list]
+    non_t0_stocks = [code for code in stock_list if code not in t0_list]
+    
+    return {
+        't0_stocks': t0_stocks,
+        'non_t0_stocks': non_t0_stocks,
+        't0_count': len(t0_stocks),
+        'total_count': len(stock_list)
+    }
+
+# ==================== 价格精度相关函数 ====================
+
+def get_price_decimals(data: Dict = None) -> int:
+    """从数据字典中获取价格精度设置
+    
+    Args:
+        data: 策略接收的数据对象，包含框架信息 __framework__
+        
+    Returns:
+        int: 价格精度（小数位数），默认为2
+    """
+    if data is None:
+        return _default_price_decimals
+    
+    framework = data.get("__framework__", None)
+    if framework and hasattr(framework, 'price_decimals'):
+        return framework.price_decimals
+    
+    return _default_price_decimals
+
+def round_price(price: float, decimals: int = None, data: Dict = None) -> float:
+    """根据精度设置对价格进行四舍五入
+    
+    Args:
+        price: 原始价格
+        decimals: 精度（小数位数），如果为None则从data中获取
+        data: 策略接收的数据对象
+        
+    Returns:
+        float: 四舍五入后的价格
+    """
+    if decimals is None:
+        decimals = get_price_decimals(data)
+    return round(price, decimals)
+
+def format_price(price: float, decimals: int = None, data: Dict = None) -> str:
+    """根据精度设置格式化价格为字符串
+    
+    Args:
+        price: 价格
+        decimals: 精度（小数位数），如果为None则从data中获取
+        data: 策略接收的数据对象
+        
+    Returns:
+        str: 格式化后的价格字符串
+    """
+    if decimals is None:
+        decimals = get_price_decimals(data)
+    return f"{price:.{decimals}f}"
+
 def is_trade_time() -> bool:
     """判断是否为交易时间"""
     current = time.strftime("%H%M%S")
@@ -274,10 +483,12 @@ class KhQuTools:
             raise ValueError(f"股票 {stock_code} 数据量不足 {period} 条，无法计算 MA{period}")
 
         prices = data[stock_code][field]
-        return round(prices.mean(), 2)
+        # 使用动态精度（根据是否为ETF判断）
+        decimals = 3 if is_etf(stock_code) else 2
+        return round(prices.mean(), decimals)
 
 
-def khMA(stock_code: str, period: int, field: str = 'close', fre_step: str = '1d', end_time: Optional[str] = None, fq: str = 'pre') -> float:
+def khMA(stock_code: str, period: int, field: str = 'close', fre_step: str = '1d', end_time: Optional[str] = None, fq: str = 'pre', data: Dict = None) -> float:
     """计算移动平均线（独立函数版本）
 
     Args:
@@ -287,6 +498,7 @@ def khMA(stock_code: str, period: int, field: str = 'close', fre_step: str = '1d
         fre_step: 时间频率，如'1d', '1m'等
         end_time: 结束时间，如果为None使用当前时间
         fq: 复权方式，'pre'前复权, 'post'后复权, 'none'不复权
+        data: 策略接收的数据对象，用于获取精度设置（可选）
 
     Returns:
         float: 移动平均值
@@ -309,7 +521,7 @@ def khMA(stock_code: str, period: int, field: str = 'close', fre_step: str = '1d
         raise ValueError("不在交易时间内，无法计算日内移动平均线")
 
     # 获取历史数据（不包含当前时间点）
-    data = khHistory(
+    history_data = khHistory(
         symbol_list=stock_code,
         fields=[field],
         bar_count=period,
@@ -319,11 +531,13 @@ def khMA(stock_code: str, period: int, field: str = 'close', fre_step: str = '1d
         force_download=False  # 不强制下载数据，提高回测速度
     )
 
-    if stock_code not in data or len(data[stock_code]) < period:
+    if stock_code not in history_data or len(history_data[stock_code]) < period:
         raise ValueError(f"股票 {stock_code} 数据量不足 {period} 条，无法计算均线{period}")
 
-    prices = data[stock_code][field]
-    return round(prices.mean(), 2)
+    prices = history_data[stock_code][field]
+    # 优先从传入的data中获取精度设置，否则根据股票代码判断
+    decimals = get_price_decimals(data) if data else (3 if is_etf(stock_code) else 2)
+    return round(prices.mean(), decimals)
 
 
 def calculate_max_buy_volume(data: Dict, stock_code: str, price: float, cash_ratio: float = 1.0) -> int:
@@ -360,8 +574,10 @@ def calculate_max_buy_volume(data: Dict, stock_code: str, price: float, cash_rat
             logging.warning(f"股票 {stock_code} 价格异常: {price}，无法计算买入量")
             return 0
 
-        # 对价格进行四舍五入处理，保留2位小数（A股价格精度为分）
-        price = round(price, 2)
+        # 获取价格精度设置
+        decimals = get_price_decimals(data)
+        # 对价格进行四舍五入处理
+        price = round(price, decimals)
 
         # 获取框架对象
         framework = data.get("__framework__", None)
@@ -403,9 +619,9 @@ def calculate_max_buy_volume(data: Dict, stock_code: str, price: float, cash_rat
             total_cost = actual_price * shares + trade_cost
 
             if total_cost <= usable_cash:
-                logging.info(f"计算买入量: 股票={stock_code}, 原始价格={price:.2f}, 考虑滑点后价格={actual_price:.2f}, "
-                           f"可用现金={available_cash:.2f}, 使用比例={cash_ratio:.2f}, "
-                           f"计划买入={shares}, 成本={trade_cost:.2f}, 总花费={total_cost:.2f}")
+                logging.info(f"计算买入量: 股票={stock_code}, 原始价格={price:.{decimals}f}, 考虑滑点后价格={actual_price:.{decimals}f}, "
+                           f"可用现金={available_cash:.{decimals}f}, 使用比例={cash_ratio:.2f}, "
+                           f"计划买入={shares}, 成本={trade_cost:.2f}, 总花费={total_cost:.{decimals}f}")
                 return int(shares) # 确保返回整数
 
             shares -= 100 # 减少一手
@@ -436,8 +652,10 @@ def generate_signal(data: Dict, stock_code: str, price: float, ratio: float, act
     current_time = data.get("__current_time__", {})
     timestamp = current_time.get("timestamp")
     
-    # 对价格进行四舍五入处理，保留2位小数（A股价格精度为分）
-    price = round(price, 2)
+    # 获取价格精度设置
+    decimals = get_price_decimals(data)
+    # 对价格进行四舍五入处理
+    price = round(price, decimals)
 
     if action == "buy":
         # 判断ratio是否大于1，若大于1则表示买入股数
@@ -452,7 +670,7 @@ def generate_signal(data: Dict, stock_code: str, price: float, ratio: float, act
             # 计算最大可买入量进行验证
             max_volume = calculate_max_buy_volume(data, stock_code, price, cash_ratio=1.0)
             if max_volume == 0:
-                logging.warning(f"无法生成买入信号: 股票={stock_code}, 价格={price:.2f}, 目标股数={target_volume}, 但资金不足无法买入")
+                logging.warning(f"无法生成买入信号: 股票={stock_code}, 价格={price:.{decimals}f}, 目标股数={target_volume}, 但资金不足无法买入")
                 return []
             elif target_volume > max_volume:
                 logging.warning(f"目标买入量超过最大可买入量: 股票={stock_code}, 目标={target_volume}, 最大可买={max_volume}, 将调整为最大可买入量")
@@ -465,7 +683,7 @@ def generate_signal(data: Dict, stock_code: str, price: float, ratio: float, act
                 "action": "buy",
                 "price": price,  # 价格已在函数开始时四舍五入
                 "volume": actual_volume,
-                "reason": reason or f"按价格 {price:.2f} 买入 {actual_volume}股({actual_volume//100}手)"
+                "reason": reason or f"按价格 {price:.{decimals}f} 买入 {actual_volume}股({actual_volume//100}手)"
             }
             if timestamp:
                 signal["timestamp"] = timestamp
@@ -480,14 +698,14 @@ def generate_signal(data: Dict, stock_code: str, price: float, ratio: float, act
                     "action": "buy",
                     "price": price,  # 价格已在函数开始时四舍五入
                     "volume": max_volume,
-                    "reason": reason or f"按价格 {price:.2f} 以 {ratio*100:.0f}% 资金比例买入"
+                    "reason": reason or f"按价格 {price:.{decimals}f} 以 {ratio*100:.0f}% 资金比例买入"
                 }
                 if timestamp:
                     signal["timestamp"] = timestamp
                 signals.append(signal)
                 logging.info(f"生成买入信号: {signal}")
             else:
-                logging.warning(f"无法生成买入信号: 股票={stock_code}, 价格={price:.2f}, 资金比例={ratio:.2f}, 计算可买量为0")
+                logging.warning(f"无法生成买入信号: 股票={stock_code}, 价格={price:.{decimals}f}, 资金比例={ratio:.2f}, 计算可买量为0")
 
     elif action == "sell":
         positions_info = data.get("__positions__", {})
@@ -505,14 +723,14 @@ def generate_signal(data: Dict, stock_code: str, price: float, ratio: float, act
                         "action": "sell",
                         "price": price,  # 价格已在函数开始时四舍五入
                         "volume": int(sell_volume), # 确保是整数
-                        "reason": reason or f"按价格 {price:.2f} 卖出 {ratio*100:.0f}% 可用持仓"
+                        "reason": reason or f"按价格 {price:.{decimals}f} 卖出 {ratio*100:.0f}% 可用持仓"
                     }
                     if timestamp:
                         signal["timestamp"] = timestamp
                     signals.append(signal)
                     logging.info(f"生成卖出信号: {signal}")
                 else:
-                    logging.warning(f"无法生成卖出信号: 股票={stock_code}, 价格={price:.2f}, 持仓比例={ratio:.2f}, 计算可卖量为0 (可用持仓={available_volume})")
+                    logging.warning(f"无法生成卖出信号: 股票={stock_code}, 价格={price:.{decimals}f}, 持仓比例={ratio:.2f}, 计算可卖量为0 (可用持仓={available_volume})")
             else:
                 logging.warning(f"无法生成卖出信号: 股票={stock_code} 无可用持仓")
         else:
@@ -1170,6 +1388,7 @@ def get_stock_list():
             'zz500_components': [],  # 中证500成分股
             'sz50_components': [],   # 上证50成分股
             'hs_convertible_bonds': [],  # 沪深转债
+            'hs_etf': [],  # 沪深ETF
         }
         
         # 重要指数列表
@@ -1297,6 +1516,40 @@ def get_stock_list():
             except Exception as e:
                 logging.error(f"获取{cb_name}列表时出错: {str(e)}")
 
+        # 获取沪深ETF成分股
+        etf_mapping = {
+            '沪深ETF': 'hs_etf'
+        }
+        
+        for etf_name, dict_key in etf_mapping.items():
+            try:
+                logging.info(f"获取{etf_name}成分股...")
+                etf_stocks = xtdata.get_stock_list_in_sector(etf_name)
+                if etf_stocks:
+                    logging.info(f"获取到 {len(etf_stocks)} 只{etf_name}")
+                    for code in etf_stocks:
+                        try:
+                            detail = xtdata.get_instrument_detail(code)
+                            if detail:
+                                if isinstance(detail, str):
+                                    detail = ast.literal_eval(detail)
+                                name = detail.get('InstrumentName', '')
+                                if name:
+                                    etf_info = {
+                                        'code': code,
+                                        'name': name
+                                    }
+                                    stock_dict[dict_key].append(etf_info)
+                                    # 不将ETF添加到all_stocks中，因为它们是基金而非股票
+                        except Exception as e:
+                            logging.error(f"处理{etf_name} {code} 时出错: {str(e)}")
+                            continue
+                    logging.info(f"成功添加 {len(stock_dict[dict_key])} 只{etf_name}")
+                else:
+                    logging.warning(f"未获取到{etf_name}")
+            except Exception as e:
+                logging.error(f"获取{etf_name}列表时出错: {str(e)}")
+
         # 添加指数并同时添加到all_stocks
         stock_dict['indices'] = important_indices
         for index in important_indices:
@@ -1336,7 +1589,8 @@ def save_stock_list_to_csv(stock_dict, output_dir):
             'hs300_components': '沪深300成分股',
             'zz500_components': '中证500成分股',
             'sz50_components': '上证50成分股',
-            'hs_convertible_bonds': '沪深转债'
+            'hs_convertible_bonds': '沪深转债',
+            'hs_etf': '沪深ETF'
         }
         
         # 为每个板块创建CSV文件
@@ -1344,6 +1598,8 @@ def save_stock_list_to_csv(stock_dict, output_dir):
             # 保存单个板块文件，沪深转债使用特定文件名
             if board == 'hs_convertible_bonds':
                 file_path = os.path.join(output_dir, "沪深转债_列表.csv")
+            elif board == 'hs_etf':
+                file_path = os.path.join(output_dir, "沪深ETF_成分股列表.csv")
             else:
                 file_path = os.path.join(output_dir, f"{board_names[board]}_股票列表.csv")
             with open(file_path, 'w', encoding='utf-8-sig') as f:
@@ -1417,6 +1673,7 @@ def get_stock_list_for_subprocess(queue):
         'zz500_components': [],  # 中证500成分股
         'sz50_components': [],   # 上证50成分股
         'hs_convertible_bonds': [],  # 沪深转债
+        'hs_etf': [],  # 沪深ETF
     }
     
     # 重要指数列表
@@ -1534,6 +1791,31 @@ def get_stock_list_for_subprocess(queue):
     except Exception as e:
         print(f"[更新进度] 获取沪深转债失败: {str(e)}", flush=True)
 
+    # 获取沪深ETF成分股
+    queue.put(("progress", "正在获取沪深ETF..."))
+    print(f"[更新进度] 正在获取沪深ETF...", flush=True)
+    try:
+        etf_stocks = xtdata.get_stock_list_in_sector('沪深ETF')
+        if etf_stocks:
+            print(f"[更新进度] 获取到 {len(etf_stocks)} 只沪深ETF，正在处理详细信息...", flush=True)
+            for code in etf_stocks:
+                try:
+                    detail = xtdata.get_instrument_detail(code)
+                    if detail:
+                        if isinstance(detail, str):
+                            detail = ast.literal_eval(detail)
+                        name = detail.get('InstrumentName', '')
+                        if name:
+                            etf_info = {'code': code, 'name': name}
+                            stock_dict['hs_etf'].append(etf_info)
+                except Exception as e:
+                    continue
+            print(f"[更新进度] 沪深ETF 完成，共获取 {len(stock_dict['hs_etf'])} 只有效ETF", flush=True)
+        else:
+            print(f"[更新进度] 沪深ETF 没有证券", flush=True)
+    except Exception as e:
+        print(f"[更新进度] 获取沪深ETF失败: {str(e)}", flush=True)
+
     # 添加指数
     stock_dict['indices'] = important_indices
     for index in important_indices:
@@ -1566,7 +1848,8 @@ def save_stock_list_to_csv_for_subprocess(stock_dict, output_dir, queue):
         'hs300_components': '沪深300成分股',
         'zz500_components': '中证500成分股',
         'sz50_components': '上证50成分股',
-        'hs_convertible_bonds': '沪深转债'
+        'hs_convertible_bonds': '沪深转债',
+        'hs_etf': '沪深ETF'
     }
 
     for board, stocks in stock_dict.items():
@@ -1575,6 +1858,8 @@ def save_stock_list_to_csv_for_subprocess(stock_dict, output_dir, queue):
         # 沪深转债使用特定文件名
         if board == 'hs_convertible_bonds':
             file_path = os.path.join(output_dir, "沪深转债_列表.csv")
+        elif board == 'hs_etf':
+            file_path = os.path.join(output_dir, "沪深ETF_成分股列表.csv")
         else:
             file_path = os.path.join(output_dir, f"{board_names[board]}_股票列表.csv")
         with open(file_path, 'w', encoding='utf-8-sig') as f:
@@ -1780,6 +2065,7 @@ else:
             'zz500_components': [],  # 中证500成分股
             'sz50_components': [],   # 上证50成分股
             'hs_convertible_bonds': [],  # 沪深转债
+            'hs_etf': [],  # 沪深ETF
         }
 
         # 重要指数列表
@@ -1924,6 +2210,43 @@ else:
             except Exception as e:
                 print(f"[更新进度] 获取{cb_name}失败: {str(e)}", flush=True)
 
+        # 获取沪深ETF成分股
+        etf_mapping = {
+            '沪深ETF': 'hs_etf'
+        }
+        
+        for etf_name, dict_key in etf_mapping.items():
+            if not self.running:
+                return stock_dict
+                
+            progress_msg = f"正在获取{etf_name}..."
+            self.progress.emit(progress_msg)
+            print(f"[更新进度] {progress_msg}", flush=True)
+            try:
+                etf_stocks = xtdata.get_stock_list_in_sector(etf_name)
+                if etf_stocks:
+                    print(f"[更新进度] 获取到 {len(etf_stocks)} 只{etf_name}，正在处理详细信息...", flush=True)
+                    for code in etf_stocks:
+                        if not self.running:
+                            return stock_dict
+                        try:
+                            detail = xtdata.get_instrument_detail(code)
+                            if detail:
+                                if isinstance(detail, str):
+                                    detail = ast.literal_eval(detail)
+                                name = detail.get('InstrumentName', '')
+                                if name:
+                                    etf_info = {'code': code, 'name': name}
+                                    stock_dict[dict_key].append(etf_info)
+                                    # 不将ETF添加到all_stocks中，因为它们是基金而非股票
+                        except Exception as e:
+                            continue
+                    print(f"[更新进度] {etf_name} 完成，共获取 {len(stock_dict[dict_key])} 只有效ETF", flush=True)
+                else:
+                    print(f"[更新进度] {etf_name} 没有证券", flush=True)
+            except Exception as e:
+                print(f"[更新进度] 获取{etf_name}失败: {str(e)}", flush=True)
+
         # 添加指数
         stock_dict['indices'] = important_indices
         for index in important_indices:
@@ -1954,7 +2277,8 @@ else:
             'hs300_components': '沪深300成分股',
             'zz500_components': '中证500成分股',
             'sz50_components': '上证50成分股',
-            'hs_convertible_bonds': '沪深转债'
+            'hs_convertible_bonds': '沪深转债',
+            'hs_etf': '沪深ETF'
         }
 
         for board, stocks in stock_dict.items():
@@ -1966,6 +2290,8 @@ else:
             # 沪深转债使用特定文件名
             if board == 'hs_convertible_bonds':
                 file_path = os.path.join(self.output_dir, "沪深转债_列表.csv")
+            elif board == 'hs_etf':
+                file_path = os.path.join(self.output_dir, "沪深ETF_成分股列表.csv")
             else:
                 file_path = os.path.join(self.output_dir, f"{board_names[board]}_股票列表.csv")
             with open(file_path, 'w', encoding='utf-8-sig') as f:
@@ -2410,11 +2736,11 @@ def khHistory(symbol_list, fields, bar_count, fre_step, current_time=None, skip_
                 if period in ['1d']:
                     latest_date = stock_data['time'].dt.date.max()
                     if latest_date >= current_datetime.date():
-                        print(f"  ⚠️ 警告: 数据包含当前日期或之后的日期")
+                        print(f"  [WARN]️ 警告: 数据包含当前日期或之后的日期")
                 else:
                     latest_time = stock_data['time'].max()
                     if latest_time >= current_datetime:
-                        print(f"  ⚠️ 警告: 数据包含当前时间或之后的时间")
+                        print(f"  [WARN]️ 警告: 数据包含当前时间或之后的时间")
     
     except Exception as e:
         print(f"获取历史数据时出错: {str(e)}")
@@ -2423,6 +2749,969 @@ def khHistory(symbol_list, fields, bar_count, fre_step, current_time=None, skip_
         return {}
     
     return result
+
+
+def khKline(
+    symbol_list: Union[str, List[str]],
+    period: str,
+    bar_count: int,
+    fields: List[str] = None,
+    end_time: Optional[str] = None,
+    fq: str = 'pre',
+    force_download: bool = False
+) -> Dict[str, pd.DataFrame]:
+    """
+    获取任意自定义周期的K线数据，支持年对齐和未收线实时快照
+    
+    专为缠论多级别共振策略设计，核心特性：
+    1. 年对齐：多日周期(2d/3d等)以年初第一个交易日为基准对齐
+    2. 未收线支持：交易时段内，未收线K线使用当前时刻数据快照
+    3. 多级别共振：支持小周期收线+大周期未收线状态的共振判断
+    
+    参数:
+        symbol_list: 股票代码列表或单个股票代码字符串
+                    例如: '000001.SZ' 或 ['000001.SZ', '600519.SH']
+        period: K线周期，支持格式：
+               - 分钟: '1m', '5m', '15m', '30m', '60m' 等
+               - 小时: '1h', '2h', '3h', '4h' 等
+               - 天: '1d', '2d', '3d', '4d' ... (无上限)
+        bar_count: 获取的K线数量，最大支持240根
+        fields: 数据字段列表，默认['open', 'high', 'low', 'close', 'volume']
+               可选字段: 'open', 'high', 'low', 'close', 'volume', 'amount' 等
+        end_time: 结束时间（可选）
+                 - 格式1: '2025-09-24 14:15:00' (2025年9月24日14点15分00秒)
+                 - 格式2: '2025-09-24 14:15' (2025年9月24日14点15分)
+                 - 格式3: '20250924 1415' (2025年9月24日14点15分)
+                 - 格式4: '20250924' (2025年9月24日)
+                 - None: 使用当前时间
+                 说明: 以该时间点向前获取指定数量的K线，秒数会被忽略
+        fq: 复权方式，默认'pre'
+           - 'pre': 前复权
+           - 'post': 后复权
+           - 'none': 不复权
+        force_download: 是否强制下载最新数据，默认False
+    
+    返回:
+        dict: {股票代码: DataFrame}
+        DataFrame包含列: time, open, high, low, close, volume 等
+        
+    核心逻辑说明:
+        1. 交易时段内: 所有未收线周期的最后一根K线使用当下时间数据快照
+        2. 非交易时段: 使用最近的交易时间点数据
+        3. 指定end_time: 如果end_time落在某K线周期内，生成该时刻快照K线
+        
+    使用示例:
+        # 获取1分钟K线
+        data = khKline('000001.SZ', '1m', 50)
+        
+        # 获取2小时K线（未收线会包含当前数据）
+        data = khKline(['000001.SZ', '600519.SH'], '2h', 30)
+        
+        # 获取3日K线（年对齐）
+        data = khKline('000001.SZ', '3d', 20)
+        
+        # 指定历史时间点回测（支持多种格式）
+        data = khKline('000001.SZ', '1h', 10, end_time='2024-12-01 14:30:00')
+        data = khKline('000001.SZ', '1h', 10, end_time='2024-12-01 14:30')
+        data = khKline('000001.SZ', '1h', 10, end_time='20241201 1430')
+    """
+    
+    # 导入必要的模块
+    try:
+        from xtquant import xtdata
+        import pandas as pd
+        from datetime import datetime, timedelta
+        import re
+    except ImportError as e:
+        logging.error(f"导入模块失败: {str(e)}")
+        return {}
+    
+    # 设置默认字段
+    if fields is None:
+        fields = ['open', 'high', 'low', 'close', 'volume']
+    
+    # 参数验证
+    if not symbol_list:
+        raise ValueError("symbol_list不能为空")
+    if not period:
+        raise ValueError("period不能为空")
+    if bar_count <= 0:
+        raise ValueError("bar_count必须大于0")
+    
+    # 统一处理股票代码列表
+    if isinstance(symbol_list, str):
+        stock_codes = [symbol_list]
+    else:
+        stock_codes = list(symbol_list)
+    
+    # 解析周期参数
+    period_match = re.match(r'^(\d+)([mhd])$', period.lower())
+    if not period_match:
+        raise ValueError(f"不支持的周期格式: {period}，支持格式如: 1m, 5m, 1h, 2h, 1d, 2d等")
+    
+    period_num = int(period_match.group(1))
+    period_unit = period_match.group(2)  # 'm', 'h', 'd'
+    
+    # 解析结束时间
+    if end_time is None:
+        target_datetime = datetime.now()
+    else:
+        end_time = end_time.strip()
+        # 尝试解析不同格式(按精确度从高到低尝试)
+        for fmt in ['%Y-%m-%d %H:%M:%S', '%Y%m%d %H%M%S', '%Y%m%d %H%M', '%Y-%m-%d %H:%M', '%Y%m%d', '%Y-%m-%d']:
+            try:
+                target_datetime = datetime.strptime(end_time, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            raise ValueError(f"无法解析时间格式: {end_time}，支持格式: YYYYMMDD, YYYYMMDD HHMM, YYYY-MM-DD HH:MM:SS等")
+        
+        # 将秒数归零(忽略秒数部分)
+        target_datetime = target_datetime.replace(second=0, microsecond=0)
+    
+    logging.info(f"khKline: 股票={stock_codes}, 周期={period}, 数量={bar_count}, 目标时间={target_datetime}")
+    
+    # 转换复权方式
+    dividend_type_map = {'pre': 'front', 'post': 'back', 'none': 'none'}
+    dividend_type = dividend_type_map.get(fq, 'front')
+    
+    try:
+        # 根据周期类型选择基础数据获取策略
+        if period_unit == 'm':
+            # 分钟周期
+            result = _get_minute_kline(
+                stock_codes, period_num, bar_count, fields, 
+                target_datetime, dividend_type, force_download
+            )
+        elif period_unit == 'h':
+            # 小时周期
+            result = _get_hour_kline(
+                stock_codes, period_num, bar_count, fields,
+                target_datetime, dividend_type, force_download
+            )
+        elif period_unit == 'd':
+            # 天周期
+            result = _get_day_kline(
+                stock_codes, period_num, bar_count, fields,
+                target_datetime, dividend_type, force_download
+            )
+        else:
+            raise ValueError(f"不支持的周期单位: {period_unit}")
+        
+        return result
+        
+    except Exception as e:
+        logging.error(f"khKline获取数据时出错: {str(e)}", exc_info=True)
+        return {}
+
+
+def _parse_period(period: str) -> tuple:
+    """解析周期字符串，返回(数字, 单位)"""
+    import re
+    match = re.match(r'^(\d+)([mhd])$', period.lower())
+    if not match:
+        raise ValueError(f"不支持的周期格式: {period}")
+    return int(match.group(1)), match.group(2)
+
+
+def _get_year_first_trade_day(year: int) -> datetime:
+    """获取指定年份的第一个交易日"""
+    from datetime import datetime, timedelta
+    
+    # 从1月1日开始查找
+    current_date = datetime(year, 1, 1)
+    end_date = datetime(year, 2, 1)  # 最多查到2月1日
+    
+    while current_date < end_date:
+        date_str = current_date.strftime('%Y-%m-%d')
+        if is_trade_day(date_str):
+            return current_date
+        current_date += timedelta(days=1)
+    
+    # 如果找不到，返回1月1日（理论上不应该发生）
+    logging.warning(f"未找到{year}年的第一个交易日，使用1月1日")
+    return datetime(year, 1, 1)
+
+
+def _get_trade_days_list(start_date: datetime, end_date: datetime) -> List[datetime]:
+    """获取指定日期范围内的所有交易日列表"""
+    trade_days = []
+    current = start_date
+    
+    while current <= end_date:
+        date_str = current.strftime('%Y-%m-%d')
+        if is_trade_day(date_str):
+            trade_days.append(current)
+        current += timedelta(days=1)
+    
+    return trade_days
+
+
+def _process_930_data(df: pd.DataFrame, fields: List[str]) -> pd.DataFrame:
+    """
+    处理09:30的数据问题
+    
+    问题：09:30的高开低收都是开盘价（数据不完整）
+    解决：将09:30的开盘价和成交量合并到09:31
+    
+    参数:
+        df: 原始分钟K线数据，已排序
+        fields: 数据字段列表
+    
+    返回:
+        处理后的DataFrame
+    """
+    import pandas as pd
+    
+    if df.empty:
+        return df
+    
+    # 按日期分组处理
+    result_dfs = []
+    
+    for date, date_df in df.groupby(df['time'].dt.date):
+        # 查找09:30和09:31的数据
+        mask_930 = (date_df['time'].dt.hour == 9) & (date_df['time'].dt.minute == 30)
+        mask_931 = (date_df['time'].dt.hour == 9) & (date_df['time'].dt.minute == 31)
+        
+        data_930 = date_df[mask_930]
+        data_931 = date_df[mask_931]
+        
+        if not data_930.empty and not data_931.empty:
+            # 有09:30和09:31的数据，需要合并
+            idx_930 = data_930.index[0]
+            idx_931 = data_931.index[0]
+            
+            # 将09:30的开盘价赋给09:31
+            if 'open' in fields and 'open' in date_df.columns:
+                date_df.loc[idx_931, 'open'] = date_df.loc[idx_930, 'open']
+            
+            # 将09:30的成交量累加到09:31
+            if 'volume' in fields and 'volume' in date_df.columns:
+                date_df.loc[idx_931, 'volume'] = date_df.loc[idx_930, 'volume'] + date_df.loc[idx_931, 'volume']
+            
+            # 将09:30的成交额累加到09:31（如果有）
+            if 'amount' in fields and 'amount' in date_df.columns:
+                date_df.loc[idx_931, 'amount'] = date_df.loc[idx_930, 'amount'] + date_df.loc[idx_931, 'amount']
+            
+            # 删除09:30的数据
+            date_df = date_df[~mask_930].copy()
+        
+        result_dfs.append(date_df)
+    
+    # 合并所有日期的数据
+    if result_dfs:
+        result = pd.concat(result_dfs, ignore_index=True)
+        result = result.sort_values('time').reset_index(drop=True)
+        return result
+    else:
+        return df
+
+
+def _aggregate_kline(df: pd.DataFrame, group_col: str, fields: List[str]) -> pd.DataFrame:
+    """
+    聚合K线数据
+    
+    参数:
+        df: 原始K线数据，必须包含time列
+        group_col: 分组列名（用于groupby）
+        fields: 需要聚合的字段
+    """
+    agg_dict = {}
+    
+    # 时间取最后一个
+    agg_dict['time'] = 'last'
+    
+    # 处理各个字段
+    if 'open' in fields:
+        agg_dict['open'] = 'first'
+    if 'high' in fields:
+        agg_dict['high'] = 'max'
+    if 'low' in fields:
+        agg_dict['low'] = 'min'
+    if 'close' in fields:
+        agg_dict['close'] = 'last'
+    if 'volume' in fields:
+        agg_dict['volume'] = 'sum'
+    if 'amount' in fields:
+        agg_dict['amount'] = 'sum'
+    
+    # 执行聚合
+    result = df.groupby(group_col, as_index=False).agg(agg_dict)
+    return result
+
+
+def _get_minute_kline(
+    stock_codes: List[str],
+    period_minutes: int,
+    bar_count: int,
+    fields: List[str],
+    target_datetime: datetime,
+    dividend_type: str,
+    force_download: bool
+) -> Dict[str, pd.DataFrame]:
+    """获取分钟级别的K线数据"""
+    from xtquant import xtdata
+    import pandas as pd
+    from datetime import datetime, timedelta
+    
+    result = {}
+    
+    # 判断是否为原生支持的分钟周期
+    native_periods = [1, 5]
+    
+    if period_minutes in native_periods:
+        # 使用原生周期直接获取
+        period_str = f"{period_minutes}m"
+        
+        # 计算需要获取的数据范围
+        lookback_days = max(10, (bar_count * period_minutes + 1439) // 1440)
+        start_dt = target_datetime - timedelta(days=lookback_days)
+        start_time = start_dt.strftime('%Y%m%d')
+        end_time = target_datetime.strftime('%Y%m%d')
+        
+        if force_download:
+            for stock_code in stock_codes:
+                try:
+                    xtdata.download_history_data(
+                        stock_code=stock_code,
+                        period=period_str,
+                        start_time=start_time,
+                        end_time=end_time
+                    )
+                except Exception as e:
+                    logging.warning(f"下载{stock_code}数据失败: {str(e)}")
+        
+        # 获取数据
+        data = xtdata.get_market_data_ex(
+            field_list=['time'] + fields,
+            stock_list=stock_codes,
+            period=period_str,
+            start_time=start_time,
+            end_time=end_time,
+            count=-1,
+            dividend_type=dividend_type,
+            fill_data=True
+        )
+        
+        if not data:
+            return {}
+        
+        # 处理每只股票
+        for stock_code in stock_codes:
+            if stock_code not in data or data[stock_code] is None or data[stock_code].empty:
+                result[stock_code] = pd.DataFrame()
+                continue
+            
+            df = data[stock_code].copy()
+            
+            # 转换时间
+            df['time'] = pd.to_datetime(df['time'].astype(float), unit='ms') + pd.Timedelta(hours=8)
+            
+            # 筛选到目标时间（包含未收线）
+            df = df[df['time'] <= target_datetime].copy()
+            
+            # 排序
+            df = df.sort_values('time').reset_index(drop=True)
+            
+            # 取最近的bar_count条
+            if len(df) > bar_count:
+                df = df.tail(bar_count).reset_index(drop=True)
+            
+            result[stock_code] = df
+    
+    else:
+        # 非原生周期，需要聚合1分钟数据
+        lookback_days = max(10, (bar_count * period_minutes + 1439) // 1440)
+        start_dt = target_datetime - timedelta(days=lookback_days)
+        start_time = start_dt.strftime('%Y%m%d')
+        end_time = target_datetime.strftime('%Y%m%d')
+        
+        if force_download:
+            for stock_code in stock_codes:
+                try:
+                    xtdata.download_history_data(
+                        stock_code=stock_code,
+                        period='1m',
+                        start_time=start_time,
+                        end_time=end_time
+                    )
+                except Exception as e:
+                    logging.warning(f"下载{stock_code}数据失败: {str(e)}")
+        
+        # 获取1分钟数据
+        data = xtdata.get_market_data_ex(
+            field_list=['time'] + fields,
+            stock_list=stock_codes,
+            period='1m',
+            start_time=start_time,
+            end_time=end_time,
+            count=-1,
+            dividend_type=dividend_type,
+            fill_data=True
+        )
+        
+        if not data:
+            return {}
+        
+        # 处理每只股票
+        for stock_code in stock_codes:
+            if stock_code not in data or data[stock_code] is None or data[stock_code].empty:
+                result[stock_code] = pd.DataFrame()
+                continue
+            
+            df = data[stock_code].copy()
+            
+            # 转换时间
+            df['time'] = pd.to_datetime(df['time'].astype(float), unit='ms') + pd.Timedelta(hours=8)
+            
+            # 筛选到目标时间
+            df = df[df['time'] <= target_datetime].copy()
+            
+            if df.empty:
+                result[stock_code] = pd.DataFrame()
+                continue
+            
+            # 排序
+            df = df.sort_values('time').reset_index(drop=True)
+            
+            # 处理09:30的数据问题
+            # 09:30的高开低收都是开盘价，需要将其开盘价和成交量合并到09:31
+            df = _process_930_data(df, fields)
+            
+            # 按自定义周期聚合
+            # 策略：从09:31开始，每period_minutes分钟一组
+            # 09:31-09:45为第1组(0-14分钟)，09:46-10:00为第2组(15-29分钟)
+            df['date'] = df['time'].dt.date
+            
+            # 计算从09:31开始的分钟数（09:31算第0分钟）
+            df['minutes_since_931'] = (df['time'].dt.hour - 9) * 60 + df['time'].dt.minute - 31
+            
+            # 处理下午时段（13:00之后需要减去午休的90分钟）
+            # 午休是11:31-13:00，共90分钟
+            df.loc[df['time'].dt.hour >= 13, 'minutes_since_931'] -= 90
+            
+            # 计算分组ID（每period_minutes分钟一组）
+            # 使用3位数字格式，确保字符串排序正确
+            df['group_id'] = df['date'].astype(str) + '_' + (df['minutes_since_931'] // period_minutes).apply(lambda x: f"{x:03d}")
+            
+            # 聚合
+            agg_df = _aggregate_kline(df, 'group_id', fields)
+            
+            # 删除临时列
+            if 'group_id' in agg_df.columns:
+                agg_df = agg_df.drop(columns=['group_id'])
+            
+            # 取最近的bar_count条
+            if len(agg_df) > bar_count:
+                agg_df = agg_df.tail(bar_count).reset_index(drop=True)
+            
+            result[stock_code] = agg_df
+    
+    return result
+
+
+def _get_hour_kline(
+    stock_codes: List[str],
+    period_hours: int,
+    bar_count: int,
+    fields: List[str],
+    target_datetime: datetime,
+    dividend_type: str,
+    force_download: bool
+) -> Dict[str, pd.DataFrame]:
+    """获取小时级别的K线数据"""
+    from xtquant import xtdata
+    import pandas as pd
+    from datetime import datetime, timedelta
+    
+    result = {}
+    
+    # 小时周期通过聚合1分钟数据实现
+    period_minutes = period_hours * 60
+    lookback_days = max(10, (bar_count * period_minutes + 1439) // 1440)
+    start_dt = target_datetime - timedelta(days=lookback_days)
+    start_time = start_dt.strftime('%Y%m%d')
+    end_time = target_datetime.strftime('%Y%m%d')
+    
+    if force_download:
+        for stock_code in stock_codes:
+            try:
+                xtdata.download_history_data(
+                    stock_code=stock_code,
+                    period='1m',
+                    start_time=start_time,
+                    end_time=end_time
+                )
+            except Exception as e:
+                logging.warning(f"下载{stock_code}数据失败: {str(e)}")
+    
+    # 获取1分钟数据
+    data = xtdata.get_market_data_ex(
+        field_list=['time'] + fields,
+        stock_list=stock_codes,
+        period='1m',
+        start_time=start_time,
+        end_time=end_time,
+        count=-1,
+        dividend_type=dividend_type,
+        fill_data=True
+    )
+    
+    if not data:
+        return {}
+    
+    # 处理每只股票
+    for stock_code in stock_codes:
+        if stock_code not in data or data[stock_code] is None or data[stock_code].empty:
+            result[stock_code] = pd.DataFrame()
+            continue
+        
+        df = data[stock_code].copy()
+        
+        # 转换时间
+        df['time'] = pd.to_datetime(df['time'].astype(float), unit='ms') + pd.Timedelta(hours=8)
+        
+        # 筛选到目标时间
+        df = df[df['time'] <= target_datetime].copy()
+        
+        if df.empty:
+            result[stock_code] = pd.DataFrame()
+            continue
+        
+        # 排序
+        df = df.sort_values('time').reset_index(drop=True)
+        
+        # 处理09:30的数据问题
+        # 09:30的高开低收都是开盘价，需要将其开盘价和成交量合并到09:31
+        df = _process_930_data(df, fields)
+        
+        # 按小时周期聚合
+        # 策略：从09:31开始，每period_hours小时一组
+        df['date'] = df['time'].dt.date
+        
+        # 计算从09:31开始的分钟数（09:31算第0分钟）
+        df['minutes_since_931'] = (df['time'].dt.hour - 9) * 60 + df['time'].dt.minute - 31
+        
+        # 处理下午时段（13:00之后需要减去午休的90分钟）
+        df.loc[df['time'].dt.hour >= 13, 'minutes_since_931'] -= 90
+        
+        # 计算分组ID（每period_minutes分钟一组）
+        # 使用3位数字格式，确保字符串排序正确
+        df['group_id'] = df['date'].astype(str) + '_' + (df['minutes_since_931'] // period_minutes).apply(lambda x: f"{x:03d}")
+        
+        # 聚合
+        agg_df = _aggregate_kline(df, 'group_id', fields)
+        
+        # 删除临时列
+        if 'group_id' in agg_df.columns:
+            agg_df = agg_df.drop(columns=['group_id'])
+        
+        # 取最近的bar_count条
+        if len(agg_df) > bar_count:
+            agg_df = agg_df.tail(bar_count).reset_index(drop=True)
+        
+        result[stock_code] = agg_df
+    
+    return result
+
+
+def _get_day_kline(
+    stock_codes: List[str],
+    period_days: int,
+    bar_count: int,
+    fields: List[str],
+    target_datetime: datetime,
+    dividend_type: str,
+    force_download: bool
+) -> Dict[str, pd.DataFrame]:
+    """获取天级别的K线数据，支持年对齐"""
+    from xtquant import xtdata
+    import pandas as pd
+    from datetime import datetime, timedelta
+    
+    result = {}
+    
+    if period_days == 1:
+        # 1日线直接获取
+        lookback_days = bar_count * 5
+        start_dt = target_datetime - timedelta(days=lookback_days)
+        start_time = start_dt.strftime('%Y%m%d')
+        end_time = target_datetime.strftime('%Y%m%d')
+        
+        if force_download:
+            for stock_code in stock_codes:
+                try:
+                    xtdata.download_history_data(
+                        stock_code=stock_code,
+                        period='1d',
+                        start_time=start_time,
+                        end_time=end_time
+                    )
+                except Exception as e:
+                    logging.warning(f"下载{stock_code}数据失败: {str(e)}")
+        
+        # 获取数据
+        data = xtdata.get_market_data_ex(
+            field_list=['time'] + fields,
+            stock_list=stock_codes,
+            period='1d',
+            start_time=start_time,
+            end_time=end_time,
+            count=-1,
+            dividend_type=dividend_type,
+            fill_data=True
+        )
+        
+        if not data:
+            return {}
+        
+        # 处理每只股票
+        for stock_code in stock_codes:
+            if stock_code not in data or data[stock_code] is None or data[stock_code].empty:
+                result[stock_code] = pd.DataFrame()
+                continue
+            
+            df = data[stock_code].copy()
+            
+            # 转换时间
+            df['time'] = pd.to_datetime(df['time'].astype(float), unit='ms') + pd.Timedelta(hours=8)
+            
+            # 筛选到目标时间（对于日线，包含当天）
+            target_date = target_datetime.date()
+            df = df[df['time'].dt.date <= target_date].copy()
+            
+            # 排序
+            df = df.sort_values('time').reset_index(drop=True)
+            
+            # 取最近的bar_count条
+            if len(df) > bar_count:
+                df = df.tail(bar_count).reset_index(drop=True)
+            
+            result[stock_code] = df
+    
+    else:
+        # 多日周期，需要年对齐
+        # 获取目标年份的第一个交易日
+        target_year = target_datetime.year
+        year_first_day = _get_year_first_trade_day(target_year)
+        
+        # 如果目标时间在年初第一个交易日之前，需要用上一年
+        if target_datetime < year_first_day:
+            target_year -= 1
+            year_first_day = _get_year_first_trade_day(target_year)
+        
+        # 计算需要获取的数据范围
+        lookback_days = bar_count * period_days * 5
+        start_dt = max(year_first_day, target_datetime - timedelta(days=lookback_days))
+        start_time = start_dt.strftime('%Y%m%d')
+        end_time = target_datetime.strftime('%Y%m%d')
+        
+        if force_download:
+            for stock_code in stock_codes:
+                try:
+                    xtdata.download_history_data(
+                        stock_code=stock_code,
+                        period='1d',
+                        start_time=start_time,
+                        end_time=end_time
+                    )
+                except Exception as e:
+                    logging.warning(f"下载{stock_code}数据失败: {str(e)}")
+        
+        # 获取日线数据
+        data = xtdata.get_market_data_ex(
+            field_list=['time'] + fields,
+            stock_list=stock_codes,
+            period='1d',
+            start_time=start_time,
+            end_time=end_time,
+            count=-1,
+            dividend_type=dividend_type,
+            fill_data=True
+        )
+        
+        if not data:
+            return {}
+        
+        # 获取年度交易日列表（用于对齐）
+        year_end = datetime(target_year, 12, 31)
+        trade_days_list = _get_trade_days_list(year_first_day, min(target_datetime, year_end))
+        
+        if not trade_days_list:
+            logging.error(f"未找到{target_year}年的交易日列表")
+            return {}
+        
+        # 处理每只股票
+        for stock_code in stock_codes:
+            if stock_code not in data or data[stock_code] is None or data[stock_code].empty:
+                result[stock_code] = pd.DataFrame()
+                continue
+            
+            df = data[stock_code].copy()
+            
+            # 转换时间
+            df['time'] = pd.to_datetime(df['time'].astype(float), unit='ms') + pd.Timedelta(hours=8)
+            
+            # 筛选到目标时间
+            target_date = target_datetime.date()
+            df = df[df['time'].dt.date <= target_date].copy()
+            
+            if df.empty:
+                result[stock_code] = pd.DataFrame()
+                continue
+            
+            # 排序
+            df = df.sort_values('time').reset_index(drop=True)
+            
+            # 创建交易日索引映射
+            df['trade_date'] = df['time'].dt.date
+            
+            # 根据年初第一个交易日计算分组
+            # 为每个交易日分配组号
+            trade_day_to_index = {}
+            for idx, trade_day in enumerate(trade_days_list):
+                trade_day_to_index[trade_day.date()] = idx
+            
+            # 计算每行数据的组ID
+            def get_group_id(row):
+                trade_date = row['trade_date']
+                if trade_date not in trade_day_to_index:
+                    return None
+                trade_index = trade_day_to_index[trade_date]
+                group_num = trade_index // period_days
+                # 使用3位数字格式，确保字符串排序正确（支持到999组）
+                return f"{target_year}_{group_num:03d}"
+            
+            df['group_id'] = df.apply(get_group_id, axis=1)
+            
+            # 过滤掉无效的组
+            df = df[df['group_id'].notna()].copy()
+            
+            if df.empty:
+                result[stock_code] = pd.DataFrame()
+                continue
+            
+            # 聚合
+            agg_df = _aggregate_kline(df, 'group_id', fields)
+            
+            # 取最近的bar_count条
+            if len(agg_df) > bar_count:
+                agg_df = agg_df.tail(bar_count).reset_index(drop=True)
+            
+            result[stock_code] = agg_df
+    
+    return result
+
+
+def test_khKline():
+    """测试khKline函数的各种参数组合"""
+    print("=" * 60)
+    print("开始测试khKline函数...")
+    print("=" * 60)
+    
+    # 测试1: 基本分钟周期测试
+    print("\n测试1: 基本分钟周期测试（1m, 5m, 15m）")
+    print("-" * 50)
+    for period in ['1m', '5m', '15m']:
+        try:
+            result = khKline(
+                symbol_list='000001.SZ',
+                period=period,
+                bar_count=10,
+                force_download=True
+            )
+            if '000001.SZ' in result and not result['000001.SZ'].empty:
+                df = result['000001.SZ']
+                print(f"[OK] {period}周期: 获取 {len(df)} 条记录")
+                if 'time' in df.columns and len(df) > 0:
+                    time_range = f"{df['time'].min()} 到 {df['time'].max()}"
+                    print(f"  时间范围: {time_range}")
+            else:
+                print(f"[FAIL] {period}周期: 未获取到数据")
+        except Exception as e:
+            print(f"[FAIL] {period}周期: 出错 - {str(e)}")
+    
+    # 测试2: 小时周期测试
+    print("\n测试2: 小时周期测试（1h, 2h）")
+    print("-" * 50)
+    for period in ['1h', '2h']:
+        try:
+            result = khKline(
+                symbol_list='000001.SZ',
+                period=period,
+                bar_count=10,
+                force_download=True
+            )
+            if '000001.SZ' in result and not result['000001.SZ'].empty:
+                df = result['000001.SZ']
+                print(f"[OK] {period}周期: 获取 {len(df)} 条记录")
+                if 'time' in df.columns and len(df) > 0:
+                    time_range = f"{df['time'].min()} 到 {df['time'].max()}"
+                    print(f"  时间范围: {time_range}")
+            else:
+                print(f"[FAIL] {period}周期: 未获取到数据")
+        except Exception as e:
+            print(f"[FAIL] {period}周期: 出错 - {str(e)}")
+    
+    # 测试3: 日线周期测试
+    print("\n测试3: 日线周期测试（1d, 2d, 3d）")
+    print("-" * 50)
+    for period in ['1d', '2d', '3d']:
+        try:
+            result = khKline(
+                symbol_list='000001.SZ',
+                period=period,
+                bar_count=10,
+                force_download=True
+            )
+            if '000001.SZ' in result and not result['000001.SZ'].empty:
+                df = result['000001.SZ']
+                print(f"[OK] {period}周期: 获取 {len(df)} 条记录")
+                if 'time' in df.columns and len(df) > 0:
+                    time_range = f"{df['time'].min()} 到 {df['time'].max()}"
+                    print(f"  时间范围: {time_range}")
+            else:
+                print(f"[FAIL] {period}周期: 未获取到数据")
+        except Exception as e:
+            print(f"[FAIL] {period}周期: 出错 - {str(e)}")
+    
+    # 测试4: 指定end_time测试
+    print("\n测试4: 指定历史时间点测试")
+    print("-" * 50)
+    test_times = [
+        ('1m', '20241201 1430'),
+        ('1h', '20241201 1400'),
+        ('1d', '20241201')
+    ]
+    for period, end_time in test_times:
+        try:
+            result = khKline(
+                symbol_list='000001.SZ',
+                period=period,
+                bar_count=5,
+                end_time=end_time,
+                force_download=True
+            )
+            if '000001.SZ' in result and not result['000001.SZ'].empty:
+                df = result['000001.SZ']
+                print(f"[OK] {period}周期到{end_time}: 获取 {len(df)} 条记录")
+                if 'time' in df.columns and len(df) > 0:
+                    latest_time = df['time'].max()
+                    print(f"  最新时间: {latest_time}")
+            else:
+                print(f"[FAIL] {period}周期到{end_time}: 未获取到数据")
+        except Exception as e:
+            print(f"[FAIL] {period}周期到{end_time}: 出错 - {str(e)}")
+    
+    # 测试5: 多股票测试
+    print("\n测试5: 多股票同时获取测试")
+    print("-" * 50)
+    try:
+        result = khKline(
+            symbol_list=['000001.SZ', '600000.SH'],
+            period='1d',
+            bar_count=5,
+            force_download=True
+        )
+        for stock_code in ['000001.SZ', '600000.SH']:
+            if stock_code in result and not result[stock_code].empty:
+                df = result[stock_code]
+                print(f"[OK] {stock_code}: 获取 {len(df)} 条记录")
+            else:
+                print(f"[FAIL] {stock_code}: 未获取到数据")
+    except Exception as e:
+        print(f"[FAIL] 多股票测试: 出错 - {str(e)}")
+    
+    # 测试6: 年对齐验证（多日周期）
+    print("\n测试6: 年对齐验证测试（2d, 5d）")
+    print("-" * 50)
+    for period in ['2d', '5d']:
+        try:
+            result = khKline(
+                symbol_list=['000001.SZ', '600000.SH'],
+                period=period,
+                bar_count=10,
+                force_download=True
+            )
+            
+            if '000001.SZ' in result and '600000.SH' in result:
+                df1 = result['000001.SZ']
+                df2 = result['600000.SH']
+                
+                if not df1.empty and not df2.empty:
+                    # 检查两只股票的K线时间是否一致
+                    times1 = df1['time'].tolist()
+                    times2 = df2['time'].tolist()
+                    
+                    if len(times1) == len(times2):
+                        aligned = all(t1 == t2 for t1, t2 in zip(times1, times2))
+                        if aligned:
+                            print(f"[OK] {period}周期年对齐验证通过: 两只股票K线时间完全一致")
+                            print(f"  000001.SZ: {len(df1)} 条记录")
+                            print(f"  600000.SH: {len(df2)} 条记录")
+                        else:
+                            print(f"[WARN] {period}周期: 两只股票K线时间不一致")
+                    else:
+                        print(f"[WARN] {period}周期: 两只股票K线数量不同 ({len(times1)} vs {len(times2)})")
+                else:
+                    print(f"[FAIL] {period}周期: 有股票数据为空")
+            else:
+                print(f"[FAIL] {period}周期: 未获取到完整数据")
+        except Exception as e:
+            print(f"[FAIL] {period}周期年对齐测试: 出错 - {str(e)}")
+    
+    # 测试7: 自定义字段测试
+    print("\n测试7: 自定义字段测试")
+    print("-" * 50)
+    try:
+        result = khKline(
+            symbol_list='000001.SZ',
+            period='1d',
+            bar_count=5,
+            fields=['open', 'close', 'volume'],
+            force_download=True
+        )
+        if '000001.SZ' in result and not result['000001.SZ'].empty:
+            df = result['000001.SZ']
+            columns = df.columns.tolist()
+            print(f"[OK] 自定义字段测试: 获取 {len(df)} 条记录")
+            print(f"  字段列表: {columns}")
+            if set(['time', 'open', 'close', 'volume']).issubset(set(columns)):
+                print(f"  [OK] 字段验证通过")
+            else:
+                print(f"  [FAIL] 字段验证失败: 缺少预期字段")
+        else:
+            print(f"[FAIL] 自定义字段测试: 未获取到数据")
+    except Exception as e:
+        print(f"[FAIL] 自定义字段测试: 出错 - {str(e)}")
+    
+    # 测试8: 复权方式测试
+    print("\n测试8: 复权方式测试")
+    print("-" * 50)
+    for fq_type in ['none', 'pre', 'post']:
+        try:
+            result = khKline(
+                symbol_list='000001.SZ',
+                period='1d',
+                bar_count=3,
+                fields=['close'],
+                fq=fq_type,
+                force_download=True
+            )
+            if '000001.SZ' in result and not result['000001.SZ'].empty:
+                df = result['000001.SZ']
+                close_prices = df['close'].tolist()
+                print(f"[OK] 复权方式{fq_type}: 收盘价 {close_prices}")
+            else:
+                print(f"[FAIL] 复权方式{fq_type}: 未获取到数据")
+        except Exception as e:
+            print(f"[FAIL] 复权方式{fq_type}: 出错 - {str(e)}")
+    
+    print("\n" + "=" * 60)
+    print("khKline函数测试完成")
+    print("=" * 60)
 
 
 def test_khHistory():
@@ -2443,7 +3732,7 @@ def test_khHistory():
         )
         if '000001.SZ' in result1 and not result1['000001.SZ'].empty:
             df = result1['000001.SZ']
-            print(f"✓ 当前时间测试: 获取 {len(df)} 条记录")
+            print(f"[OK] 当前时间测试: 获取 {len(df)} 条记录")
             print(f"  列名: {list(df.columns)}")
             if 'time' in df.columns:
                 time_range = f"{df['time'].min()} 到 {df['time'].max()}"
@@ -2453,13 +3742,13 @@ def test_khHistory():
                 today = datetime.now().date()
                 latest_date = df['time'].dt.date.max()
                 if latest_date < today:
-                    print(f"  ✓ 验证通过: 数据不包含当前日期 {today}")
+                    print(f"  [OK] 验证通过: 数据不包含当前日期 {today}")
                 else:
-                    print(f"  ✗ 验证失败: 数据包含当前日期或之后的日期")
+                    print(f"  [FAIL] 验证失败: 数据包含当前日期或之后的日期")
         else:
-            print("✗ 当前时间测试: 未获取到数据")
+            print("[FAIL] 当前时间测试: 未获取到数据")
     except Exception as e:
-        print(f"✗ 当前时间测试: 出错 - {str(e)}")
+        print(f"[FAIL] 当前时间测试: 出错 - {str(e)}")
     
     # 测试2: 指定历史日期测试
     print("\n测试2: 指定历史日期测试")
@@ -2478,7 +3767,7 @@ def test_khHistory():
             )
             if '000001.SZ' in result2 and not result2['000001.SZ'].empty:
                 df = result2['000001.SZ']
-                print(f"✓ 日期{test_date}: 获取 {len(df)} 条记录")
+                print(f"[OK] 日期{test_date}: 获取 {len(df)} 条记录")
                 if 'time' in df.columns:
                     time_range = f"{df['time'].min()} 到 {df['time'].max()}"
                     print(f"  时间范围: {time_range}")
@@ -2490,13 +3779,13 @@ def test_khHistory():
                         target_date = datetime.strptime(test_date, '%Y%m%d').date()
                     latest_date = df['time'].dt.date.max()
                     if latest_date < target_date:
-                        print(f"  ✓ 验证通过: 数据不包含目标日期 {target_date}")
+                        print(f"  [OK] 验证通过: 数据不包含目标日期 {target_date}")
                     else:
-                        print(f"  ✗ 验证失败: 数据包含目标日期或之后的日期")
+                        print(f"  [FAIL] 验证失败: 数据包含目标日期或之后的日期")
             else:
-                print(f"✗ 日期{test_date}: 未获取到数据")
+                print(f"[FAIL] 日期{test_date}: 未获取到数据")
         except Exception as e:
-            print(f"✗ 日期{test_date}: 出错 - {str(e)}")
+            print(f"[FAIL] 日期{test_date}: 出错 - {str(e)}")
     
     # 测试3: 指定精确时间测试（分钟数据）
     print("\n测试3: 指定精确时间测试（分钟数据）")
@@ -2520,7 +3809,7 @@ def test_khHistory():
             )
             if '000001.SZ' in result3 and not result3['000001.SZ'].empty:
                 df = result3['000001.SZ']
-                print(f"✓ 时间{test_time}: 获取 {len(df)} 条记录")
+                print(f"[OK] 时间{test_time}: 获取 {len(df)} 条记录")
                 if 'time' in df.columns:
                     time_range = f"{df['time'].min()} 到 {df['time'].max()}"
                     print(f"  时间范围: {time_range}")
@@ -2536,13 +3825,13 @@ def test_khHistory():
                     
                     latest_time = df['time'].max()
                     if latest_time < target_time:
-                        print(f"  ✓ 验证通过: 数据不包含目标时间 {target_time}")
+                        print(f"  [OK] 验证通过: 数据不包含目标时间 {target_time}")
                     else:
-                        print(f"  ✗ 验证失败: 数据包含目标时间或之后的时间")
+                        print(f"  [FAIL] 验证失败: 数据包含目标时间或之后的时间")
             else:
-                print(f"✗ 时间{test_time}: 未获取到数据")
+                print(f"[FAIL] 时间{test_time}: 未获取到数据")
         except Exception as e:
-            print(f"✗ 时间{test_time}: 出错 - {str(e)}")
+            print(f"[FAIL] 时间{test_time}: 出错 - {str(e)}")
     
     # 测试4: 多股票测试（指定时间）
     print("\n测试4: 多股票测试（指定时间）")
@@ -2559,11 +3848,11 @@ def test_khHistory():
         for stock_code in ['000001.SZ', '600000.SH']:
             if stock_code in result4 and not result4[stock_code].empty:
                 df = result4[stock_code]
-                print(f"✓ {stock_code}: 获取 {len(df)} 条记录")
+                print(f"[OK] {stock_code}: 获取 {len(df)} 条记录")
             else:
-                print(f"✗ {stock_code}: 未获取到数据")
+                print(f"[FAIL] {stock_code}: 未获取到数据")
     except Exception as e:
-        print(f"✗ 多股票测试: 出错 - {str(e)}")
+        print(f"[FAIL] 多股票测试: 出错 - {str(e)}")
     
     # 测试5: 跳过停牌数据测试（指定时间）
     print("\n测试5: 跳过停牌数据测试（指定时间）")
@@ -2582,11 +3871,11 @@ def test_khHistory():
             if '000001.SZ' in result5 and not result5['000001.SZ'].empty:
                 df = result5['000001.SZ']
                 zero_volume_count = (df['volume'] == 0).sum()
-                print(f"✓ 跳过停牌={skip}: 获取 {len(df)} 条记录，其中成交量为0的有 {zero_volume_count} 条")
+                print(f"[OK] 跳过停牌={skip}: 获取 {len(df)} 条记录，其中成交量为0的有 {zero_volume_count} 条")
             else:
-                print(f"✗ 跳过停牌={skip}: 未获取到数据")
+                print(f"[FAIL] 跳过停牌={skip}: 未获取到数据")
         except Exception as e:
-            print(f"✗ 跳过停牌={skip}: 出错 - {str(e)}")
+            print(f"[FAIL] 跳过停牌={skip}: 出错 - {str(e)}")
     
     # 测试6: 强制下载性能测试（指定时间）
     print("\n测试6: 强制下载性能测试（指定时间）")
@@ -2609,14 +3898,14 @@ def test_khHistory():
         
         if '000001.SZ' in result6 and not result6['000001.SZ'].empty:
             df = result6['000001.SZ']
-            print(f"✓ 强制下载性能测试: 获取 {len(df)} 条记录，耗时 {elapsed_time:.1f}ms")
+            print(f"[OK] 强制下载性能测试: 获取 {len(df)} 条记录，耗时 {elapsed_time:.1f}ms")
             if 'time' in df.columns:
                 time_range = f"{df['time'].min()} 到 {df['time'].max()}"
                 print(f"  时间范围: {time_range}")
         else:
-            print(f"✗ 强制下载性能测试: 未获取到数据，耗时 {elapsed_time:.1f}ms")
+            print(f"[FAIL] 强制下载性能测试: 未获取到数据，耗时 {elapsed_time:.1f}ms")
     except Exception as e:
-        print(f"✗ 强制下载性能测试: 出错 - {str(e)}")
+        print(f"[FAIL] 强制下载性能测试: 出错 - {str(e)}")
     
     # 测试7: 分钟数据精确时间控制测试
     print("\n测试7: 分钟数据精确时间控制测试")
@@ -2639,14 +3928,14 @@ def test_khHistory():
             )
             if '000001.SZ' in result7 and not result7['000001.SZ'].empty:
                 df = result7['000001.SZ']
-                print(f"✓ {freq}数据到{test_time}: 获取 {len(df)} 条记录")
+                print(f"[OK] {freq}数据到{test_time}: 获取 {len(df)} 条记录")
                 if 'time' in df.columns:
                     time_range = f"{df['time'].min()} 到 {df['time'].max()}"
                     print(f"  时间范围: {time_range}")
             else:
-                print(f"✗ {freq}数据到{test_time}: 未获取到数据")
+                print(f"[FAIL] {freq}数据到{test_time}: 未获取到数据")
         except Exception as e:
-            print(f"✗ {freq}数据到{test_time}: 出错 - {str(e)}")
+            print(f"[FAIL] {freq}数据到{test_time}: 出错 - {str(e)}")
     
     # 测试8: 复权方式测试（指定时间）
     print("\n测试8: 复权方式测试（指定时间）")
@@ -2665,11 +3954,11 @@ def test_khHistory():
             if '000001.SZ' in result8 and not result8['000001.SZ'].empty:
                 df = result8['000001.SZ']
                 close_prices = df['close'].tolist()
-                print(f"✓ 复权方式{fq_type}: 获取 {len(df)} 条记录，收盘价: {close_prices}")
+                print(f"[OK] 复权方式{fq_type}: 获取 {len(df)} 条记录，收盘价: {close_prices}")
             else:
-                print(f"✗ 复权方式{fq_type}: 未获取到数据")
+                print(f"[FAIL] 复权方式{fq_type}: 未获取到数据")
         except Exception as e:
-            print(f"✗ 复权方式{fq_type}: 出错 - {str(e)}")
+            print(f"[FAIL] 复权方式{fq_type}: 出错 - {str(e)}")
     
     # 测试9: 时间边界验证测试
     print("\n测试9: 时间边界验证测试")
@@ -2695,7 +3984,7 @@ def test_khHistory():
             )
             if '000001.SZ' in result9 and not result9['000001.SZ'].empty:
                 df = result9['000001.SZ']
-                print(f"✓ {desc}: 获取 {len(df)} 条记录")
+                print(f"[OK] {desc}: 获取 {len(df)} 条记录")
                 if 'time' in df.columns and len(df) > 0:
                     latest_time = df['time'].max()
                     print(f"  最新时间: {latest_time}")
@@ -2716,19 +4005,19 @@ def test_khHistory():
                     if is_minute:
                         # 分钟数据精确时间比较
                         if latest_time < target_time:
-                            print(f"  ✓ 时间边界验证通过: {latest_time} < {target_time}")
+                            print(f"  [OK] 时间边界验证通过: {latest_time} < {target_time}")
                         else:
-                            print(f"  ✗ 时间边界验证失败: {latest_time} >= {target_time}")
+                            print(f"  [FAIL] 时间边界验证失败: {latest_time} >= {target_time}")
                     else:
                         # 日线数据按日期比较
                         if latest_time.date() < target_time.date():
-                            print(f"  ✓ 日期边界验证通过: {latest_time.date()} < {target_time.date()}")
+                            print(f"  [OK] 日期边界验证通过: {latest_time.date()} < {target_time.date()}")
                         else:
-                            print(f"  ✗ 日期边界验证失败: {latest_time.date()} >= {target_time.date()}")
+                            print(f"  [FAIL] 日期边界验证失败: {latest_time.date()} >= {target_time.date()}")
             else:
-                print(f"✗ {desc}: 未获取到数据")
+                print(f"[FAIL] {desc}: 未获取到数据")
         except Exception as e:
-            print(f"✗ {desc}: 出错 - {str(e)}")
+            print(f"[FAIL] {desc}: 出错 - {str(e)}")
     
     print("\n" + "=" * 50)
     print("khHistory函数测试完成（不包含当前时间点，适合回测场景）")
@@ -2743,4 +4032,8 @@ def test_khHistory():
 tools = KhQuTools()
 
 if __name__ == "__main__":
-    test_khHistory()
+    # 测试 khKline 函数
+    test_khKline()
+    
+    # 如果需要测试 khHistory 函数，取消下面的注释
+    # test_khHistory()

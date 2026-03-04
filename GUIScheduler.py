@@ -539,9 +539,11 @@ class GUIScheduler(QMainWindow):
             return os.path.join(os.path.dirname(__file__), 'icons', icon_name)
     
     def center_main_window(self):
-        """将主窗口居中显示在屏幕上"""
+        """将主窗口居中显示在主屏幕上"""
         desktop = QDesktopWidget()
-        screen = desktop.screenGeometry()
+        # 使用主屏幕而不是跟随鼠标位置
+        primary_screen = desktop.primaryScreen()
+        screen = desktop.screenGeometry(primary_screen)
         x = (screen.width() - self.width()) // 2
         y = (screen.height() - self.height()) // 2
         self.move(x, y)
@@ -1173,6 +1175,7 @@ class GUIScheduler(QMainWindow):
     def load_stock_names(self):
         """加载股票名称映射"""
         try:
+            # 加载全部股票列表
             stock_list_file = os.path.join(os.path.dirname(__file__), 'data', '全部股票_股票列表.csv')
             if os.path.exists(stock_list_file):
                 with open(stock_list_file, 'r', encoding='utf-8-sig') as f:
@@ -1235,6 +1238,8 @@ class GUIScheduler(QMainWindow):
                         filename = os.path.join(data_dir, "创业板_股票列表.csv")
                     elif pool_type == 'sci':
                         filename = os.path.join(data_dir, "科创板_股票列表.csv")
+                    elif pool_type == 'convertible_bonds':
+                        filename = os.path.join(data_dir, "沪深转债_列表.csv")
                     elif pool_type == 'custom':
                         # 处理自定义股票池
                         # 1. 添加默认自定义文件
@@ -1852,4 +1857,4 @@ def main():
 if __name__ == '__main__':
     # Windows多进程保护
     multiprocessing.freeze_support()
-    main() 
+    main()

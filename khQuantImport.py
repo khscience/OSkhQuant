@@ -37,9 +37,98 @@ from khQTTools import (
 # 同时将 khQTTools 的其他常用工具函数暴露出来（如 khHistory 等）
 from khQTTools import *
 
+# ===== 框架核心 =====
+from khFrame import KhQuantFramework
+
 # ===== 指标库（MyTT） =====
 import MyTT as _mytt
 from MyTT import *  # 暴露 MA/RSI 等指标函数
+
+# ===== Tick数据字段映射 =====
+# Tick数据和K线数据字段名不同，需要映射
+# K线数据使用 'close'，Tick数据使用 'lastPrice'
+TICK_FIELD_MAPPING = {
+    'close': 'lastPrice',      # 收盘价 -> 最新价
+    'lastPrice': 'lastPrice',  # 兼容直接使用lastPrice
+}
+
+def _is_valid_value(value) -> bool:
+    """检查值是否有效（非None且非NaN）
+    
+    Args:
+        value: 要检查的值
+        
+    Returns:
+        bool: 值是否有效
+    """
+    if value is None:
+        return False
+    # 检查是否为NaN（nan != nan 是NaN的特性）
+    try:
+        if isinstance(value, float) and value != value:
+            return False
+        # 也可以使用numpy检查
+        if np.isnan(value):
+            return False
+    except (TypeError, ValueError):
+        # 如果不是数值类型，无法检查nan，认为有效
+        pass
+    return True
+
+def _get_tick_compatible_field(stock_data: Dict, field: str):
+    """获取tick兼容的字段值，自动处理close/lastPrice映射
+    
+    对于close字段：先检查是否有lastPrice字段来判断数据类型
+    - 有lastPrice → 是tick数据 → 优先返回lastPrice
+    - 没有lastPrice → 是K线数据 → 返回close
+    
+    Args:
+        stock_data: 股票数据字典或类似对象
+        field: 请求的字段名
+        
+    Returns:
+        字段值，如果不存在或无效返回None
+    """
+    # 检查stock_data是否有get方法或支持in操作
+    has_get = hasattr(stock_data, 'get')
+    has_contains = hasattr(stock_data, '__contains__')
+    
+    # 特殊处理：当请求close字段时，先检查是否是tick数据
+    # Tick数据同时有close(nan)和lastPrice(有效值)，需要优先读取lastPrice
+    if field == 'close':
+        # 检查是否有lastPrice字段（tick数据的标志）
+        has_lastPrice = False
+        if has_get:
+            has_lastPrice = stock_data.get('lastPrice') is not None
+        elif has_contains:
+            has_lastPrice = 'lastPrice' in stock_data
+        
+        if has_lastPrice:
+            # 是tick数据，优先返回lastPrice
+            try:
+                if has_get:
+                    value = stock_data.get('lastPrice')
+                else:
+                    value = stock_data['lastPrice']
+                if _is_valid_value(value):
+                    return value
+            except (KeyError, IndexError):
+                pass
+    
+    # 其他情况：正常获取请求的字段
+    if has_get:
+        value = stock_data.get(field)
+        if _is_valid_value(value):
+            return value
+    elif has_contains and field in stock_data:
+        try:
+            value = stock_data[field]
+            if _is_valid_value(value):
+                return value
+        except (KeyError, IndexError):
+            pass
+    
+    return None
 
 # ===== 时间标准化类 =====
 class TimeInfo:
@@ -115,6 +204,7 @@ class StockDataParser:
         Args:
             stock_code: 股票代码
             field: 价格字段，如 'open', 'high', 'low', 'close', 'volume'
+                   对于tick数据，'close'会自动映射为'lastPrice'
             
         Returns:
             float: 价格值，如果没有数据返回0.0
@@ -138,24 +228,31 @@ class StockDataParser:
             # 其他类型的空值检查
             return 0.0
             
-        # 获取字段值
+        # 获取字段值 - 使用tick兼容的字段获取函数
         value = None
         try:
-            # 处理pandas Series对象
-            if hasattr(stock_data, 'get'):
-                # 类似字典的访问方式
-                value = stock_data.get(field, 0.0)
-            elif hasattr(stock_data, field):
-                # 属性访问方式
-                value = getattr(stock_data, field)
-            elif hasattr(stock_data, '__getitem__'):
-                # 索引访问方式
-                try:
-                    value = stock_data[field]
-                except (KeyError, IndexError):
-                    return 0.0
-            else:
-                return 0.0
+            # 首先尝试使用tick兼容的字段映射获取
+            value = _get_tick_compatible_field(stock_data, field)
+            
+            # 如果映射函数返回None，尝试其他访问方式
+            if value is None:
+                if hasattr(stock_data, field):
+                    # 属性访问方式
+                    value = getattr(stock_data, field)
+                elif hasattr(stock_data, '__getitem__'):
+                    # 索引访问方式 - 也尝试映射字段
+                    try:
+                        value = stock_data[field]
+                    except (KeyError, IndexError):
+                        # 尝试映射字段
+                        if field in TICK_FIELD_MAPPING:
+                            mapped_field = TICK_FIELD_MAPPING[field]
+                            try:
+                                value = stock_data[mapped_field]
+                            except (KeyError, IndexError):
+                                return 0.0
+                        else:
+                            return 0.0
         except Exception as e:
             logging.debug(f"获取字段 {field} 时出错: {str(e)}")
             return 0.0
@@ -350,6 +447,7 @@ def khPrice(data: Dict, stock_code: str, field: str = 'close') -> float:
         data: 策略数据字典
         stock_code: 股票代码
         field: 价格字段，默认为'close'
+               对于tick数据，'close'会自动映射为'lastPrice'
         
     Returns:
         float: 股票价格，如果获取失败返回0.0
@@ -360,7 +458,11 @@ def khPrice(data: Dict, stock_code: str, field: str = 'close') -> float:
         
         # 首先检查是否为None
         if price is None:
-            logging.warning(f"股票 {stock_code} 的 {field} 价格数据为None")
+            # 对于tick数据的close字段，降低日志级别，因为这是正常情况
+            if field == 'close':
+                logging.debug(f"股票 {stock_code} 的 {field} 价格数据为None（可能是tick数据）")
+            else:
+                logging.warning(f"股票 {stock_code} 的 {field} 价格数据为None")
             return 0.0
         
         # 处理pandas Series的情况
@@ -370,10 +472,10 @@ def khPrice(data: Dict, stock_code: str, field: str = 'close') -> float:
                 if len(price) > 0:
                     price_val = price.iloc[-1]
                 else:
-                    logging.warning(f"股票 {stock_code} 的 {field} 价格Series为空")
+                    logging.debug(f"股票 {stock_code} 的 {field} 价格Series为空")
                     return 0.0
             except Exception as e:
-                logging.warning(f"处理pandas Series时出错: {str(e)}")
+                logging.debug(f"处理pandas Series时出错: {str(e)}")
                 return 0.0
         elif hasattr(price, '__len__') and hasattr(price, '__getitem__') and not isinstance(price, str):
             # 数组类型（但不是字符串）
@@ -381,10 +483,10 @@ def khPrice(data: Dict, stock_code: str, field: str = 'close') -> float:
                 if len(price) > 0:
                     price_val = price[-1]
                 else:
-                    logging.warning(f"股票 {stock_code} 的 {field} 价格数组为空")
+                    logging.debug(f"股票 {stock_code} 的 {field} 价格数组为空")
                     return 0.0
             except Exception as e:
-                logging.warning(f"处理数组类型价格时出错: {str(e)}")
+                logging.debug(f"处理数组类型价格时出错: {str(e)}")
                 return 0.0
         else:
             # 标量值
@@ -395,11 +497,12 @@ def khPrice(data: Dict, stock_code: str, field: str = 'close') -> float:
             result = float(price_val)
             # 检查是否为有效数字
             if np.isnan(result) or np.isinf(result):
-                logging.warning(f"股票 {stock_code} 的 {field} 价格数据无效: {result}")
+                # 对于tick数据的NaN，使用debug级别而非warning
+                logging.debug(f"股票 {stock_code} 的 {field} 价格数据无效: {result}")
                 return 0.0
             return result
         except (ValueError, TypeError):
-            logging.warning(f"股票 {stock_code} 的 {field} 价格数据无法转换为数字: {price_val}")
+            logging.debug(f"股票 {stock_code} 的 {field} 价格数据无法转换为数字: {price_val}")
             return 0.0
             
     except Exception as e:
@@ -422,62 +525,6 @@ def khHas(data: Dict, stock_code: str) -> bool:
     except Exception as e:
         logging.error(f"检查持仓时出错: {str(e)}")
         return False
-
-def khBuy(data: Dict, stock_code: str, ratio: float = 1.0, volume: Optional[int] = None, reason: str = "") -> Dict:
-    """生成买入信号的便捷函数
-    
-    Args:
-        data: 策略数据字典
-        stock_code: 股票代码
-        ratio: 买入比例，默认1.0（全仓）
-        volume: 指定买入数量，如果提供则忽略ratio
-        reason: 买入原因
-        
-    Returns:
-        Dict: 买入信号字典
-    """
-    try:
-        current_price = khPrice(data, stock_code)
-        if current_price <= 0:
-            logging.warning(f"无法获取股票 {stock_code} 的价格信息，跳过买入信号")
-            return {}
-        
-        if reason == "":
-            reason = f"策略买入 {stock_code}"
-        
-        signals = generate_signal(data, stock_code, current_price, ratio, 'buy', reason)
-        return signals[0] if signals else {}
-    except Exception as e:
-        logging.error(f"生成买入信号时出错: {str(e)}")
-        return {}
-
-def khSell(data: Dict, stock_code: str, ratio: float = 1.0, volume: Optional[int] = None, reason: str = "") -> Dict:
-    """生成卖出信号的便捷函数
-    
-    Args:
-        data: 策略数据字典
-        stock_code: 股票代码
-        ratio: 卖出比例，默认1.0（全仓）
-        volume: 指定卖出数量，如果提供则忽略ratio
-        reason: 卖出原因
-        
-    Returns:
-        Dict: 卖出信号字典
-    """
-    try:
-        current_price = khPrice(data, stock_code)
-        if current_price <= 0:
-            logging.warning(f"无法获取股票 {stock_code} 的价格信息，跳过卖出信号")
-            return {}
-        
-        if reason == "":
-            reason = f"策略卖出 {stock_code}"
-        
-        signals = generate_signal(data, stock_code, current_price, ratio, 'sell', reason)
-        return signals[0] if signals else {}
-    except Exception as e:
-        logging.error(f"生成卖出信号时出错: {str(e)}")
-        return {}
 
 def get_default_risk_params() -> Dict:
     """获取默认的风控参数"""
@@ -505,16 +552,20 @@ __all__ = [
     # 内部工具
     'generate_signal', 'calculate_max_buy_volume', 'KhQuTools',
     
+    # 框架核心
+    'KhQuantFramework',
+    
     # 时间工具函数 - 可直接使用，无需实例化类
     'is_trade_time', 'is_trade_day', 'get_trade_days_count',
     
     # 新增类和函数
     'TimeInfo', 'StockDataParser', 'PositionParser', 'StockPoolParser',
     'StrategyContext', 'parse_context', 'khGet', 'khPrice', 'khHas',
-    'khBuy', 'khSell', 'get_default_risk_params',
+    'get_default_risk_params',
+
     # 指标函数（MyTT）与项目内均线
     'MA', 'RSI', 'khMA'
-] 
+]
 
 # 自动并入 khQTTools 与 MyTT 的所有公共符号，便于 from khQuantImport import * 统一入口
 __all__ += [name for name in dir(_khq) if not name.startswith('_') and name not in __all__]

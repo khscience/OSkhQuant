@@ -17,15 +17,36 @@ from xtquant import xtconstant
 
 from khTrade import KhTradeManager
 from khRisk import KhRiskManager
-from khQTTools import KhQuTools
+from khQTTools import KhQuTools, determine_pool_type, format_price, round_price, get_price_decimals, check_t0_support, get_t0_details
 from khConfig import KhConfig
 
 import numpy as np
-from PyQt5.QtCore import Qt, QMetaObject, Q_ARG
+from PyQt5.QtCore import Qt, QMetaObject, Q_ARG, QObject
 from PyQt5.QtWidgets import QMessageBox
 import pandas as pd
 import os
 import holidays
+
+# 简单的GUI类，用于处理日志记录
+class DummySignal:
+    """虚拟信号类，用于非GUI模式下替代PyQt5信号"""
+    def emit(self, *args, **kwargs):
+        """空实现，忽略信号发射"""
+        pass
+
+class SimpleGUI:
+    """简单的GUI类，用于处理日志记录，兼容纯代码运行模式"""
+    def __init__(self):
+        # 创建虚拟信号对象，避免属性访问错误
+        self.progress_signal = DummySignal()
+
+    def log_message(self, message, level="INFO"):
+        """记录日志消息"""
+        print(f"[{level}] {datetime.datetime.now()} - {message}")
+
+    def on_strategy_finished(self):
+        """策略完成回调"""
+        print(f"[INFO] {datetime.datetime.now()} - 策略执行完成")
 
 # 触发器基类
 class TriggerBase:
@@ -257,7 +278,12 @@ class MyTraderCallback(XtQuantTraderCallback):
     def __init__(self, gui):
         super().__init__()
         self.gui = gui
+        self.price_decimals = 2  # 默认价格精度，会在回测开始时根据股票池类型更新
         self.gui.log_message("交易回调已初始化", "INFO")
+    
+    def set_price_decimals(self, decimals: int):
+        """设置价格精度"""
+        self.price_decimals = decimals
     
     def on_stock_order(self, order):
         """委托回报推送"""
@@ -295,12 +321,13 @@ class MyTraderCallback(XtQuantTraderCallback):
                 except Exception as e:
                     formatted_time = f"时间转换错误: {e}"
             
+            decimals = self.price_decimals
             order_msg = (
                 f"委托信息 - "
                 f"时间: {formatted_time} | "
                 f"股票代码: {order.stock_code} | "
                 f"方向: {direction_map.get(order.order_type, '未知')} | "
-                f"委托价格: {order.price:.2f} | "
+                f"委托价格: {order.price:.{decimals}f} | "
                 f"数量: {order.order_volume} | "
                 f"委托编号: {order.order_id} | "
                 f"原因: {order.status_msg or '策略交易'}"
@@ -342,14 +369,15 @@ class MyTraderCallback(XtQuantTraderCallback):
                 except Exception as e:
                     formatted_time = f"时间转换错误: {e}"
             
+            decimals = self.price_decimals
             trade_msg = (
                 f"成交信息 - "
                 f"时间: {formatted_time} | "
                 f"股票代码: {trade.stock_code} | "
                 f"方向: {direction_map.get(trade.order_type, '未知')} | "
-                f"实际成交价: {actual_price:.2f} | "
+                f"实际成交价: {actual_price:.{decimals}f} | "
                 f"成交数量: {trade.traded_volume} | "
-                f"成交金额: {trade.traded_amount:.2f} | "
+                f"成交金额: {trade.traded_amount:.{decimals}f} | "
                 f"成交编号: {trade.traded_id} | "
                 f"原因: {trade.order_remark or '策略交易'}"
             )
@@ -429,13 +457,14 @@ class MyTraderCallback(XtQuantTraderCallback):
         """持仓变动推送"""
         try:
             # 只记录重要的持仓变动
+            decimals = self.price_decimals
             msg = (
                 f"持仓变动 - "
                 f"股票代码: {position.stock_code} | "
                 f"持仓数量: {position.volume} | "
-                f"最新价格: {getattr(position, 'current_price', 0):.3f} | "
-                f"持仓市值: {getattr(position, 'market_value', 0):.2f} | "
-                f"持仓盈亏: {getattr(position, 'profit', 0):.2f}"
+                f"最新价格: {getattr(position, 'current_price', 0):.{decimals}f} | "
+                f"持仓市值: {getattr(position, 'market_value', 0):.{decimals}f} | "
+                f"持仓盈亏: {getattr(position, 'profit', 0):.{decimals}f}"
             )
             self.gui.log_message(msg, "INFO")
         except Exception as e:
@@ -449,11 +478,12 @@ class MyTraderCallback(XtQuantTraderCallback):
         """资金变动推送"""
         '''
         try:
+            decimals = self.price_decimals
             msg = (
                 f"资金变动 - "
                 f"账户: {asset.account_id} | "
-                f"可用资金: {asset.cash:.2f} | "
-                f"总资产: {asset.total_asset:.2f}"
+                f"可用资金: {asset.cash:.{decimals}f} | "
+                f"总资产: {asset.total_asset:.{decimals}f}"
             )
             self.gui.log_message(msg, "INFO")
             print("资金变动推送on asset callback")
@@ -473,6 +503,10 @@ class KhQuantFramework:
             strategy_file: 策略文件路径
             trader_callback: 交易回调函数
         """
+        print(f"[DEBUG] KhQuantFramework.__init__ 开始")
+        print(f"[DEBUG] config_path: {config_path}")
+        print(f"[DEBUG] strategy_file: {strategy_file}")
+        
         self.config_path = config_path
         self.config = KhConfig(config_path)
         self.is_running = False  # 运行状态标识
@@ -487,13 +521,27 @@ class KhQuantFramework:
         self.daily_price_cache = {}  # 日线价格缓存，用于存储所有股票的日线数据
         self._cached_benchmark_close = {}  # 基准指数收盘价缓存
         
+        # T+0交易模式标识（默认关闭，在run()中根据股票池判断）
+        self.t0_mode = False
+        
         # 添加运行时间记录变量
         self.start_time = None  # 策略开始运行时间
         self.end_time = None    # 策略结束运行时间
         self.total_runtime = 0  # 总运行时间（秒）
         
+        # 添加简单的GUI属性用于日志记录
+        self.gui = SimpleGUI()
+        
         # 加载策略模块
-        self.strategy_module = self.load_strategy(strategy_file)
+        print(f"[DEBUG] 准备加载策略模块: {strategy_file}")
+        try:
+            self.strategy_module = self.load_strategy(strategy_file)
+            print(f"[DEBUG] 策略模块加载成功")
+        except Exception as e:
+            print(f"[DEBUG] 策略模块加载失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise
         
         # 当前运行模式
         self.run_mode = self.config.run_mode
@@ -534,18 +582,70 @@ class KhQuantFramework:
         # 初始化风控管理器
         self.risk_mgr = KhRiskManager(self.config)
         
+    def _log(self, message, level="INFO"):
+        """根据是否存在回调函数选择日志记录方式"""
+        if self.trader_callback and hasattr(self.trader_callback, 'gui'):
+            self.trader_callback.gui.log_message(message, level)
+        else:
+            # 在调试模式下，trader_callback可能不存在，使用print输出
+            print(f"[{level}] {datetime.datetime.now()} - {message}")
+
+    def _should_log(self):
+        """检查是否应该输出日志（用于性能优化）
+
+        始终返回True，保持兼容性
+        """
+        return True
+
+    def _cache_should_log(self):
+        """在回测开始时缓存日志开关状态（保持兼容性）"""
+        pass
+
     def load_strategy(self, strategy_file: str):
         """动态加载策略模块
-        
+
         Args:
             strategy_file: 策略文件路径
-            
+
         Returns:
             module: 策略模块
         """
-        spec = importlib.util.spec_from_file_location("strategy", strategy_file)
+        print(f"[DEBUG] load_strategy 被调用，参数: {strategy_file}")
+        import importlib.util
+        import sys
+        import os
+
+        # 获取策略文件的绝对路径
+        strategy_file = os.path.abspath(strategy_file)
+        print(f"[DEBUG] 策略文件绝对路径: {strategy_file}")
+
+        # 使用策略文件的实际文件名作为模块名（不含.py扩展名）
+        # 这样debugpy可以正确识别模块
+        module_name = os.path.splitext(os.path.basename(strategy_file))[0]
+        print(f"[DEBUG] 模块名: {module_name}")
+
+        # 创建模块规范
+        spec = importlib.util.spec_from_file_location(module_name, strategy_file)
+        print(f"[DEBUG] spec 创建成功")
+
+        # 创建模块对象
         strategy_module = importlib.util.module_from_spec(spec)
+        print(f"[DEBUG] 模块对象创建成功")
+
+        # 将模块添加到sys.modules，这样debugpy可以找到它
+        # 这是让VSCode断点生效的关键！
+        sys.modules[module_name] = strategy_module
+        print(f"[DEBUG] 模块已添加到sys.modules: {module_name}")
+
+        # 确保模块的__file__属性指向正确的源文件
+        strategy_module.__file__ = strategy_file
+        print(f"[DEBUG] 模块__file__属性: {strategy_module.__file__}")
+
+        # 执行模块代码
+        print(f"[DEBUG] 准备执行模块代码")
         spec.loader.exec_module(strategy_module)
+        print(f"[DEBUG] 模块代码执行完成")
+
         return strategy_module
         
     def init_trader_and_account(self):
@@ -716,6 +816,7 @@ class KhQuantFramework:
                 return
                 
             # 添加当前时间信息到数据字典
+            current_time = datetime.datetime.fromtimestamp(timestamp)
             time_data = {
                 "__current_time__": {
                     "timestamp": timestamp,
@@ -797,8 +898,8 @@ class KhQuantFramework:
             if signals:
                 for signal in signals:
                     if 'price' in signal:
-                        # 确保价格保留到0.01
-                        signal['price'] = round(float(signal['price']), 2)
+                        # 使用动态精度
+                        signal['price'] = round(float(signal['price']), self.price_decimals)
             
             # 发送交易指令
             if signals:
@@ -859,6 +960,69 @@ class KhQuantFramework:
             
             if self.trader_callback:
                 self.trader_callback.gui.log_message(f"股票列表加载耗时: {stock_list_time:.2f}秒", "INFO")
+            
+            # 判断股票池类型并设置价格精度
+            self.pool_type, self.price_decimals = determine_pool_type(stock_codes)
+            # 将精度设置传递给交易管理器
+            self.trade_mgr.set_price_decimals(self.price_decimals)
+            # 将精度设置传递给回调对象（用于日志格式化）
+            if self.trader_callback and hasattr(self.trader_callback, 'set_price_decimals'):
+                self.trader_callback.set_price_decimals(self.price_decimals)
+            
+            # 记录股票池类型信息
+            pool_type_names = {
+                'stock_only': '纯股票',
+                'etf_only': '纯ETF',
+                'mixed': '股票+ETF混合'
+            }
+            if self.trader_callback:
+                self.trader_callback.gui.log_message(
+                    f"股票池类型: {pool_type_names.get(self.pool_type, self.pool_type)}, "
+                    f"价格精度: {self.price_decimals}位小数", "INFO"
+                )
+            
+            # ==================== T+0模式检验 ====================
+            t0_support_type, self.t0_mode = check_t0_support(stock_codes)
+            
+            # 将T+0模式设置传递给交易管理器
+            self.trade_mgr.set_t0_mode(self.t0_mode)
+            
+            if t0_support_type == 'all_t0':
+                # 全部支持T+0，进入T+0模式
+                if self.trader_callback:
+                    self.trader_callback.gui.log_message(
+                        "T+0交易模式已启用 - 股票池中全部为T0型ETF，支持当日买入当日卖出", "INFO"
+                    )
+                    # 通知GUI更新显示（使用try-except防止跨线程调用导致崩溃）
+                    try:
+                        if hasattr(self.trader_callback.gui, 'set_t0_mode_display'):
+                            self.trader_callback.gui.set_t0_mode_display(True)
+                    except Exception as e:
+                        logging.warning(f"更新T+0模式显示时出错: {e}")
+            elif t0_support_type == 'mixed':
+                # 混合池，弹窗提醒
+                t0_details = get_t0_details(stock_codes)
+                warning_msg = (
+                    f"股票池中包含混合品种：\n"
+                    f"- 支持T+0的ETF: {t0_details['t0_count']}只\n"
+                    f"- 不支持T+0的品种: {len(t0_details['non_t0_stocks'])}只\n\n"
+                    f"系统将使用T+1模式运行。如需使用T+0模式，请确保股票池中只包含T0型ETF。"
+                )
+                if self.trader_callback:
+                    self.trader_callback.gui.log_message(
+                        f"T+0模式未启用：股票池包含{t0_details['t0_count']}只T0型ETF和{len(t0_details['non_t0_stocks'])}只非T0品种", 
+                        "WARNING"
+                    )
+                    # 显示警告弹窗（使用try-except防止跨线程调用导致崩溃）
+                    try:
+                        if hasattr(self.trader_callback.gui, 'show_t0_warning'):
+                            self.trader_callback.gui.show_t0_warning(warning_msg)
+                    except Exception as e:
+                        logging.warning(f"显示T+0警告弹窗时出错: {e}")
+            else:
+                # 全部不支持T+0，正常T+1模式
+                if self.trader_callback:
+                    self.trader_callback.gui.log_message("交易模式: T+1（标准A股交易规则）", "INFO")
             
             # 准备初始化数据结构，包含时间、账户、持仓、股票池等信息
             init_data = {
@@ -1097,9 +1261,12 @@ class KhQuantFramework:
                 'init_capital': self.config.config_dict["backtest"]["init_capital"]
             }
             
+            # 缓存日志开关状态，避免在回测循环中重复检查
+            self._cache_should_log()
+
             if self.trader_callback:
                 self.trader_callback.gui.log_message("开始回测...", "INFO")
-                
+
             # 获取股票列表
             stock_codes = self.get_stock_list()
 
@@ -1109,19 +1276,114 @@ class KhQuantFramework:
             # 获取策略文件名（不含路径和扩展名）
             strategy_file = self.config.config_dict.get("strategy_file", "")
             strategy_name = os.path.splitext(os.path.basename(strategy_file))[0] if strategy_file else "unknown"
+            
+            self._log(f"策略文件路径: {strategy_file}", "INFO")
+            self._log(f"解析的策略名称: {strategy_name}", "INFO")
 
-            # 生成回测目录名（使用策略名称和回测时间范围）
-            backtest_dir_name = f"{strategy_name}_{self.config.backtest_start}_{self.config.backtest_end}"
+            # 生成回测时间戳
+            backtest_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # 生成回测目录名（使用策略名称、回测时间范围和时间戳）
+            # 为了避免调试器和中文路径的问题，直接使用ASCII安全的名称
+            try:
+                # 直接使用ASCII安全的策略名
+                import hashlib
+                strategy_hash = hashlib.md5(strategy_name.encode('utf-8')).hexdigest()[:8]
+                backtest_dir_name = f"strategy_{strategy_hash}_{self.config.backtest_start}_{self.config.backtest_end}_{backtest_timestamp}"
+                self._log(f"使用安全目录名: {backtest_dir_name} (原始策略名: {strategy_name})", "INFO")
+            except Exception as e:
+                self._log(f"生成目录名时出错: {str(e)}", "ERROR")
+                # 使用默认名称
+                backtest_dir_name = f"unknown_{self.config.backtest_start}_{self.config.backtest_end}_{backtest_timestamp}"
+                self._log(f"使用默认目录名: {backtest_dir_name}", "INFO")
 
+            # 确保backtest_results基础目录存在
+            base_results_dir = "backtest_results"
+            self._log(f"检查基础目录是否存在: {base_results_dir}", "INFO")
+            try:
+                if not os.path.exists(base_results_dir):
+                    os.makedirs(base_results_dir, exist_ok=True)
+                    self._log(f"创建基础回测目录: {base_results_dir}", "INFO")
+                else:
+                    self._log(f"基础目录已存在: {base_results_dir}", "INFO")
+            except Exception as e:
+                self._log(f"检查/创建基础目录时出错: {str(e)}", "ERROR")
+                raise
+            
             # 构建回测结果目录路径
             backtest_dir = os.path.join(
-                "backtest_results",
+                base_results_dir,
                 backtest_dir_name
             )
+            self._log(f"完整回测结果目录路径: {os.path.abspath(backtest_dir)}", "INFO")
+            
+            # 尝试规范化路径，处理可能的编码问题
+            try:
+                backtest_dir = os.path.normpath(backtest_dir)
+                self._log(f"规范化后的路径: {backtest_dir}", "INFO")
+            except Exception as e:
+                self._log(f"路径规范化失败: {str(e)}", "ERROR")
 
-            # 确保目录存在
-            if not os.path.exists(backtest_dir):
-                os.makedirs(backtest_dir)
+            # 确保目录存在，增强错误处理
+            try:
+                # 强制使用绝对路径以增加稳健性
+                if not os.path.isabs(backtest_dir):
+                    backtest_dir = os.path.abspath(backtest_dir)
+                    self._log(f"已将回测目录转换为绝对路径: {backtest_dir}", "INFO")
+
+                self._log(f"准备检查目录是否存在: {backtest_dir}", "INFO")
+                
+                # 检测是否在调试模式下
+                import sys
+                # 优先使用环境变量检测，这在编辑器调试模块中更可靠
+                is_debugging = os.environ.get('KHQUANT_DEBUG_MODE') == '1' or (hasattr(sys, 'gettrace') and sys.gettrace() is not None)
+                
+                if is_debugging:
+                    self._log(f"检测到调试模式，使用传统方法创建目录", "INFO")
+                    # 在调试模式下，直接尝试创建目录，不检查是否存在
+                    try:
+                        # 使用exist_ok=True，如果目录已存在也不会报错
+                        os.makedirs(backtest_dir, exist_ok=True)
+                        self._log(f"已使用 os.makedirs 创建目录（或目录已存在）", "INFO")
+                        time.sleep(0.2)
+                    except Exception as e:
+                        self._log(f"创建目录时出错: {str(e)}", "ERROR")
+                        # 尝试使用绝对路径
+                        abs_backtest_dir = os.path.abspath(backtest_dir)
+                        self._log(f"尝试使用绝对路径: {abs_backtest_dir}", "INFO")
+                        os.makedirs(abs_backtest_dir, exist_ok=True)
+                        backtest_dir = abs_backtest_dir
+                else:
+                    # 非调试模式下可以使用pathlib
+                    from pathlib import Path
+                    backtest_path = Path(backtest_dir)
+                    self._log(f"使用 pathlib.Path 处理路径: {backtest_path}", "INFO")
+                    
+                    if not backtest_path.exists():
+                        self._log(f"目录不存在，尝试创建: {backtest_path}", "INFO")
+                        backtest_path.mkdir(parents=True, exist_ok=True)
+                        self._log(f"已使用 Path.mkdir 创建目录", "INFO")
+                        time.sleep(0.2)
+                    else:
+                        self._log(f"目录已存在: {backtest_path}", "INFO")
+                    
+                    # 将路径转回字符串格式供后续使用
+                    backtest_dir = str(backtest_path)
+                
+                # 再次验证目录是否存在（调试模式下跳过）
+                if not is_debugging:
+                    if not os.path.exists(backtest_dir):
+                        self._log(f"目录创建后仍然不存在！", "ERROR")
+                        raise FileNotFoundError(f"无法创建或访问回测结果目录: {backtest_dir}")
+                    self._log(f"回测结果目录确认存在: {backtest_dir}", "INFO")
+                else:
+                    self._log(f"调试模式下跳过目录存在性验证", "INFO")
+                    self._log(f"假定回测结果目录已创建: {backtest_dir}", "INFO")
+                    
+            except Exception as e:
+                error_msg = f"创建回测结果目录时失败: {str(e)}"
+                self._log(error_msg, "ERROR")
+                raise Exception(error_msg)
 
             benchmark_file = os.path.join(backtest_dir, "benchmark.csv")
 
@@ -1233,31 +1495,32 @@ class KhQuantFramework:
                     
                 # 根据触发器的数据周期加载对应的历史数据
                 period = data_period
-                if period == "1s":
-                    # 对于自定义定时触发，检查时间点是否都是整分钟
-                    if isinstance(self.trigger, CustomTimeTrigger):
-                        # 检查所有触发时间点是否都是整分钟（秒数为0）
-                        all_whole_minutes = True
-                        for seconds in self.trigger.trigger_seconds:
-                            # 计算秒数部分
-                            seconds_part = seconds % 60
-                            if seconds_part != 0:
-                                all_whole_minutes = False
-                                break
-                        
-                        if all_whole_minutes:
-                            # 如果所有时间点都是整分钟，使用1m数据
-                            period = "1m"
-                            if self.trader_callback:
-                                self.trader_callback.gui.log_message(f"所有自定义时间点都是整分钟，使用1分钟K线数据", "INFO")
-                        else:
-                            # 如果有不是整分钟的时间点，使用tick数据
-                            period = "tick"
-                            if self.trader_callback:
-                                self.trader_callback.gui.log_message(f"存在非整分钟的自定义时间点，使用tick数据", "INFO")
+                
+                # 对于自定义定时触发，需要特殊处理数据周期
+                if isinstance(self.trigger, CustomTimeTrigger):
+                    # 检查所有触发时间点是否都是整分钟（秒数为0）
+                    all_whole_minutes = True
+                    for seconds in self.trigger.trigger_seconds:
+                        # 计算秒数部分
+                        seconds_part = seconds % 60
+                        if seconds_part != 0:
+                            all_whole_minutes = False
+                            break
+                    
+                    if all_whole_minutes:
+                        # 如果所有时间点都是整分钟，使用1m数据
+                        period = "1m"
+                        if self.trader_callback:
+                            self.trader_callback.gui.log_message(f"所有自定义时间点都是整分钟，使用1分钟K线数据", "INFO")
                     else:
-                        # 默认使用tick数据
+                        # 如果有不是整分钟的时间点，使用tick数据
                         period = "tick"
+                        if self.trader_callback:
+                            self.trader_callback.gui.log_message(f"存在非整分钟的自定义时间点，使用tick数据", "INFO")
+                
+                # 对于其他触发器类型，直接使用触发器返回的数据周期
+                if self.trader_callback:
+                    self.trader_callback.gui.log_message(f"使用{period}数据周期进行回测", "INFO")
                 
                 data = xtdata.get_market_data_ex(
                     field_list=field_list,
@@ -1442,9 +1705,8 @@ class KhQuantFramework:
                 self.trader_callback.gui.log_message("回测进度: 0.00%", "INFO")
                 # 强制发送0%进度信号，确保进度条立即显示
                 self.trader_callback.gui.progress_signal.emit(0)
-                # 刷新界面
-                from PyQt5.QtWidgets import QApplication
-                QApplication.processEvents()
+                # 注意：不要在子线程中调用 QApplication.processEvents()
+                # 这会导致GUI线程阻塞和潜在的线程安全问题
             
             # 预先构建数据缓存（避免在循环中重复构建）
             if not hasattr(self, 'historical_data_ref'):
@@ -1554,7 +1816,12 @@ class KhQuantFramework:
                 
                 if should_show_progress and self.trader_callback:
                     progress = (processed_times / total_times) * 100
-                    self.trader_callback.gui.log_message(f"回测进度: {progress:.2f}%", "INFO")
+                    # 直接发送进度信号更新进度条（高效，不走日志系统）
+                    if hasattr(self.trader_callback.gui, 'progress_signal'):
+                        self.trader_callback.gui.progress_signal.emit(int(progress))
+                    # 只在需要输出日志时才记录进度文本
+                    if self._should_log():
+                        self.trader_callback.gui.log_message(f"回测进度: {progress:.2f}%", "INFO")
                 
                 # 进一步优化的构造数据代码
                 data_start_time = time.time()
@@ -1630,15 +1897,15 @@ class KhQuantFramework:
                 
                 time_stats["构造数据"] += time.time() - data_start_time
                 
-                # 添加日志，显示第一个股票的数据示例
-                if processed_times == 1 and self.trader_callback and current_data:
+                # 添加日志，显示第一个股票的数据示例（仅在需要输出日志时执行）
+                if processed_times == 1 and self.trader_callback and current_data and self._should_log():
                     # 获取第一个股票代码
                     first_stock = None
                     for code in current_data:
                         if code != "__current_time__":
                             first_stock = code
                             break
-                    
+
                     if first_stock:
                         sample_data = current_data[first_stock]
                         self.trader_callback.gui.log_message(f"数据样例 - 股票: {first_stock}, 字段: {list(sample_data.keys())}", "INFO")
@@ -1736,7 +2003,7 @@ class KhQuantFramework:
                             if post_signals:
                                 for signal in post_signals:
                                     if 'price' in signal:
-                                        signal['price'] = round(float(signal['price']), 2)
+                                        signal['price'] = round(float(signal['price']), self.price_decimals)
                                     signal['timestamp'] = time_info["timestamp"]
                                 
                                 # 发送交易指令
@@ -1745,12 +2012,18 @@ class KhQuantFramework:
                             if self.trader_callback:
                                 self.trader_callback.gui.log_message(f"执行盘后回调时出错: {str(e)}", "ERROR")
                     time_stats["盘后回调"] += time.time() - post_market_start
-                    
+
                     # 更新当前日期
                     current_date = time_info["date"]
                     day_start_time = time_info["timestamp"]
                     day_data = current_data
-                    
+
+                    # T+1模式下，新交易日将 can_use_volume 更新为 volume
+                    if not self.trade_mgr.t0_mode:
+                        for code, pos in self.trade_mgr.positions.items():
+                            if pos.get("volume", 0) > 0:
+                                pos["can_use_volume"] = pos["volume"]
+
                     # 检查是否需要执行盘前回调
                     pre_market_start = time.time()
                     if pre_market_enabled and hasattr(self.strategy_module, 'khPreMarket'):
@@ -1783,7 +2056,7 @@ class KhQuantFramework:
                             if pre_signals:
                                 for signal in pre_signals:
                                     if 'price' in signal:
-                                        signal['price'] = round(float(signal['price']), 2)
+                                        signal['price'] = round(float(signal['price']), self.price_decimals)
                                     signal['timestamp'] = time_info["timestamp"]
                                 
                                 # 发送交易指令
@@ -1871,8 +2144,8 @@ class KhQuantFramework:
                 if signals:
                     for signal in signals:
                         if 'price' in signal:
-                            # 确保价格保留到0.01
-                            signal['price'] = round(float(signal['price']), 2)
+                            # 使用动态精度
+                            signal['price'] = round(float(signal['price']), self.price_decimals)
                         # 添加当前回测时间戳
                         signal['timestamp'] = current_time
                 time_stats["处理信号"] += time.time() - signal_process_start
@@ -1941,7 +2214,7 @@ class KhQuantFramework:
                     if post_signals:
                         for signal in post_signals:
                             if 'price' in signal:
-                                signal['price'] = round(float(signal['price']), 2)
+                                signal['price'] = round(float(signal['price']), self.price_decimals)
                             signal['timestamp'] = time_info["timestamp"]
                         
                         # 发送交易指令
@@ -1954,19 +2227,20 @@ class KhQuantFramework:
             if self.trader_callback:
                 # 先停止策略并更新状态
                 self.is_running = False
-                self.trader_callback.gui.on_strategy_finished()
+                try:
+                    from PyQt5.QtCore import QMetaObject, Qt
+                    QMetaObject.invokeMethod(
+                        self.trader_callback.gui,
+                        "on_strategy_finished",
+                        Qt.QueuedConnection
+                    )
+                except Exception:
+                    # 如果invoke失败，退回到直接调用，但至少捕获异常
+                    self.trader_callback.gui.on_strategy_finished()
                 
                 # 显示100%进度
                 self.trader_callback.gui.log_message("回测进度: 100.00%", "INFO")
-                
-                # 然后再显示回测结果
                 self.trader_callback.gui.log_message("回测完成", "INFO")
-                QMetaObject.invokeMethod(
-                    self.trader_callback.gui, 
-                    "show_backtest_result", 
-                    Qt.QueuedConnection,
-                    Q_ARG(str, backtest_dir)
-                )
                 
             # 在回测完成后保存回测记录
             try:
@@ -1983,42 +2257,85 @@ class KhQuantFramework:
                     backtest_dir_name
                 )
 
-                # 如果目录已存在，先删除
-                if os.path.exists(backtest_dir):
-                    shutil.rmtree(backtest_dir)
+                # 创建新目录（由于包含时间戳，目录名唯一，无需删除）
+                os.makedirs(backtest_dir, exist_ok=True)
 
-                # 创建新目录
-                os.makedirs(backtest_dir)
+                def _safe_to_csv(df: pd.DataFrame, target_path: str, desc: str):
+                    """处理共享冲突时的容错写入"""
+                    for attempt in range(1, 4):
+                        try:
+                            df.to_csv(target_path, index=False, encoding='utf-8-sig')
+                            return
+                        except PermissionError:
+                            wait_time = 0.2 * attempt
+                            if self.trader_callback:
+                                self.trader_callback.gui.log_message(
+                                    f"{desc}保存失败（文件被占用），{wait_time:.1f}s后重试({attempt}/3)",
+                                    "WARNING"
+                                )
+                            time.sleep(wait_time)
+                        except Exception as e:
+                            self._log(f"{desc}保存失败: {e}", "ERROR")
+                            raise
 
                 # 保存交易记录
                 trades_df = pd.DataFrame(self.backtest_records['trades'])
-                if len(trades_df) > 0:
-                    trades_df.to_csv(os.path.join(backtest_dir, "trades.csv"), index=False, encoding='utf-8-sig')
-                else:
-                    # 创建一个包含列名但没有数据的空DataFrame
-                    empty_trades_df = pd.DataFrame(columns=[
+                if len(trades_df) == 0:
+                    trades_df = pd.DataFrame(columns=[
                         'datetime', 'code', 'action', 'price', 'volume', 'amount',
                         'commission', 'stamp_tax', 'transfer_fee', 'flow_fee',
                         'total_asset', 'cash', 'market_value'
                     ])
-                    empty_trades_df.to_csv(os.path.join(backtest_dir, "trades.csv"), index=False, encoding='utf-8-sig')
                     if self.trader_callback:
                         self.trader_callback.gui.log_message("回测期间没有产生交易记录", "WARNING")
+                _safe_to_csv(trades_df, os.path.join(backtest_dir, "trades.csv"), "交易记录")
 
                 # 保存每日统计数据
                 daily_stats_df = pd.DataFrame(self.backtest_records['daily_stats'])
-                if len(daily_stats_df) > 0:
-                    daily_stats_df.to_csv(os.path.join(backtest_dir, "daily_stats.csv"), index=False, encoding='utf-8-sig')
-                else:
-                    # 创建一个包含列名但没有数据的空DataFrame
-                    empty_stats_df = pd.DataFrame(columns=[
+                if len(daily_stats_df) == 0:
+                    daily_stats_df = pd.DataFrame(columns=[
                         'date', 'total_asset', 'cash', 'market_value', 
                         'daily_return', 'benchmark_close', 'positions'
                     ])
-                    empty_stats_df.to_csv(os.path.join(backtest_dir, "daily_stats.csv"), index=False, encoding='utf-8-sig')
                     if self.trader_callback:
                         self.trader_callback.gui.log_message("回测期间没有产生每日统计数据", "WARNING")
-                
+                _safe_to_csv(daily_stats_df, os.path.join(backtest_dir, "daily_stats.csv"), "每日统计数据")
+
+                # 保存回测汇总指标
+                try:
+                    if len(daily_stats_df) >= 2:
+                        init_capital = self.backtest_records['init_capital']
+                        final_capital = daily_stats_df['total_asset'].iloc[-1]
+                        trade_days = len(daily_stats_df)
+
+                        # 计算总收益率
+                        total_return = (final_capital - init_capital) / init_capital * 100 if init_capital > 0 else 0
+
+                        # 计算年化收益率: ((1+R)^(250/n)-1)*100%
+                        if trade_days > 0 and init_capital > 0:
+                            total_return_decimal = (final_capital / init_capital) - 1
+                            annual_return = (pow(1 + total_return_decimal, 250/trade_days) - 1) * 100
+                        else:
+                            annual_return = 0
+
+                        # 计算最大回撤
+                        cummax = daily_stats_df['total_asset'].cummax()
+                        drawdown = (cummax - daily_stats_df['total_asset']) / cummax * 100
+                        max_drawdown = drawdown.max()
+
+                        # 保存汇总指标
+                        summary = {
+                            'init_capital': init_capital,
+                            'final_capital': final_capital,
+                            'total_return': total_return,
+                            'annual_return': annual_return,
+                            'max_drawdown': max_drawdown,
+                            'trade_days': trade_days
+                        }
+                        _safe_to_csv(pd.DataFrame([summary]), os.path.join(backtest_dir, "summary.csv"), "回测汇总")
+                except Exception as e:
+                    logging.warning(f"保存回测汇总指标时出错: {str(e)}")
+
                 # 保存基准指数数据
                 benchmark_code = self.config.config_dict["backtest"]["benchmark"]
                 try:
@@ -2081,7 +2398,7 @@ class KhQuantFramework:
                                 
                                 # 保存到benchmark.csv
                                 benchmark_file = os.path.join(backtest_dir, "benchmark.csv")
-                                df.to_csv(benchmark_file, index=False)
+                                _safe_to_csv(df, benchmark_file, "基准数据")
                                 
                                 if self.trader_callback:
                                     self.trader_callback.gui.log_message(
@@ -2099,6 +2416,46 @@ class KhQuantFramework:
                         self.trader_callback.gui.log_message(f"获取基准指数数据时出错: {str(e)}", "ERROR")
                     logging.error(f"获取基准指数数据时出错: {str(e)}", exc_info=True)
                 
+                # 保存策略文件副本
+                strategy_file_path = self.config.config_dict.get("strategy_file", "")
+                if strategy_file_path and os.path.exists(strategy_file_path):
+                    try:
+                        # 保存.py文件
+                        strategy_filename = os.path.basename(strategy_file_path)
+                        strategy_backup_path = os.path.join(backtest_dir, strategy_filename)
+                        shutil.copy2(strategy_file_path, strategy_backup_path)
+                        
+                        # 查找并保存对应的.kh文件
+                        kh_file_path = os.path.splitext(strategy_file_path)[0] + ".kh"
+                        if os.path.exists(kh_file_path):
+                            kh_filename = os.path.basename(kh_file_path)
+                            kh_backup_path = os.path.join(backtest_dir, kh_filename)
+                            shutil.copy2(kh_file_path, kh_backup_path)
+                            if self.trader_callback:
+                                self.trader_callback.gui.log_message(f"策略配置文件已保存: {kh_filename}", "INFO")
+                        
+                        if self.trader_callback:
+                            self.trader_callback.gui.log_message(f"策略文件已保存: {strategy_filename}", "INFO")
+                            
+                    except Exception as e:
+                        if self.trader_callback:
+                            self.trader_callback.gui.log_message(f"保存策略文件时出错: {str(e)}", "ERROR")
+                        logging.error(f"保存策略文件时出错: {str(e)}", exc_info=True)
+                
+                # 保存完整的配置文件副本
+                try:
+                    config_file_path = getattr(self.config, 'config_path', None)
+                    if config_file_path and os.path.exists(config_file_path):
+                        config_filename = os.path.basename(config_file_path)
+                        config_backup_path = os.path.join(backtest_dir, f"full_{config_filename}")
+                        shutil.copy2(config_file_path, config_backup_path)
+                        if self.trader_callback:
+                            self.trader_callback.gui.log_message(f"完整配置文件已保存: full_{config_filename}", "INFO")
+                except Exception as e:
+                    if self.trader_callback:
+                        self.trader_callback.gui.log_message(f"保存完整配置文件时出错: {str(e)}", "ERROR")
+                    logging.error(f"保存完整配置文件时出错: {str(e)}", exc_info=True)
+                
                 # 保存回测配置信息
                 config_info = {
                     'start_time': self.backtest_records['start_time'],
@@ -2109,9 +2466,14 @@ class KhQuantFramework:
                     'actual_start_time': datetime.datetime.fromtimestamp(self.start_time).strftime("%Y-%m-%d %H:%M:%S") if self.start_time else "",
                     'actual_end_time': datetime.datetime.fromtimestamp(self.end_time).strftime("%Y-%m-%d %H:%M:%S") if self.end_time else "",
                     'total_runtime_seconds': self.total_runtime,
-                    'total_runtime_formatted': self._format_runtime(self.total_runtime)
+                    'total_runtime_formatted': self._format_runtime(self.total_runtime),
+                    # 保存股票池信息
+                    'stock_list': ','.join(self.get_stock_list()) if hasattr(self, 'get_stock_list') else '',
+                    'min_volume': self.config.config_dict["backtest"].get("min_volume", 100),
+                    'kline_period': self.config.config_dict["data"].get("kline_period", "1m"),
+                    'dividend_type': self.config.config_dict["data"].get("dividend_type", "front")
                 }
-                pd.DataFrame([config_info]).to_csv(os.path.join(backtest_dir, "config.csv"), index=False, encoding='utf-8-sig')
+                _safe_to_csv(pd.DataFrame([config_info]), os.path.join(backtest_dir, "config.csv"), "配置数据")
                 
                 if self.trader_callback:
                     self.trader_callback.gui.log_message(
@@ -2120,9 +2482,17 @@ class KhQuantFramework:
                     )
                     # 记录回测总耗时
                     self.trader_callback.gui.log_message(
-                        f"回测总耗时: {self._format_runtime(self.total_runtime)}", 
+                        f"回测总耗时: {self._format_runtime(self.total_runtime)}",
                         "INFO"
                     )
+                    # 只有在GUI模式下（gui是QObject）才调用显示结果窗口
+                    if isinstance(self.trader_callback.gui, QObject):
+                        QMetaObject.invokeMethod(
+                            self.trader_callback.gui,
+                            "show_backtest_result",
+                            Qt.QueuedConnection,
+                            Q_ARG(str, backtest_dir)
+                        )
                 
             except Exception as e:
                 if self.trader_callback:
@@ -2159,7 +2529,7 @@ class KhQuantFramework:
             is_trading_day = self.tools.is_trade_day(current_date)
             if not is_trading_day:
                 # 如果不是交易日，则跳过策略调用
-                if self.trader_callback:
+                if self.trader_callback and self._should_log():
                     self.trader_callback.gui.log_message(f"日期 {current_date} 不是交易日，跳过策略执行", "INFO")
                 return
             
@@ -2251,8 +2621,18 @@ class KhQuantFramework:
                 # 一次性从数据中提取所有价格
                 for code in position_codes:
                     # 使用条件短路避免不必要的检查
-                    if code in data and 'close' in data[code]:
-                        prices[code] = data[code]['close']
+                    # 先检查lastPrice判断是否是tick数据（tick数据的close字段值为nan）
+                    if code in data:
+                        if 'lastPrice' in data[code]:
+                            # Tick数据：优先使用lastPrice字段
+                            prices[code] = data[code]['lastPrice']
+                        elif 'close' in data[code]:
+                            # K线数据：使用close字段
+                            prices[code] = data[code]['close']
+                        elif code in positions and 'current_price' in positions[code] and positions[code]['current_price'] > 0:
+                            prices[code] = positions[code]['current_price']
+                        elif code in positions and 'avg_price' in positions[code]:
+                            prices[code] = positions[code]['avg_price']
                     elif code in positions and 'current_price' in positions[code] and positions[code]['current_price'] > 0:
                         prices[code] = positions[code]['current_price']
                     elif code in positions and 'avg_price' in positions[code]:
@@ -2499,7 +2879,7 @@ class KhQuantFramework:
                         period='1d',
                         start_time=yyyymmdd_date,
                         end_time=yyyymmdd_date,
-                        # 与回测数据保持一致的复权方式，避免“下单用复权价、估值用未复权价”的不一致
+                        # 与回测数据保持一致的复权方式，避免"下单用复权价、估值用未复权价"的不一致
                         dividend_type=self.config.config_dict["data"].get("dividend_type", "none")
                     )
                     
@@ -2530,7 +2910,12 @@ class KhQuantFramework:
             if code in daily_prices and daily_prices[code] > 0:
                 current_price = daily_prices[code]
             # 备选方案：使用触发数据中的价格
+            # 先检查lastPrice判断是否是tick数据（tick数据的close字段值为nan）
+            elif code in data and 'lastPrice' in data[code]:
+                # Tick数据：优先使用lastPrice字段
+                current_price = data[code]['lastPrice']
             elif code in data and 'close' in data[code]:
+                # K线数据：使用close字段
                 current_price = data[code]['close']
             # 备选方案：使用持仓记录的价格
             elif 'current_price' in positions[code] and positions[code]['current_price'] > 0:
@@ -2567,15 +2952,26 @@ class KhQuantFramework:
         else:
             try:
                 # 备选：使用触发数据中的价格
-                if benchmark_code in data and 'close' in data[benchmark_code]:
-                    benchmark_close = data[benchmark_code]['close']
-                    # 缓存结果
-                    self._cached_benchmark_close[cache_key] = benchmark_close
+                # 先检查lastPrice判断是否是tick数据（tick数据的close字段值为nan）
+                if benchmark_code in data:
+                    if 'lastPrice' in data[benchmark_code]:
+                        # Tick数据：优先使用lastPrice字段
+                        benchmark_close = data[benchmark_code]['lastPrice']
+                        # 缓存结果
+                        self._cached_benchmark_close[cache_key] = benchmark_close
+                    elif 'close' in data[benchmark_code]:
+                        # K线数据：使用close字段
+                        benchmark_close = data[benchmark_code]['close']
+                        # 缓存结果
+                        self._cached_benchmark_close[cache_key] = benchmark_close
             except Exception as e:
                 logging.error(f"获取基准指数数据失败: {e}")
-                # 备选方案
-                if benchmark_code in data and 'close' in data[benchmark_code]:
-                    benchmark_close = data[benchmark_code]['close']
+                # 备选方案：先检查lastPrice判断是否是tick数据
+                if benchmark_code in data:
+                    if 'lastPrice' in data[benchmark_code]:
+                        benchmark_close = data[benchmark_code]['lastPrice']
+                    elif 'close' in data[benchmark_code]:
+                        benchmark_close = data[benchmark_code]['close']
         
         # 计算当日收益率
         daily_stats = self.backtest_records['daily_stats']
@@ -2618,14 +3014,15 @@ class KhQuantFramework:
                 'close': benchmark_close
             })
         
-        # 输出日志
-        if self.trader_callback:
+        # 输出日志（性能优化：检查是否需要输出）
+        if self.trader_callback and self._should_log():
+            decimals = self.price_decimals
             self.trader_callback.gui.log_message(
                 f"每日统计 - 日期: {daily_stat['date']} | "
-                f"总资产: {total_asset:.2f} | "
+                f"总资产: {total_asset:.{decimals}f} | "
                 f"日收益率: {daily_return*100:.2f}% | "
-                f"持仓市值: {day_end_market_value:.2f} | "
-                f"可用资金: {cash:.2f}",
+                f"持仓市值: {day_end_market_value:.{decimals}f} | "
+                f"可用资金: {cash:.{decimals}f}",
                 "INFO"
             )
 
@@ -2677,3 +3074,85 @@ class KhQuantFramework:
         minutes = int((seconds % 3600) // 60)
         seconds = int(seconds % 60)
         return f"{hours}小时{minutes}分钟{seconds}秒"
+    
+    def on_stock_position(self, position):
+        """持仓变动回调"""
+        try:
+            if self.trader_callback and hasattr(self.trader_callback, 'gui'):
+                decimals = self.price_decimals
+                position_msg = (
+                    f"持仓变动 - "
+                    f"股票代码: {position.stock_code} | "
+                    f"持仓数量: {position.volume} | "
+                    f"可用数量: {position.can_use_volume} | "
+                    f"持仓均价: {position.avg_price:.{decimals}f} | "
+                    f"市值: {position.market_value:.{decimals}f}"
+                )
+                self.trader_callback.gui.log_message(position_msg, "TRADE")
+            print(f"持仓变动回调: {position.stock_code}")
+        except Exception as e:
+            print(f"处理持仓变动回调时出错: {str(e)}")
+    
+    def on_order_error(self, error):
+        """委托错误回调"""
+        try:
+            if self.trader_callback and hasattr(self.trader_callback, 'gui'):
+                error_msg = (
+                    f"委托错误 - "
+                    f"股票代码: {error.stock_code} | "
+                    f"错误代码: {error.error_id} | "
+                    f"错误信息: {error.error_msg} | "
+                    f"备注: {error.order_remark}"
+                )
+                self.trader_callback.gui.log_message(error_msg, "ERROR")
+            print(f"[ERROR] 委托错误: {error.error_msg}")
+        except Exception as e:
+            print(f"处理委托错误回调时出错: {str(e)}")
+    
+    def on_stock_order(self, order):
+        """委托回报回调"""
+        try:
+            if self.trader_callback and hasattr(self.trader_callback, 'gui'):
+                order_msg = (
+                    f"委托回报 - "
+                    f"股票代码: {order.stock_code} | "
+                    f"委托编号: {getattr(order, 'order_id', 'N/A')} | "
+                    f"状态: {getattr(order, 'order_status', 'N/A')} | "
+                    f"委托价格: {getattr(order, 'price', 'N/A')} | "
+                    f"委托数量: {getattr(order, 'order_volume', 'N/A')}"
+                )
+                self.trader_callback.gui.log_message(order_msg, "TRADE")
+            print(f"委托回报: {order.stock_code}")
+        except Exception as e:
+            print(f"处理委托回报时出错: {str(e)}")
+    
+    def on_stock_trade(self, trade):
+        """成交回报回调"""
+        try:
+            if self.trader_callback and hasattr(self.trader_callback, 'gui'):
+                trade_msg = (
+                    f"成交回报 - "
+                    f"股票代码: {trade.stock_code} | "
+                    f"成交价格: {getattr(trade, 'traded_price', 'N/A')} | "
+                    f"成交数量: {getattr(trade, 'traded_volume', 'N/A')} | "
+                    f"成交金额: {getattr(trade, 'traded_amount', 'N/A')}"
+                )
+                self.trader_callback.gui.log_message(trade_msg, "TRADE")
+            print(f"成交回报: {trade.stock_code}")
+        except Exception as e:
+            print(f"处理成交回报时出错: {str(e)}")
+    
+    def on_stock_asset(self, asset):
+        """资产变动回调"""
+        try:
+            if self.trader_callback and hasattr(self.trader_callback, 'gui'):
+                asset_msg = (
+                    f"资产变动 - "
+                    f"总资产: {getattr(asset, 'total_asset', 'N/A')} | "
+                    f"现金: {getattr(asset, 'cash', 'N/A')} | "
+                    f"市值: {getattr(asset, 'market_value', 'N/A')}"
+                )
+                self.trader_callback.gui.log_message(asset_msg, "INFO")
+            print(f"资产变动: 总资产={getattr(asset, 'total_asset', 'N/A')}")
+        except Exception as e:
+            print(f"处理资产变动时出错: {str(e)}")
