@@ -7,9 +7,6 @@ from PyQt5.QtCore import QEvent, QObject, QSettings
 from PyQt5.QtWidgets import QAbstractScrollArea, QAbstractSpinBox, QApplication, QComboBox
 from PyQt5.QtGui import QFont, QFontDatabase
 
-import khTheme
-khTheme.setup_theme_patches()
-
 DEFAULT_BASE_FONT_SIZE = 9
 IS_MACOS = sys.platform == "darwin"
 

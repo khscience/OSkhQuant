@@ -3,7 +3,7 @@
 BaoStock 多进程下载工作模块
 
 目标：
-- 参考 duckdb_storage/import_worker.py 的 MultiProcessImporter 设计
+- 多进程下载设计与 CS 版的 MultiProcessImporter 相同
 - 将 baostock 请求放到子进程执行，主进程负责写入 DuckDB（避免并发写库冲突）
 - Windows 使用 spawn 方式创建进程
 
@@ -24,9 +24,9 @@ import time
 import traceback
 
 try:
-    from .import_worker import _effective_task_timeout, _is_transient_data_source_error
+    from .worker_common import _effective_task_timeout, _is_transient_data_source_error
 except ImportError:
-    from import_worker import _effective_task_timeout, _is_transient_data_source_error
+    from worker_common import _effective_task_timeout, _is_transient_data_source_error
 
 
 def _fetch_kline_once(bs, stock: str, period: str, start_date: str, end_date: str, adjustflag: str):
@@ -518,7 +518,7 @@ class MultiProcessBaoStockImporter:
     """
     BaoStock 多进程下载器（主进程调度 + 子进程下载）
 
-    使用方式与 MultiProcessImporter 类似：
+    使用方式：
         importer = MultiProcessBaoStockImporter(num_workers=2)
         importer.start()
         importer.add_task(stock_code, bs_code, period, start, end)
