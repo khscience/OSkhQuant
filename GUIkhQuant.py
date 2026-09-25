@@ -1,12 +1,138 @@
 import sys
 import os
+import math
+from kh_stock_pools import DESKTOP_CODE_INDEX, desktop_pool_definitions
+from khPathUtils import (
+    get_custom_stock_pool_path,
+    get_macos_logs_dir,
+    get_stock_pool_path,
+    get_stock_pool_write_dir,
+    get_user_packages_dir,
+    is_frozen_runtime,
+)
+
+_IS_FROZEN_RUNTIME = is_frozen_runtime()
+if _IS_FROZEN_RUNTIME:
+    # macOS .app 自重启后仍能识别打包状态，避免资源/可写目录退回源码路径。
+    os.environ.setdefault("KHQUANT_PACKAGED", "1")
+
+
+def _relaunch_macos_app_outside_development_sandbox():
+    """将被开发工具沙箱启动的 Mac 安装版交回 LaunchServices。
+
+    TRAE 的 agent 沙箱只允许访问项目目录和临时目录。若直接在其中运行
+    .app，配置目录、日志目录以及用户选择的 DuckDB 目录都会被系统拒绝。
+    通过 ``open`` 重新启动后，新进程由 launchd 创建，不继承该文件沙箱。
+    """
+    if sys.platform != "darwin" or not _IS_FROZEN_RUNTIME:
+        return
+    if os.environ.get("KHQUANT_RELAUNCHED_OUTSIDE_SANDBOX") == "1":
+        return
+    if not (
+        os.environ.get("TRAE_SANDBOX_STORAGE_PATH")
+        or os.environ.get("TRAE_SANDBOX_CLI_PATH")
+    ):
+        return
+
+    executable = os.path.abspath(sys.executable)
+    app_bundle = os.path.dirname(os.path.dirname(os.path.dirname(executable)))
+    if not app_bundle.lower().endswith(".app") or not os.path.isdir(app_bundle):
+        return
+
+    try:
+        import subprocess as _startup_subprocess
+
+        launch_env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("TRAE_SANDBOX_")
+            and not key.startswith("SAFE_RM_")
+        }
+        launch_env["KHQUANT_RELAUNCHED_OUTSIDE_SANDBOX"] = "1"
+        _startup_subprocess.Popen(
+            ["/usr/bin/open", "-n", app_bundle],
+            stdout=_startup_subprocess.DEVNULL,
+            stderr=_startup_subprocess.DEVNULL,
+            start_new_session=True,
+            env=launch_env,
+        )
+        raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        # 自动脱离失败时继续启动，让后续错误信息保留真实原因。
+        print(f"无法脱离开发工具沙箱，将继续当前进程: {exc}")
+
+
+_relaunch_macos_app_outside_development_sandbox()
+
+# ── 可复现性：固定哈希种子(与 kh.py 一致)──────────────────────────────
+# GUI 在同进程的 QThread 内直接运行 KhQuantFramework(非子进程)，故 GUI
+# 进程本身需固定 PYTHONHASHSEED，否则策略中 set 迭代顺序随机 → 回测结果
+# 每次不可复现。须早于 multiprocessing 导入；multiprocessing 子进程会继承
+# 本环境变量(=0)从而跳过重启，不影响 freeze_support 的打包子进程逻辑。
+# 使用子进程并等待，而不是 os.execv：后者会切断 VS Code/debugpy 的启动链，
+# 表现为按 F5 后终端没有报错、GUI 也不出现。
+if os.environ.get("PYTHONHASHSEED") != "0":
+    os.environ["PYTHONHASHSEED"] = "0"
+    try:
+        import subprocess
+        _argv = sys.argv[1:] if _IS_FROZEN_RUNTIME else sys.argv
+        sys.exit(subprocess.call([sys.executable] + _argv))
+    except SystemExit:
+        raise
+    except Exception:
+        # 极少数环境无法重启时继续运行，退化为本进程哈希种子未固定，
+        # 但不能阻断 GUI 启动。
+        pass
+
+import multiprocessing
+
+# 打包(PyInstaller)后，multiprocessing 以 spawn 方式启动的子进程（含资源跟踪进程）会重新执行本入口文件。
+# 必须在任何重型导入和 multiprocessing 资源分配之前调用 freeze_support()，否则打包版的子进程会重新跑到
+# main() 反复弹出主界面（macOS 上尤为明显：从 baostock 补充数据时会按工作进程数额外弹出多个主界面）。
+# PyInstaller 提供了跨平台的 freeze_support 实现；源码直接运行时该调用为 no-op，对 Windows/Linux/源码运行无任何副作用。
+multiprocessing.freeze_support()
+
+# 桌面主窗口与定时补充各自单实例，二者可以同时运行。固定哈希中继父进程
+# 尚未走到这里，multiprocessing 子进程的 __name__ 也不是 __main__，不会
+# 抢占锁。必须早于日志初始化，防止重复调度器短暂争抢 scheduled_sync.log。
+_desktop_instance_lock = None
+_scheduled_instance_lock = None
+if __name__ == "__main__":
+    from kh_single_instance import (
+        DEFAULT_SCHEDULED_INSTANCE_KEY,
+        DesktopSingleInstanceLock,
+        notify_already_running,
+    )
+
+    if "--scheduled-sync" in sys.argv[1:]:
+        _scheduled_instance_lock = DesktopSingleInstanceLock(
+            key=DEFAULT_SCHEDULED_INSTANCE_KEY
+        )
+        if not _scheduled_instance_lock.acquire():
+            notify_already_running(
+                "定时数据补充已经在运行。请切换到现有窗口，无需重复启动。",
+                "看海量化 - 定时数据补充",
+            )
+            raise SystemExit(0)
+    else:
+        _desktop_instance_lock = DesktopSingleInstanceLock()
+        if not _desktop_instance_lock.acquire():
+            notify_already_running()
+            raise SystemExit(0)
+
 import logging
+from logging.handlers import RotatingFileHandler
 import psutil
 import time
 import traceback
 import json
+import csv
 import subprocess
 import shutil
+import copy
+import threading
 from datetime import datetime
 from PyQt5.QtCore import (
     Qt,
@@ -23,6 +149,8 @@ from PyQt5.QtCore import (
     QEvent,
     QUrl,
     QMetaObject,
+    QObject,
+    QSize,
 )
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
                            QTableWidget, QTableWidgetItem, QMenu, QAction, QFileDialog, QMessageBox, QSplitter,
@@ -31,16 +159,62 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushBu
                            QListWidgetItem, QSlider, QFrame, QToolBar, QButtonGroup, QRadioButton, QSpinBox, QDoubleSpinBox,
                            QCalendarWidget, QTimeEdit, QFormLayout, QSpacerItem, QGridLayout, QStatusBar, QInputDialog,
                            QHeaderView, QStyleFactory, QGraphicsDropShadowEffect, QProgressBar, QSplashScreen, QToolButton,
-                           QDesktopWidget)
+                           QDesktopWidget, QDialogButtonBox)
 from PyQt5.QtGui import QIcon, QCursor, QFont, QColor, QPainter, QPen, QBrush, QPixmap, QTextCursor, QPalette, QDoubleValidator, QIntValidator, QDesktopServices
+
+
+def _dispatch_duckdb_viewer_destroyed(owner, target):
+    """主窗口也可能已进入 Qt 销毁阶段，先检查再获取其绑定方法。"""
+    try:
+        from PyQt5 import sip
+        if sip.isdeleted(owner):
+            return
+    except (TypeError, RuntimeError):
+        pass
+    KhQuantGUI._on_duckdb_viewer_destroyed(owner, target)
+
+
+PLUGIN_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "plugins"))
+if PLUGIN_DIR not in sys.path:
+    sys.path.append(PLUGIN_DIR)
+
+# 添加用户自定义包目录
+_base_dir = os.path.dirname(os.path.abspath(__file__))
+USER_PACKAGES_DIR = get_user_packages_dir(_base_dir, create=True)
+if USER_PACKAGES_DIR not in sys.path:
+    # 用户扩展包只作为缺失依赖的补充，不能抢在程序自带核心依赖之前，
+    # 否则同名包可能遮蔽打包版本并导致难以复现的启动/导入异常。
+    sys.path.append(USER_PACKAGES_DIR)
 
 # 导入GUI模块中的StockDataProcessorGUI类
 try:
     from GUI import StockDataProcessorGUI, setup_logging
-except ImportError:
-    logging.error("无法导入GUI模块中的StockDataProcessorGUI类")
+except Exception as _imp_exc:
+    logging.error(f"无法导入GUI模块: {_imp_exc}")
     StockDataProcessorGUI = None
     setup_logging = None
+
+# 导入内置VSCode编辑器管理器（内嵌 VSCode + debugpy 目前只适配 Windows，
+# macOS/Linux 上将禁用此入口，建议直接用系统 VSCode 打开策略文件）
+try:
+    from kh_platform import EMBEDDED_VSCODE_ENABLED as _EMBEDDED_VSCODE_ENABLED
+except ImportError:
+    _EMBEDDED_VSCODE_ENABLED = sys.platform == "win32"
+
+if _EMBEDDED_VSCODE_ENABLED:
+    try:
+        from editor_debug_modules.EmbeddedVSCodeManager import EmbeddedVSCodeManager
+        EMBEDDED_VSCODE_AVAILABLE = True
+    except ImportError:
+        logging.error("无法导入EmbeddedVSCodeManager模块")
+        EmbeddedVSCodeManager = None
+        EMBEDDED_VSCODE_AVAILABLE = False
+else:
+    logging.info("当前平台未启用内嵌 VSCode 编辑器（仅 Windows 支持）")
+    EmbeddedVSCodeManager = None
+    EMBEDDED_VSCODE_AVAILABLE = False
+
+from editor_debug_modules.vscode_helper import find_vscode_executable
 
 # 导入数据管理模块
 try:
@@ -55,68 +229,313 @@ except ImportError:
     logging.error("无法导入数据定时补充模块")
     GUIScheduler = None
 
-
+try:
+    from BacktestHistoryManager import BacktestHistoryManager  # 回测历史管理模块
+except ImportError:
+    logging.error("无法导入回测历史管理模块")
+    BacktestHistoryManager = None
 
 # 导入其他必要的模块
 try:
     from khFrame import KhQuantFramework, MyTraderCallback
     from khQTTools import get_stock_names
-    from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
 except ImportError as e:
     logging.error(f"导入必要模块失败: {str(e)}")
 
+# xtquant 仅 Windows + miniQMT 可用；GUI 主入口实际并未使用 XtQuantTrader/Callback，
+# 这里仍保留 import 以兼容旧代码引用，失败时静默放置为 None
+try:
+    from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback  # type: ignore
+except ImportError:
+    XtQuantTrader = None  # type: ignore
+    XtQuantTraderCallback = None  # type: ignore
+
 from SettingsDialog import SettingsDialog
-from PyQt5.QtCore import QSettings
+from qt_settings_bridge import KhQtSettings
+try:
+    from cli.web_launcher import launch_web_workbench
+    WEB_WORKBENCH_AVAILABLE = True
+except ImportError:
+    # CSkhQuant/Mac 公共发行版按发布边界不包含网页端模块；网页入口必须是
+    # 可选能力，不能因为缺少 webapp 让桌面主程序无法启动。
+    launch_web_workbench = None
+    WEB_WORKBENCH_AVAILABLE = False
+from backtest_runtime_config import (
+    apply_system_runtime_settings,
+    build_headless_settings,
+    is_memory_error,
+    preserve_strategy_runtime_blocks,
+    stamp_memory_decision,
+    strip_runtime_config,
+)
+from data_integrity_policy import should_run_integrity_check
 from update_manager import UpdateManager  # 导入UpdateManager类
 from version import get_version_info  # 导入版本信息
+from khPathUtils import resolve_strategy_file, strategy_file_for_config
+from khUiScale import (
+    get_ui_font_scale,
+    apply_app_font,
+    install_wheel_guard,
+    force_primary_screen_dpi,
+    get_platform_ui_metrics,
+    get_adaptive_window_size,
+    is_macos_ui,
+    get_preferred_ui_font_family,
+    get_preferred_mono_font_family,
+)
 
-# 配置日志系统
+
+class WebWorkbenchLaunchNotifier(QObject):
+    """把守护线程的网页启动结果安全投递到 Qt 主线程。"""
+
+    result_signal = pyqtSignal(object)
+    error_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal()
+
 def get_logs_dir():
     """获取日志目录的正确路径"""
-    base_dir = os.path.dirname(__file__)
-    logs_dir = os.path.join(base_dir, 'logs')
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+    if sys.platform == "darwin" and is_frozen_runtime():
+        possible_dirs = [get_macos_logs_dir()]
+    else:
+        # Windows 与源码模式保持原有目录优先级。
+        possible_dirs = [
+            os.path.join(base_dir, 'logs'),
+            os.path.join(os.path.expanduser('~'), 'KhQuant', 'logs'),
+            os.path.join(os.environ.get('TEMP', '/tmp'), 'KhQuant', 'logs'),
+        ]
+
+    for logs_dir in possible_dirs:
+        try:
+            os.makedirs(logs_dir, exist_ok=True)
+            test_file = os.path.join(logs_dir, 'test_write.tmp')
+            with open(test_file, 'w') as f:
+                f.write('test')
+            os.remove(test_file)
+            return logs_dir
+        except (OSError, PermissionError):
+            continue
+    
+    # 如果所有目录都失败，使用临时目录
+    import tempfile
+    logs_dir = os.path.join(tempfile.gettempdir(), 'KhQuant_logs')
     try:
-        os.makedirs(logs_dir, exist_ok=True)
-        print(f"使用日志目录: {logs_dir}")
-        return logs_dir
-    except (OSError, PermissionError) as e:
-        print(f"无法使用日志目录 {logs_dir}: {e}")
-        # 备用目录
-        import tempfile
-        logs_dir = os.path.join(tempfile.gettempdir(), 'KhQuant_logs')
         os.makedirs(logs_dir, exist_ok=True)
         print(f"使用临时日志目录: {logs_dir}")
         return logs_dir
+    except Exception as e:
+        print(f"创建临时日志目录失败: {e}")
+        return tempfile.gettempdir()
+
+
+def get_writable_duckdb_data_dir(preferred_path: str = "") -> str:
+    """返回可写的 DuckDB 数据目录。
+
+    优先级：
+    1. 用户已设置的路径（如果可写）
+    2. macOS 标准应用数据目录 ~/Library/Application Support/khQuant
+    3. /tmp/KhQuant/duckdb_data（兜底）
+    """
+    # 用户设置的路径
+    preferred_abs = ""
+    if preferred_path:
+        expanded = os.path.expanduser(os.path.expandvars(preferred_path))
+        preferred_abs = os.path.abspath(expanded)
+
+    def _try_path(abs_dir: str) -> bool:
+        """尝试创建目录并验证可写性"""
+        try:
+            os.makedirs(abs_dir, exist_ok=True)
+            for market in ('SH', 'SZ', 'BJ'):
+                os.makedirs(os.path.join(abs_dir, market), exist_ok=True)
+            test_file = os.path.join(abs_dir, '.write_test')
+            with open(test_file, 'w', encoding='utf-8') as f:
+                f.write('ok')
+            os.remove(test_file)
+            return True
+        except (OSError, PermissionError):
+            return False
+
+    # 1. 用户设置的路径可写则直接使用
+    if preferred_abs and _try_path(preferred_abs):
+        return preferred_abs
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    stock_dir = os.path.join(base_dir, 'stock_data')
+    if _try_path(stock_dir):
+        return stock_dir
+
+    # 3. 兜底 /tmp
+    fallback = os.path.join('/tmp', 'KhQuant', 'duckdb_data')
+    if _try_path(fallback):
+        return fallback
+
+    return fallback
 
 LOGS_DIR = get_logs_dir()
 
 # 配置日志，添加异常处理
 try:
-    logging.basicConfig(
-        filename=os.path.join(LOGS_DIR, 'app.log'),
-        level=logging.DEBUG,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        filemode='w',
-        encoding='utf-8'
+    _startup_process_name = multiprocessing.current_process().name
+    from kh_startup_logging import select_startup_log_name
+    _startup_log_name = select_startup_log_name(
+        _startup_process_name,
+        sys.argv[1:],
     )
-    print(f"日志文件配置成功: {os.path.join(LOGS_DIR, 'app.log')}")
+    if _startup_log_name:
+        _startup_file_handler = RotatingFileHandler(
+            os.path.join(LOGS_DIR, _startup_log_name),
+            mode='a',
+            maxBytes=20 * 1024 * 1024,
+            backupCount=5,
+            encoding='utf-8',
+        )
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[_startup_file_handler],
+            force=True
+        )
+        print(f"日志文件配置成功: {os.path.join(LOGS_DIR, _startup_log_name)}")
+    else:
+        # multiprocessing 子进程不与桌面主进程共同打开/轮转固定日志。
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            force=True,
+        )
 except Exception as e:
     # 如果文件日志配置失败，只使用控制台日志
     print(f"配置文件日志失败: {e}")
     logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s - %(levelname)s - %(message)s'
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        force=True
     )
 
 # 添加控制台日志处理器（仅在标准错误可用时）
 _stderr_stream = getattr(sys, 'stderr', None)
 if _stderr_stream and hasattr(_stderr_stream, 'write'):
     console_handler = logging.StreamHandler(_stderr_stream)
-    console_handler.setLevel(logging.DEBUG)
+    console_handler.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     console_handler.setFormatter(formatter)
     logging.getLogger('').addHandler(console_handler)
+logging.getLogger('').setLevel(logging.INFO)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('requests').setLevel(logging.WARNING)
+logging.info("=" * 72)
+logging.info(
+    "[SESSION] 看海量化进程启动 pid=%s parent_pid=%s runtime=%s",
+    os.getpid(),
+    os.getppid(),
+    "packaged" if _IS_FROZEN_RUNTIME else "source",
+)
+if _desktop_instance_lock is not None and _desktop_instance_lock.error:
+    logging.warning("跨进程单实例锁启用失败，已安全放行: %s", _desktop_instance_lock.error)
+if _scheduled_instance_lock is not None and _scheduled_instance_lock.error:
+    logging.warning(
+        "定时补充跨进程单实例锁启用失败，已安全放行: %s",
+        _scheduled_instance_lock.error,
+    )
+
+
+_SLIPPAGE_LABEL_TO_TYPE = {
+    "按最小变动价跳数": "tick",
+    "按成交金额比例": "ratio",
+}
+_SLIPPAGE_TYPE_TO_LABEL = {value: key for key, value in _SLIPPAGE_LABEL_TO_TYPE.items()}
+_SLIPPAGE_UI_DEFAULTS = {"tick": "2", "ratio": "0.1"}
+_TRADE_COST_ENGINE_DEFAULTS = {
+    "min_commission": 5.0,
+    "commission_rate": 0.0003,
+    "stamp_tax_rate": 0.001,
+    "flow_fee": 0.1,
+}
+
+
+def _normalize_slippage_ui_value(slippage_type, value):
+    """把滑点输入规范为界面文本；两种单位之间不做隐式换算。"""
+    normalized_type = "tick" if slippage_type == "tick" else "ratio"
+    default_value = _SLIPPAGE_UI_DEFAULTS[normalized_type]
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return default_value
+    if not math.isfinite(numeric_value):
+        return default_value
+    if normalized_type == "tick":
+        if numeric_value < 0 or numeric_value > 100 or not numeric_value.is_integer():
+            return default_value
+        return str(int(numeric_value))
+    if numeric_value < 0 or numeric_value > 10:
+        return default_value
+    return format(numeric_value, ".12g")
+
+
+def _normalize_slippage_config(slippage):
+    """把任意 .kh 滑点配置收敛为撮合引擎可安全读取的规范结构。"""
+    raw = slippage if isinstance(slippage, dict) else {}
+    slippage_type = raw.get("type", "ratio")
+    if slippage_type not in {"tick", "ratio"}:
+        slippage_type = "ratio"
+    tick_text = _normalize_slippage_ui_value(
+        "tick",
+        raw.get("tick_count", _SLIPPAGE_UI_DEFAULTS["tick"]),
+    )
+    try:
+        ratio_percent = float(raw.get("ratio", 0.001)) * 100
+    except (TypeError, ValueError):
+        ratio_percent = _SLIPPAGE_UI_DEFAULTS["ratio"]
+    ratio_text = _normalize_slippage_ui_value("ratio", ratio_percent)
+    try:
+        tick_size = float(raw.get("tick_size", 0.01))
+    except (TypeError, ValueError):
+        tick_size = 0.01
+    if not math.isfinite(tick_size) or tick_size <= 0 or tick_size > 100:
+        tick_size = 0.01
+    return {
+        "type": slippage_type,
+        "tick_size": tick_size,
+        "tick_count": int(tick_text),
+        # 配置保存小数；界面输入的是百分比。
+        "ratio": float(ratio_text) / 100,
+    }
+
+
+def _normalize_trade_cost_config(trade_cost):
+    """保留扩展费用字段，并把原始数值收敛到 GUI/撮合都可安全读取的范围。"""
+    raw = trade_cost if isinstance(trade_cost, dict) else {}
+    normalized = copy.deepcopy(raw)
+    for key, default, lower, upper in (
+        ("min_commission", _TRADE_COST_ENGINE_DEFAULTS["min_commission"], 0.0, None),
+        ("commission_rate", _TRADE_COST_ENGINE_DEFAULTS["commission_rate"], 0.0, 1.0),
+        ("stamp_tax_rate", _TRADE_COST_ENGINE_DEFAULTS["stamp_tax_rate"], 0.0, 1.0),
+        ("flow_fee", _TRADE_COST_ENGINE_DEFAULTS["flow_fee"], 0.0, 100.0),
+    ):
+        try:
+            value = float(raw.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        if (
+            not math.isfinite(value)
+            or value < lower
+            or (upper is not None and value > upper)
+        ):
+            value = default
+        normalized[key] = value
+    normalized["slippage"] = _normalize_slippage_config(raw.get("slippage", {}))
+    return normalized
+
+
+def _merge_trade_cost_config(base_trade_cost, ui_trade_cost):
+    """用界面可编辑字段覆盖费用配置，同时保留界面未知的扩展语义。"""
+    merged = copy.deepcopy(base_trade_cost) if isinstance(base_trade_cost, dict) else {}
+    if isinstance(ui_trade_cost, dict):
+        merged.update(copy.deepcopy(ui_trade_cost))
+    return _normalize_trade_cost_config(merged)
 
 # 定义StockAccount类
 class StockAccount:
@@ -129,36 +548,331 @@ class StockAccount:
         self.market_value = 0.0
         self.positions = []
 
+
+class IntegrityCheckThread(QThread):
+    """数据完整性检查线程"""
+    # 定义信号
+    progress_signal = pyqtSignal(int, int, str, int)  # 进度信号(current, total, message, task_count)
+    finished_signal = pyqtSignal(dict)  # 完成信号，传递检查结果
+    error_signal = pyqtSignal(str)  # 错误信号
+
+    def __init__(self, stock_list, periods, start_date, end_date, duckdb_data_path, stock_periods=None, dividend_type='none'):
+        super().__init__()
+        self.stock_list = stock_list
+        self.periods = periods
+        self.start_date = start_date
+        self.end_date = end_date
+        self.duckdb_data_path = duckdb_data_path
+        self.stock_periods = stock_periods
+        self.dividend_type = dividend_type
+        self._is_running = True
+
+    def stop(self):
+        """停止检查"""
+        self._is_running = False
+
+    def _stop_flag(self):
+        """停止标志回调函数"""
+        return not self._is_running
+
+    def _progress_callback(self, current, total, message, task_count):
+        """进度回调函数"""
+        self.progress_signal.emit(current, total, message, task_count)
+
+    def run(self):
+        """线程运行函数"""
+        try:
+            import khQTTools
+
+            # 调用检查函数
+            result = khQTTools.check_duckdb_data_integrity(
+                stock_list=self.stock_list,
+                periods=self.periods,
+                start_date=self.start_date,
+                end_date=self.end_date,
+                duckdb_data_path=self.duckdb_data_path,
+                progress_callback=self._progress_callback,
+                stop_flag=self._stop_flag,
+                stock_periods=self.stock_periods,
+                dividend_type=self.dividend_type
+            )
+
+            self.finished_signal.emit(result)
+
+        except Exception as e:
+            import traceback
+            error_msg = f"数据完整性检查时发生异常:\n{str(e)}\n{traceback.format_exc()}"
+            self.error_signal.emit(error_msg)
+
+
 class StrategyThread(QThread):
     """策略运行线程"""
     # 定义信号
     error_signal = pyqtSignal(str, Exception)  # 错误信号
     status_signal = pyqtSignal(str)  # 状态信号
     finished_signal = pyqtSignal()  # 完成信号
+    debug_server_started = pyqtSignal(int)  # 调试服务器启动信号（传递端口号）
 
-    def __init__(self, config_path, strategy_file, trader_callback):
+    def __init__(self, config_path, strategy_file, trader_callback, debug_mode=False, debug_manager=None):
         super().__init__()
         self.config_path = config_path
         self.strategy_file = strategy_file
         self.trader_callback = trader_callback
         self.framework = None
+        self.temp_config_paths = [config_path] if config_path else []
         self._is_running = True
+        self.debug_mode = debug_mode  # 新增：调试模式标志
+        self.debug_manager = debug_manager  # 新增：调试管理器
+        self._debug_signal_connected = False
+
+        if self.debug_manager is not None:
+            try:
+                self.debug_manager.debug_server_started.connect(
+                    self._forward_debug_server_started,
+                    Qt.QueuedConnection
+                )
+            except TypeError:
+                self.debug_manager.debug_server_started.connect(
+                    self._forward_debug_server_started
+                )
+            self._debug_signal_connected = True
 
     def run(self):
         """线程运行函数"""
         try:
+            # 如果启用调试模式，启动debugpy服务器
+            if self.debug_mode and self.debug_manager:
+                self.status_signal.emit("🔧 启动调试服务器...")
+                # debugpy.listen() 在同一进程中只能调用一次。后续回测应复用
+                # 已有监听端口；若重新查找，会得到下一个空闲端口并在界面上
+                # 错报端口，尽管实际附加仍连接到旧端口。
+                if (
+                    self.debug_manager.is_debug_server_running
+                    and self.debug_manager.debug_port
+                ):
+                    debug_port = self.debug_manager.debug_port
+                else:
+                    debug_port = self.debug_manager.find_available_port()
+                if debug_port:
+                    debug_started = self.debug_manager.start_debug_server(port=debug_port, wait_for_client=True)
+                    if debug_started:
+                        active_port = self.debug_manager.debug_port or debug_port
+                        self.status_signal.emit(f"✓ 调试服务器已启动，端口: {active_port}")
+                        self.status_signal.emit("⏸ 程序已暂停，等待调试器连接...")
+                        self.status_signal.emit("📍 VSCode将自动启动调试会话...")
+                        self.status_signal.emit("✓ 调试器已连接，策略开始运行")
+
+                        # 关键：让debugpy调试当前线程
+                        # 这样策略代码运行时，debugpy可以正确追踪
+                        try:
+                            import debugpy
+                            debugpy.debug_this_thread()
+                            self.status_signal.emit("✓ 当前线程已启用调试")
+                        except Exception as e:
+                            self.status_signal.emit(f"⚠ 启用线程调试失败: {e}")
+                    else:
+                        # 调试服务器启动失败（通常是因为已经运行过一次）
+                        self.status_signal.emit("⚠ 调试服务器启动失败，将以普通模式继续运行")
+                        self.status_signal.emit("💡 提示：要使用调试功能，请完全关闭并重启主程序")
+                else:
+                    self.status_signal.emit("✗ 无法找到可用的调试端口，将以普通模式继续运行")
+
+            # 读取UI设置，传递给回测框架
+            from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+            from PyQt5.QtWidgets import QMessageBox
+            settings = KhQtSettings('KHQuant', 'StockAnalyzer')
+            gui = self.trader_callback.gui if self.trader_callback and hasattr(self.trader_callback, 'gui') else None
+            duckdb_data_path = gui._ensure_duckdb_data_path() if gui else settings.value('duckdb_data_path', '')
+            
+            # 定义弹窗回调
+            def ui_confirm_callback(title: str, message: str) -> bool:
+                if self.trader_callback and hasattr(self.trader_callback, 'gui'):
+                    user_choice = [None]
+                    def show_dialog():
+                        msg_box = QMessageBox(self.trader_callback.gui)
+                        msg_box.setIcon(QMessageBox.Warning)
+                        msg_box.setWindowTitle(title)
+                        msg_box.setText(message)
+                        msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                        msg_box.setDefaultButton(QMessageBox.No)
+                        
+                        yes_button = msg_box.button(QMessageBox.Yes)
+                        no_button = msg_box.button(QMessageBox.No)
+                        yes_button.setText("继续运行")
+                        no_button.setText("停止运行")
+                        
+                        user_choice[0] = msg_box.exec_()
+                        
+                    QMetaObject.invokeMethod(
+                        self.trader_callback.gui,
+                        "invoke",
+                        Qt.BlockingQueuedConnection,
+                        Q_ARG("PyQt_PyObject", show_dialog)
+                    )
+                    return user_choice[0] == QMessageBox.Yes
+                return False
+
+            def duckdb_lock_decision_callback(info: dict) -> str:
+                """回测读取被写任务占用时，在GUI主线程询问用户。"""
+                if not (self.trader_callback and hasattr(self.trader_callback, 'gui')):
+                    return "skip"
+                decision = ["skip"]
+
+                def show_dialog():
+                    stock = info.get("stock") or "未知证券"
+                    period = info.get("period") or "未知周期"
+                    pid = info.get("pid")
+                    process = info.get("process") or "其他进程"
+                    path = info.get("db_path") or ""
+                    box = QMessageBox(self.trader_callback.gui)
+                    box.setIcon(QMessageBox.Warning)
+                    box.setWindowTitle("回测数据文件正在使用")
+                    box.setText(f"{stock}（{period}）暂时无法读取")
+                    details = [
+                        "系统已自动重试 5 次，文件仍可能正在写入。",
+                        f"占用进程：{process}" + (f"（PID {pid}）" if pid else ""),
+                    ]
+                    if path:
+                        details.append(f"文件：{path}")
+                    details.append("若选择跳过，回测结果会明确记录该证券未参与计算。")
+                    box.setInformativeText("\n".join(details))
+                    retry_button = box.addButton("继续重试", QMessageBox.AcceptRole)
+                    skip_button = box.addButton("先跳过", QMessageBox.ActionRole)
+                    abort_button = box.addButton("停止回测", QMessageBox.RejectRole)
+                    box.setDefaultButton(skip_button)
+                    box.exec_()
+                    clicked = box.clickedButton()
+                    if clicked is retry_button:
+                        decision[0] = "retry"
+                    elif clicked is abort_button:
+                        decision[0] = "abort"
+                    else:
+                        decision[0] = "skip"
+
+                QMetaObject.invokeMethod(
+                    self.trader_callback.gui,
+                    "invoke",
+                    Qt.BlockingQueuedConnection,
+                    Q_ARG("PyQt_PyObject", show_dialog),
+                )
+                return decision[0]
+
+            # 定义显示结果回调
+            def show_result_callback(backtest_dir: str):
+                if self.trader_callback and hasattr(self.trader_callback, 'gui'):
+                    if hasattr(self.trader_callback.gui, 'show_backtest_result_signal'):
+                        self.trader_callback.gui.show_backtest_result_signal.emit(backtest_dir)
+                    else:
+                        # 兼容直接调用
+                        QMetaObject.invokeMethod(
+                            self.trader_callback.gui,
+                            "show_backtest_result",
+                            Qt.QueuedConnection,
+                            Q_ARG(str, backtest_dir)
+                        )
+
+            def set_t0_mode_display_callback(enabled: bool):
+                if self.trader_callback and hasattr(self.trader_callback, 'gui'):
+                    self.trader_callback.gui.set_t0_mode_display(enabled)
+
+            def show_t0_warning_callback(msg: str):
+                if self.trader_callback and hasattr(self.trader_callback, 'gui'):
+                    self.trader_callback.gui.show_t0_warning(msg, self.strategy_file)
+
+            def set_progress_label_callback(label: str):
+                if self.trader_callback and hasattr(self.trader_callback, 'gui'):
+                    self.trader_callback.gui.set_progress_label(label)
+
+            last_progress_emit = {'value': None, 'ts': 0.0}
+
+            def update_progress_callback(value: int):
+                if self.trader_callback and hasattr(self.trader_callback, 'gui'):
+                    try:
+                        progress_value = max(0, min(int(value), 100))
+                    except Exception:
+                        return
+
+                    now_ts = time.time()
+                    last_value = last_progress_emit['value']
+                    last_ts = last_progress_emit['ts']
+                    should_emit = (
+                        last_value is None
+                        or progress_value != last_value
+                        or now_ts - last_ts >= 1.0
+                    )
+                    if not should_emit:
+                        return
+
+                    last_progress_emit['value'] = progress_value
+                    last_progress_emit['ts'] = now_ts
+                    self.trader_callback.gui.progress_signal.emit(progress_value)
+            
+            settings_cfg = settings.load()
+            ui_settings = build_headless_settings(
+                settings_cfg=settings_cfg,
+                duckdb_data_path=duckdb_data_path,
+                include_callbacks={
+                    'confirm_callback': ui_confirm_callback,
+                    'duckdb_lock_decision_callback': duckdb_lock_decision_callback,
+                    'show_backtest_result_callback': show_result_callback,
+                    'set_t0_mode_display_callback': set_t0_mode_display_callback,
+                    'show_t0_warning_callback': show_t0_warning_callback,
+                    'set_progress_label_callback': set_progress_label_callback,
+                    'update_progress_callback': update_progress_callback,
+                },
+                include_runtime_settings={
+                    'init_data_enabled': False,
+                    'khhistory_missing_data_prompt': settings_cfg.get('performance_khhistory_missing_data_prompt', False),
+                },
+            )
+
             # 创建框架实例
             self.framework = KhQuantFramework(
                 self.config_path,
                 self.strategy_file,
-                trader_callback=self.trader_callback
+                trader_callback=self.trader_callback,
+                ui_settings=ui_settings
             )
 
             # 发送状态信号
             self.status_signal.emit("框架实例创建成功")
 
-            # 运行策略
-            self.framework.run()
+            # 运行策略；若遇到内存异常则自动降档后重跑，和 CLI 保持一致。
+            current_config_path = self.config_path
+            while True:
+                try:
+                    self.framework.run()
+                    break
+                except Exception as run_exc:
+                    from performance_config import next_lower_memory_profile
+                    current_perf = getattr(self.framework.config, "config_dict", {}).get("performance", {}) if self.framework else {}
+                    current_profile = current_perf.get("memory_profile_effective", current_perf.get("memory_profile", "standard"))
+                    next_profile = next_lower_memory_profile(current_profile) if is_memory_error(run_exc) else None
+                    if not next_profile:
+                        raise
+                    retry_config = apply_system_runtime_settings(
+                        getattr(self.framework.config, "config_dict", {}) or {},
+                        settings.load(),
+                        force_performance_overrides={
+                            "memory_profile": next_profile,
+                            "memory_profile_retry_from": current_profile,
+                            "memory_profile_retry_reason": f"{run_exc.__class__.__name__}: {str(run_exc)[:300]}",
+                        },
+                    )
+                    retry_config, _, _ = stamp_memory_decision(retry_config, config_path=current_config_path)
+                    current_config_path = os.path.join(
+                        os.path.dirname(current_config_path),
+                        f"_tmp_gui_retry_{next_profile}_{os.path.basename(current_config_path)}",
+                    )
+                    with open(current_config_path, "w", encoding="utf-8") as f:
+                        json.dump(retry_config, f, ensure_ascii=False, indent=2)
+                    self.temp_config_paths.append(current_config_path)
+                    self.framework = KhQuantFramework(
+                        current_config_path,
+                        self.strategy_file,
+                        trader_callback=self.trader_callback,
+                        ui_settings=ui_settings,
+                    )
 
         except Exception as e:
             # 发送错误信号
@@ -170,6 +884,15 @@ class StrategyThread(QThread):
             self.finished_signal.emit()
             # 现在设置运行状态为False
             self._is_running = False
+            if self.debug_manager is not None and self._debug_signal_connected:
+                try:
+                    self.debug_manager.debug_server_started.disconnect(self._forward_debug_server_started)
+                except TypeError:
+                    pass
+
+    def _forward_debug_server_started(self, port):
+        """转发调试服务器启动信号，确保在服务器真正监听后通知主线程"""
+        self.debug_server_started.emit(port)
 
     def stop(self):
         """停止策略"""
@@ -186,12 +909,33 @@ class GUILogHandler(logging.Handler):
     def __init__(self, gui):
         super().__init__()
         self.gui = gui
+        self.setLevel(logging.INFO)
+
+    # 数据管理模块（duckdb_storage 包，含各数据源导入器）拥有独立的日志窗口，
+    # 其日志不应混入主界面的运行日志面板，这里按来源文件过滤掉
+    _SUPPRESSED_LOG_DIRS = ("duckdb_storage",)
 
     def emit(self, record):
         try:
+            if record.levelno < logging.INFO:
+                return
+
+            # 过滤数据管理模块的日志，使其只显示在 DuckDBViewer 自己的日志窗口
+            pathname = (getattr(record, "pathname", "") or "").replace("\\", "/")
+            path_parts = pathname.split("/")
+            if any(d in path_parts for d in self._SUPPRESSED_LOG_DIRS):
+                return
+
             msg = self.format(record)
+            level = record.levelname
+
+            # 拦截 [TRADE] 标签，将其转换为 TRADE 级别的日志
+            if "[TRADE]" in msg:
+                level = "TRADE"
+                msg = msg.replace("[TRADE]", "").strip()
+                
             # 使用Qt的信号槽机制来更新GUI
-            self.gui.log_signal.emit(msg, record.levelname)
+            self.gui.log_signal.emit(msg, level)
         except Exception:
             self.handleError(record)
 
@@ -199,39 +943,91 @@ class KhQuantGUI(QMainWindow):
     # 添加Qt信号
     log_signal = pyqtSignal(str, str)
     update_status_signal = pyqtSignal(str, str)
+    
+    # 类级别的实例计数器，用于追踪是否有多个实例被创建
+    _instance_count = 0
+    _init_lock = False
     show_backtest_result_signal = pyqtSignal(str)  # 添加新信号
     progress_signal = pyqtSignal(int)  # 添加进度条信号
+    CSV_HEADER_CODE = "股票代码"
+    CSV_HEADER_NAME = "股票名称"
+    CSV_HEADER_CODE_EN = "code"
+    CSV_HEADER_NAME_EN = "name"
+    CSV_HEADER_KEYWORDS = [
+        CSV_HEADER_CODE,
+        CSV_HEADER_NAME,
+        CSV_HEADER_CODE_EN,
+        CSV_HEADER_NAME_EN,
+        "",
+    ]
     
     def __init__(self):
+        # 更新实例计数器
+        import threading
+        KhQuantGUI._instance_count += 1
+        logging.info(f"[INSTANCE] KhQuantGUI.__init__ 被调用，当前实例数: {KhQuantGUI._instance_count}")
+        
+        # 初始化锁，防止重复初始化
+        if KhQuantGUI._init_lock:
+            logging.warning("[INSTANCE] 检测到重复初始化尝试！")
+            raise RuntimeError("KhQuantGUI 已经初始化，不允许重复创建")
+        KhQuantGUI._init_lock = True
+        
         super().__init__()
         
         # 记录程序启动时间
         self.start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logging.info(f"[INSTANCE] KhQuantGUI 实例创建中，当前实例数: {KhQuantGUI._instance_count}")
         
         # 初始化设置
-        self.settings = QSettings('KHQuant', 'StockAnalyzer')
+        self.settings = KhQtSettings('KHQuant', 'StockAnalyzer')
+        self._ensure_duckdb_data_path()
         
         # 初始化延迟日志显示相关属性（需要在早期初始化，避免AttributeError）
         self.delay_log_display = self.settings.value('delay_log_display', True, type=bool)
         self.delayed_logs = []
         self.strategy_is_running = False
+        self._strategy_stop_requested = False
+        self._strategy_stop_exit_immediately = True
+        self._strategy_stop_warning_shown = False
+        self._close_after_strategy_stop = False
+        self._force_close_after_strategy_stop = False
         self.max_log_lines = self.settings.value('max_log_lines', 1000, type=int)  # 最大日志显示行数
+        self._pending_log_html = []
+        self._log_flush_scheduled = False
+        self._log_display_batch_size = 200
+        self._log_display_interval_ms = 50
+        self._last_progress_ui_update_ts = 0.0
+        self._last_progress_ui_value = None
+        self._last_progress_ui_label = None
+        self._progress_update_min_interval = 0.2
+        self._last_status_table_resize_ts = 0.0
 
         # 检测屏幕分辨率并设置字体缩放
         self.font_scale = self.detect_screen_resolution()
+        self.ui_metrics = get_platform_ui_metrics(self.font_scale)
         
         # 设置应用样式表
         self.setStyleSheet(self.get_scaled_stylesheet())
         
         # 初始化属性
         self.config = {}
+        self._loaded_config_snapshot = {}
+        self._ui_loaded_state_snapshot = None
         self.trader = None
         self.trader_callback = None
         self.stock_data_manager = None
+        self.log_handler = None
         
         # 日志过滤器设置
         self.filter_log_levels = {"INFO": True, "DEBUG": True, "WARNING": True, "ERROR": True}
         self.current_config_file = None  # 当前加载的配置文件路径
+        
+        # 记录用户明确删除的股票（用于防止从股票池中重新添加）
+        self.deleted_stocks = set()
+        
+        # 记录用户选择"不再提醒"T+0混合池警告的策略文件路径集合
+        self._t0_warning_suppressed = set()
         
         # 设置窗口属性
         self.setWindowTitle("看海量化回测系统")
@@ -248,14 +1044,15 @@ class KhQuantGUI(QMainWindow):
         
         # 初始化配置
         self.init_config()
-        
+
+        # 自动加载上次的配置文件
+        self.auto_load_last_config()
+
         # 记录日志
         logging.info("GUI初始化完成")
         
         # 初始化属性
         self.strategy_thread = None
-        self.log_handler = GUILogHandler(self)
-        self.log_handler.setLevel(logging.INFO)
         
         # 日志存储
         self.log_entries = []
@@ -280,49 +1077,248 @@ class KhQuantGUI(QMainWindow):
         #     try:
         #         self.editor_module = get_editor_module(self)
         #         logging.info("代码编辑器模块初始化成功")
-        # 调试模式相关属性（开源版本不支持内置调试）
-        self.debug_mode_enabled = False
-        self.debug_manager = None
+        #     except Exception as e:
+        #         logging.error(f"代码编辑器模块初始化失败: {e}")
 
+        # 初始化调试模式管理器
+        self.debug_mode_enabled = False
+        try:
+            from editor_debug_modules.DebugModeIntegration import DebugModeManager
+            self.debug_manager = DebugModeManager(self)
+            # 连接调试消息信号到日志
+            self.debug_manager.debug_message.connect(lambda msg: logging.info(msg))
+            logging.info("调试模式管理器初始化成功")
+        except ImportError:
+            logging.warning("无法导入DebugModeManager，调试模式不可用")
+            self.debug_manager = None
+
+        # 初始化内置VSCode编辑器管理器
+        self.embedded_vscode_manager = None
+        if EMBEDDED_VSCODE_AVAILABLE and EmbeddedVSCodeManager is not None:
+            try:
+                self.embedded_vscode_manager = EmbeddedVSCodeManager(self)
+                # 连接信号
+                self.embedded_vscode_manager.communication_server_ready.connect(
+                    lambda port: self.log_message(
+                        f"内置VSCode编辑器通信服务已启动（端口 {port}）",
+                        "INFO",
+                    )
+                )
+                self.embedded_vscode_manager.communication_server_failed.connect(
+                    lambda message: self.log_message(
+                        "内置VSCode编辑器通信端口被占用或启动失败："
+                        f"{message}。回测功能仍可正常使用。",
+                        "WARNING",
+                    )
+                )
+                self.embedded_vscode_manager.editor_started.connect(self._on_embedded_editor_started)
+                self.embedded_vscode_manager.editor_stopped.connect(self._on_embedded_editor_stopped)
+                self.embedded_vscode_manager.file_opened.connect(self._on_embedded_editor_file_opened)
+                self.embedded_vscode_manager.debug_started.connect(self._on_embedded_editor_debug_started)
+                logging.info("内置VSCode编辑器管理器已创建，通信服务正在启动")
+            except Exception as e:
+                logging.error(f"内置VSCode编辑器管理器初始化失败: {e}")
+                self.embedded_vscode_manager = None
+        
         # 记录启动信息到日志
         logging.info(f"软件启动时间: {self.start_time}")
         logging.info(f"当前版本: {get_version_info()['version']}")
         logging.info(f"日志文件路径: {os.path.join(LOGS_DIR, 'app.log')}")
+        runtime_mode = "打包模式" if is_frozen_runtime() else "源码模式"
+        logging.info(f"程序运行环境: {runtime_mode}")
         
         # 最后确保窗口在主屏幕居中显示（放在初始化的最末尾）
         self.center_window()
         self.show()
 
+        # macOS：首次启动自动安装命令行工具 kh（延迟执行，先让主窗口显示出来）
+        if sys.platform == 'darwin':
+            QTimer.singleShot(800, self.auto_install_cli_tools)
 
         # 初始化数据管理窗口实例变量
         self.csv_manager_window = None
         self.data_viewer_window = None
+        self.duckdb_viewer_window = None
         self.scheduler_window = None
+        self._close_after_duckdb_viewer = False
+        
+        logging.info(f"[INSTANCE] KhQuantGUI 实例初始化完成，当前实例数: {KhQuantGUI._instance_count}")
 
     def get_icon_path(self, icon_name):
         """获取图标文件的正确路径"""
         return os.path.join(os.path.dirname(__file__), 'icons', icon_name)
-
+    
     def get_data_path(self, filename):
         """获取数据文件的正确路径"""
-        return os.path.join(os.path.dirname(__file__), 'data', filename)
+        return get_stock_pool_path(filename)
+
+    @classmethod
+    def _is_csv_header_row(cls, stock_code, stock_name=""):
+        header_keywords = {keyword.lower() for keyword in cls.CSV_HEADER_KEYWORDS}
+        clean_code = stock_code.strip().replace('\ufeff', '').lower()
+        clean_name = stock_name.strip().lower()
+        return clean_code in header_keywords or clean_name in header_keywords
+
+    def _read_stock_rows_from_file(self, file_path, require_name=False):
+        """读取股票清单文件，返回去重后的 (code, name) 列表。"""
+        stock_rows = []
+        seen_codes = set()
+
+        with open(file_path, 'r', encoding='utf-8-sig', newline='') as f:
+            reader = csv.reader(f)
+            for parts in reader:
+                if not parts:
+                    continue
+
+                code = parts[0].strip().replace('\ufeff', '')
+                name = parts[1].strip() if len(parts) > 1 else ""
+                if not code or (require_name and not name):
+                    continue
+                if self._is_csv_header_row(code, name):
+                    continue
+                if code in seen_codes:
+                    continue
+
+                seen_codes.add(code)
+                stock_rows.append((code, name))
+
+        return stock_rows
+
+    def _get_stock_table_codes(self):
+        """获取当前股票表格中的代码集合，用于大股票池快速去重。"""
+        codes = set()
+        for row in range(self.stock_list.rowCount()):
+            item = self.stock_list.item(row, 0)
+            if item:
+                code = item.text().strip()
+                if code:
+                    codes.add(code)
+        return codes
+
+    def _set_stock_list_rows(self, stock_rows):
+        """批量刷新股票表格，避免大股票池逐行 insertRow 造成界面卡顿。"""
+        table = self.stock_list
+        sorting_enabled = table.isSortingEnabled()
+
+        table.setUpdatesEnabled(False)
+        table.blockSignals(True)
+        try:
+            if sorting_enabled:
+                table.setSortingEnabled(False)
+
+            table.clearContents()
+            table.setRowCount(len(stock_rows))
+            for row, (code, name) in enumerate(stock_rows):
+                table.setItem(row, 0, QTableWidgetItem(code))
+                table.setItem(row, 1, QTableWidgetItem(name))
+        finally:
+            if sorting_enabled:
+                table.setSortingEnabled(True)
+            table.blockSignals(False)
+            table.setUpdatesEnabled(True)
+            table.viewport().update()
+
+    def _append_stock_list_rows(self, stock_rows):
+        """批量追加股票行，返回实际新增数量。"""
+        if not stock_rows:
+            return 0
+
+        table = self.stock_list
+        existing_codes = self._get_stock_table_codes()
+        rows_to_add = []
+        for code, name in stock_rows:
+            if code in existing_codes:
+                continue
+            existing_codes.add(code)
+            rows_to_add.append((code, name))
+
+        if not rows_to_add:
+            return 0
+
+        sorting_enabled = table.isSortingEnabled()
+        start_row = table.rowCount()
+
+        table.setUpdatesEnabled(False)
+        table.blockSignals(True)
+        try:
+            if sorting_enabled:
+                table.setSortingEnabled(False)
+
+            table.setRowCount(start_row + len(rows_to_add))
+            for offset, (code, name) in enumerate(rows_to_add):
+                row = start_row + offset
+                table.setItem(row, 0, QTableWidgetItem(code))
+                table.setItem(row, 1, QTableWidgetItem(name))
+        finally:
+            if sorting_enabled:
+                table.setSortingEnabled(True)
+            table.blockSignals(False)
+            table.setUpdatesEnabled(True)
+            table.viewport().update()
+
+        return len(rows_to_add)
 
     def detect_screen_resolution(self):
         """检测屏幕分辨率并返回字体缩放比例"""
-        from PyQt5.QtWidgets import QApplication
-        screen = QApplication.desktop().screenGeometry()
-        width = screen.width()
-        height = screen.height()
-        
-        # 根据屏幕宽度确定字体缩放比例
-        if width >= 3840:  # 4K及以上分辨率
-            return 1.8
-        elif width >= 2560:  # 2K分辨率
-            return 1.4
-        elif width >= 1920:  # 1080P分辨率
-            return 1.0
-        else:  # 低分辨率
-            return 0.8
+        return get_ui_font_scale(self.settings)
+
+    def apply_ui_scale(self, scale=None):
+        """应用界面字号倍率到当前窗口"""
+        if scale is None:
+            scale = get_ui_font_scale(self.settings)
+        self.font_scale = scale
+        self.ui_metrics = get_platform_ui_metrics(scale)
+        self.setUpdatesEnabled(False)
+        self.setStyleSheet(self.get_scaled_stylesheet())
+        if hasattr(self, 'log_text'):
+            self.apply_log_text_style()
+        toolbar = self.findChild(QToolBar, "mainToolBar")
+        if toolbar:
+            self._apply_toolbar_style(toolbar)
+            self.set_button_colors()
+            self._apply_extra_btn_styles()
+        layout = self.layout()
+        if layout:
+            layout.invalidate()
+            layout.activate()
+        central = self.centralWidget()
+        if central:
+            central.updateGeometry()
+            central.update()
+        try:
+            self.style().unpolish(self)
+            self.style().polish(self)
+        except Exception:
+            pass
+        self.updateGeometry()
+        self.repaint()
+        self.setUpdatesEnabled(True)
+        self.update()
+
+    def _get_log_font_size(self):
+        """获取系统日志字号"""
+        return max(10, int(14 * self.font_scale))
+
+    def apply_log_text_style(self):
+        """应用系统日志样式"""
+        if not hasattr(self, 'log_text'):
+            return
+        font_size = self._get_log_font_size()
+        mono_font_family = get_preferred_mono_font_family() or "Consolas"
+        self.log_text.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: #2b2b2b;
+                color: #e8e8e8;
+                border: 1px solid #404040;
+                border-radius: 4px;
+                padding: 5px;
+                font-family: "{mono_font_family}", "Microsoft YaHei", monospace;
+                font-size: {font_size}px;
+            }}
+            QTextEdit:focus {{
+                border: 1px solid #666666;
+            }}
+        """)
 
     def get_scaled_stylesheet(self):
         """获取根据分辨率缩放的样式表"""
@@ -342,6 +1338,8 @@ class KhQuantGUI(QMainWindow):
         # 计算缩放后的复选框指示器大小
         checkbox_indicator_size = max(20, int(20 * self.font_scale))
         
+        mono_font_family = get_preferred_mono_font_family() or "Consolas"
+        ui_font_family = get_preferred_ui_font_family() or "Microsoft YaHei UI"
         return f"""
             /* 主窗口和基础样式 */
             QMainWindow {{
@@ -413,10 +1411,11 @@ class KhQuantGUI(QMainWindow):
                 background-color: #505050;
                 border: none;
                 border-radius: 4px;
-                padding: 8px 16px;
-                color: #e8e8e8;
+                padding: {self.ui_metrics.get('toolbar_button_padding_y', 8)}px {self.ui_metrics.get('toolbar_button_padding_x', 16)}px;
+                color: #ffffff;
                 min-width: 80px;
-                font-weight: bold;
+                font-family: "{ui_font_family}";
+                font-weight: normal;
                 font-size: {scaled_sizes['normal']}px;
             }}
             QPushButton:hover {{
@@ -677,7 +1676,7 @@ class KhQuantGUI(QMainWindow):
                 border-radius: 4px;
                 color: #e8e8e8;
                 selection-background-color: #505050;
-                font-family: "Consolas", "Microsoft YaHei", monospace;
+                font-family: "{mono_font_family}", "Microsoft YaHei", monospace;
                 font-size: {scaled_sizes['large']}px;
             }}
             
@@ -828,7 +1827,47 @@ class KhQuantGUI(QMainWindow):
         message = f"{error_msg}: {str(error)}"
         self.log_message(message, "ERROR")
         import traceback
-        self.log_message(f"错误详情:\n{traceback.format_exc()}", "ERROR")
+        tb = getattr(error, "__traceback__", None)
+        if tb:
+            detail = "".join(traceback.format_exception(type(error), error, tb))
+        else:
+            detail = traceback.format_exc()
+        self.log_message(f"错误详情:\n{detail}", "ERROR")
+
+    def _install_gui_log_handler(self):
+        """安装主界面日志处理器，避免重复注册到root logger。"""
+        try:
+            root_logger = logging.getLogger('')
+            for handler in list(root_logger.handlers):
+                if isinstance(handler, GUILogHandler) and getattr(handler, 'gui', None) is self:
+                    root_logger.removeHandler(handler)
+                    try:
+                        handler.close()
+                    except Exception:
+                        pass
+
+            self.log_handler = GUILogHandler(self)
+            self.log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            root_logger.addHandler(self.log_handler)
+        except Exception as e:
+            logging.warning(f"安装GUI日志处理器失败: {e}")
+
+    def _remove_gui_log_handler(self):
+        """从root logger移除主界面日志处理器，避免关闭后残留窗口引用。"""
+        try:
+            handler = getattr(self, 'log_handler', None)
+            if handler is None:
+                return
+
+            root_logger = logging.getLogger('')
+            if handler in root_logger.handlers:
+                root_logger.removeHandler(handler)
+            try:
+                handler.close()
+            finally:
+                self.log_handler = None
+        except Exception as e:
+            logging.warning(f"移除GUI日志处理器失败: {e}")
     
     def flush_logs(self):
         """强制刷新日志缓冲区，确保日志及时写入文件"""
@@ -855,13 +1894,15 @@ class KhQuantGUI(QMainWindow):
                 
     def center_window(self):
         """将窗口居中显示在主屏幕"""
-        # 设置窗口大小为屏幕尺寸的80%
-        # 使用主屏幕而不是跟随鼠标位置
         desktop = QDesktopWidget()
         primary_screen = desktop.primaryScreen()
         screen = desktop.availableGeometry(primary_screen)
-        width = int(screen.width() * 0.7)
-        height = int(screen.height() * 0.7)
+        width, height = get_adaptive_window_size(
+            0,
+            0,
+            ratio=self.ui_metrics.get("main_window_ratio", (0.70, 0.70)),
+            minimum=self.ui_metrics.get("main_window_min_size"),
+        )
         self.resize(width, height)
         
         # 计算居中位置（基于主屏幕）
@@ -892,7 +1933,7 @@ class KhQuantGUI(QMainWindow):
                 )
                 
                 # 设置标题栏颜色
-                caption_color = DWORD(0x2b2b2b)  # 使用与主界面相同的颜色
+                caption_color = DWORD(0x333333)  # 使用与主界面相同的颜色
                 windll.dwmapi.DwmSetWindowAttribute(
                     int(self.winId()),
                     DWMWA_CAPTION_COLOR,
@@ -907,9 +1948,7 @@ class KhQuantGUI(QMainWindow):
         self.setStyleSheet(self.get_scaled_stylesheet())
         
         # 创建自定义日志处理器（移到最前面）
-        self.log_handler = GUILogHandler(self)
-        self.log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logging.getLogger('').addHandler(self.log_handler)
+        self._install_gui_log_handler()
         
         # 设置窗口标题
         self.setWindowTitle("看海量化回测系统")
@@ -937,11 +1976,29 @@ class KhQuantGUI(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         
+        # DuckDB 数据路径（低调显示，放在状态标签左侧）
+        self.duckdb_path_label = QLabel("")
+        self.duckdb_path_label.setStyleSheet("""
+            QLabel {
+                color: #5cb3ff;
+                background: #3a3a3a;
+                font-size: 15px;
+                font-weight: bold;
+                border: 1px solid #4d4d4d;
+                border-radius: 4px;
+                padding: 3px 12px;
+                margin: 0 6px;
+            }
+        """)
+        self.status_bar.addPermanentWidget(self.duckdb_path_label)
+
         # 添加状态标签（放在右侧）
         self.status_label = QLabel("就绪")
-        self.status_label.setFixedWidth(100)
+        self.status_label.setMinimumWidth(self.ui_metrics["status_label_width"])
         self.status_bar.addPermanentWidget(self.status_label)
-        
+
+        progress_height = self.ui_metrics["progress_height"]
+
         # 进度条容器：叠放进度条与文本，保证文本浮在上方
         class ProgressOverlay(QWidget):
             def __init__(self, parent=None):
@@ -956,11 +2013,11 @@ class KhQuantGUI(QMainWindow):
                 self.bar.setRange(0, 100)
                 self.bar.setValue(0)
                 self.bar.setFormat("")  # 禁止进度条自绘文字
-                self.bar.setFixedHeight(16)
+                self.bar.setFixedHeight(progress_height)
                 self.bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
                 layout.addWidget(self.bar, 1)
                 # 右侧文本
-                self.label = QLabel("回测进度: 0%", self)
+                self.label = QLabel("进度: 0%", self)
                 self.label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
                 self.label.setStyleSheet("""
                     QLabel {
@@ -999,8 +2056,14 @@ class KhQuantGUI(QMainWindow):
         
         # 确保状态栏可见
         self.status_bar.setVisible(True)
+
+        # 初始化 DuckDB 路径显示
+        self._update_duckdb_path_label()
         
         main_layout = QHBoxLayout()  # 水平布局，包含三列
+        margins = self.ui_metrics["main_layout_margins"]
+        main_layout.setContentsMargins(*margins)
+        main_layout.setSpacing(self.ui_metrics["main_layout_spacing"])
         main_widget.setLayout(main_layout)
         
         # 创建三个面板
@@ -1017,14 +2080,47 @@ class KhQuantGUI(QMainWindow):
         right_panel.setLayout(self.right_layout)
         
         # 设置三个面板的最小宽度
-        left_panel.setMinimumWidth(500)
-        middle_panel.setMinimumWidth(500)
-        right_panel.setMinimumWidth(500)
-        
-        # 添加三个面板到主布局
-        main_layout.addWidget(left_panel)
-        main_layout.addWidget(middle_panel)
-        main_layout.addWidget(right_panel)
+        if is_macos_ui():
+            left_panel.setMinimumWidth(self.ui_metrics["main_left_panel_min_width"])
+            middle_panel.setMinimumWidth(self.ui_metrics["main_middle_panel_min_width"])
+            right_panel.setMinimumWidth(self.ui_metrics["main_right_panel_min_width"])
+        else:
+            panel_min_width = self.ui_metrics["main_panel_min_width"]
+            left_panel.setMinimumWidth(panel_min_width)
+            middle_panel.setMinimumWidth(panel_min_width)
+            right_panel.setMinimumWidth(panel_min_width)
+
+        if is_macos_ui():
+            self.main_splitter = QSplitter(Qt.Horizontal)
+            self.main_splitter.setChildrenCollapsible(False)
+            self.main_splitter.setHandleWidth(6)
+            self.main_splitter.setStyleSheet("""
+                QSplitter {
+                    background-color: #2b2b2b;
+                }
+                QSplitter::handle {
+                    background-color: #404040;
+                    width: 6px;
+                    margin: 2px;
+                    border-radius: 2px;
+                }
+                QSplitter::handle:hover {
+                    background-color: #4e4e4e;
+                }
+            """)
+            self.main_splitter.addWidget(left_panel)
+            self.main_splitter.addWidget(middle_panel)
+            self.main_splitter.addWidget(right_panel)
+            self.main_splitter.setStretchFactor(0, 1)
+            self.main_splitter.setStretchFactor(1, 1)
+            self.main_splitter.setStretchFactor(2, 2)
+            self.main_splitter.setSizes(self.ui_metrics["main_splitter_sizes"])
+            main_layout.addWidget(self.main_splitter)
+        else:
+            # 添加三个面板到主布局
+            main_layout.addWidget(left_panel)
+            main_layout.addWidget(middle_panel)
+            main_layout.addWidget(right_panel)
         
         # 调整大小以适应内容
         # self.adjustSize()  # 删除此行，因为它会覆盖最大化设置
@@ -1036,8 +2132,8 @@ class KhQuantGUI(QMainWindow):
         
         # 连接信号（运行模式已固定为回测，无需连接信号）
         
-        # 初始化用户策略目录
-        self.init_user_strategies()
+        # 初始化用户策略目录（splash 仍在显示，跳过迁移弹窗，避免被启动画面遮挡）
+        self.init_user_strategies(check_legacy=False)
         
         # 初始化配置
         self.init_config()
@@ -1064,7 +2160,7 @@ class KhQuantGUI(QMainWindow):
         # 添加配置另存为按钮
         save_config_as_action = toolbar.addAction("配置另存为")
         save_config_as_action.triggered.connect(self.save_config_as)
-        
+
         # 添加分隔符
         toolbar.addSeparator()
         
@@ -1082,70 +2178,124 @@ class KhQuantGUI(QMainWindow):
         
         # 添加分隔符
         toolbar.addSeparator()
-        
-        # 添加本地数据管理按钮
-        data_viewer_action = toolbar.addAction("本地数据管理")
-        data_viewer_action.setToolTip("查看和分析本地存储的股票数据")
-        data_viewer_action.triggered.connect(self.open_data_viewer)
-        
-        # 添加定时补充按钮
-        scheduler_action = toolbar.addAction("定时补充数据")
-        scheduler_action.setToolTip("设置和管理数据定时补充任务")
-        scheduler_action.triggered.connect(self.open_scheduler)
-        
-        # 添加CSV数据管理按钮
-        data_module_action = toolbar.addAction("CSV数据管理")
-        data_module_action.setToolTip("打开CSV数据下载、清洗和管理界面")
-        data_module_action.triggered.connect(self.open_data_module)
-        
 
-        
+        # 添加本地数据管理按钮 (miniQMT模式)
+        self.data_viewer_action = toolbar.addAction("本地数据管理")
+        self.data_viewer_action.setToolTip("查看和分析本地存储的股票数据")
+        self.data_viewer_action.triggered.connect(self.open_data_viewer)
+
+        # 添加定时补充按钮 (miniQMT模式)
+        self.scheduler_action = toolbar.addAction("定时补充数据")
+        self.scheduler_action.setToolTip("设置和管理数据定时补充任务")
+        self.scheduler_action.triggered.connect(self.open_scheduler)
+
+        # 添加CSV数据管理按钮 (miniQMT模式)
+        self.data_module_action = toolbar.addAction("CSV数据管理")
+        self.data_module_action.setToolTip("打开CSV数据下载、清洗和管理界面")
+        self.data_module_action.triggered.connect(self.open_data_module)
+
+        # 添加DuckDB数据管理按钮 (DuckDB模式，按钮名称改为"数据管理")
+        self.duckdb_viewer_action = toolbar.addAction("数据管理")
+        self.duckdb_viewer_action.setToolTip("打开DuckDB本地数据库管理界面")
+        self.duckdb_viewer_action.triggered.connect(self.open_duckdb_viewer)
+
         # 添加分隔符
         toolbar.addSeparator()
+
+        # 调试模式开关（隐藏，由编辑器自动控制）
+        # 注释：调试模式现在由打开/关闭编辑器自动控制
+        # 打开编辑器时自动启用调试模式，关闭编辑器时自动禁用
+        self.debug_mode_checkbox = None  # 不再显示勾选框
+
+        # 调试状态指示器（隐藏）
+        self.debug_status_label = None  # 不再显示状态标签
+
+        # 不再添加调试相关的UI元素到工具栏
 
         # 添加设置按钮
         settings_action = toolbar.addAction("设置")
         settings_action.triggered.connect(self.show_settings)
-
+        
         # 添加弹性空间
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         toolbar.addWidget(spacer)
 
+        self.memory_usage_label = QLabel("--G/--G")
+        self.memory_usage_label.setMinimumWidth(96)
+        self.memory_usage_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.memory_usage_label.setToolTip("系统内存占用，低频刷新")
+        self.memory_usage_label.setStyleSheet("""
+            QLabel {
+                color: #e8e8e8;
+                background: transparent;
+                padding: 0 6px;
+                font-weight: normal;
+            }
+        """)
+        toolbar.addWidget(self.memory_usage_label)
+        self.memory_usage_timer = QTimer(self)
+        self.memory_usage_timer.timeout.connect(self.update_memory_usage_label)
+        self.memory_usage_timer.start(5000)
+        self.update_memory_usage_label()
+        
         # 创建状态指示灯
         self.status_indicator = QLabel()
-        self.status_indicator.setFixedSize(16, 16)
+        indicator_size = self.ui_metrics["toolbar_indicator_size"]
+        self.status_indicator.setFixedSize(indicator_size, indicator_size)
         self.status_indicator.setToolTip("MiniQMT状态")
-
+        
         # 创建一个容器来包装状态指示灯，并添加边距
         indicator_container = QWidget()
         indicator_layout = QHBoxLayout(indicator_container)
         indicator_layout.setContentsMargins(0, 0, 10, 0)  # 右边距为10像素
         indicator_layout.addWidget(self.status_indicator)
         toolbar.addWidget(indicator_container)
+        
+        # macOS 下不显示编辑器按钮，避免暴露不适配的 Windows 专属入口
+        self._editor_btn = None
+        if not is_macos_ui():
+            self._editor_btn = QToolButton()
+            self._editor_btn.setText("编辑器")
+            try:
+                from kh_platform import EMBEDDED_VSCODE_ENABLED as _EVSC
+            except ImportError:
+                _EVSC = sys.platform == "win32"
+            self._editor_btn.setToolTip(
+                "打开代码编辑器（内嵌 VSCode）" if _EVSC
+                else "使用本机安装的 Visual Studio Code 打开策略文件"
+            )
+            self._editor_btn.clicked.connect(self.open_embedded_editor)
+            toolbar.addWidget(self._editor_btn)
 
+        # 网页回测入口：完整开发版启用；未包含 webapp 的公共发行版自动隐藏。
+        self._web_btn = None
+        if WEB_WORKBENCH_AVAILABLE:
+            self._web_btn = QToolButton()
+            self._web_btn.setIcon(QIcon(self.get_icon_path("web.svg")))
+            self._web_btn.setToolTip("打开网页回测工作台")
+            self._web_btn.clicked.connect(self.open_web_workbench)
+            toolbar.addWidget(self._web_btn)
+        else:
+            logging.info("当前发行版未包含网页回测模块，已隐藏网页入口")
+        
         # 添加帮助按钮
-        help_btn = QToolButton()
-        help_btn.setText("?")
-        help_btn.setToolTip("打开使用教程")
-        help_btn.setStyleSheet("""
-            QToolButton {
-                background-color: #505050;
-                color: #e8e8e8;
-                border: none;
-                border-radius: 10px;
-                font-weight: bold;
-                min-width: 20px;
-                max-width: 20px;
-                min-height: 20px;
-                max-height: 20px;
-            }
-            QToolButton:hover {
-                background-color: #606060;
-            }
-        """)
-        help_btn.clicked.connect(self.open_help_tutorial)
-        toolbar.addWidget(help_btn)
+        self._help_btn = QToolButton()
+        self._help_btn.setText("?")
+        self._help_btn.setToolTip("打开使用教程")
+        self._help_btn.clicked.connect(self.open_help_tutorial)
+        toolbar.addWidget(self._help_btn)
+
+        # 添加安装命令行工具按钮（仅限 macOS）
+        if sys.platform == "darwin":
+            self._cli_install_btn = QToolButton()
+            self._cli_install_btn.setText("安装CLI")
+            self._cli_install_btn.setToolTip("在终端中全局安装 'kh' 命令行工具")
+            self._cli_install_btn.clicked.connect(self.install_cli_tools)
+            toolbar.addWidget(self._cli_install_btn)
+
+        # 应用编辑器/帮助按钮样式
+        self._apply_extra_btn_styles()
         
         # 添加定时器来检查软件状态
         self.status_timer = QTimer(self)
@@ -1156,36 +2306,155 @@ class KhQuantGUI(QMainWindow):
         self.check_software_status()
         
         # 设置工具栏样式
-        toolbar.setStyleSheet("""
-            QToolBar {
+        self._apply_toolbar_style(toolbar)
+
+        # 根据数据源设置更新工具栏按钮可见性
+        self.update_data_toolbar_buttons()
+
+    def update_data_toolbar_buttons(self):
+        """根据数据源设置更新工具栏数据管理按钮的可见性
+
+        ``backtest_data_source`` 只决定回测读取路径，不应限制 DuckDB
+        数据管理器的入口。现代数据管理器内的历史导入窗口可以独立选择
+        MiniQMT 或大 QMT 原生桥，因此在 Windows 上始终保留“数据管理”按钮。
+        旧的 MiniQMT/CSV 按钮继续按原规则显示，兼容仍依赖这些入口的安装。
+
+        - DuckDB模式: 显示现代“数据管理”按钮
+        - miniQMT模式: 显示现代“数据管理”以及旧的“本地数据管理”、
+          “定时补充数据”、“CSV数据管理”按钮
+        """
+        try:
+            try:
+                from kh_platform import MINIQMT_LAUNCH_ENABLED
+            except ImportError:
+                MINIQMT_LAUNCH_ENABLED = sys.platform == "win32"
+
+            # macOS/Linux：无 miniQMT 客户端，固定只展示 DuckDB 数据管理入口
+            if not MINIQMT_LAUNCH_ENABLED:
+                if hasattr(self, 'data_viewer_action'):
+                    self.data_viewer_action.setVisible(False)
+                if hasattr(self, 'scheduler_action'):
+                    self.scheduler_action.setVisible(False)
+                if hasattr(self, 'data_module_action'):
+                    self.data_module_action.setVisible(False)
+                if hasattr(self, 'duckdb_viewer_action'):
+                    self.duckdb_viewer_action.setVisible(True)
+                logging.debug("当前平台无 miniQMT，工具栏已固定为 DuckDB 数据管理")
+                return
+
+            # 现代 DuckDB 管理器同时承载 MiniQMT/大QMT 原生桥历史导入，
+            # 与回测使用的 provider 无关。Windows 上不能因为用户选择
+            # xtdata（或其它 live provider）就把这个入口隐藏，否则用户
+            # 会被迫回到旧的 CSV/HTTP 数据管理界面。
+            if hasattr(self, 'duckdb_viewer_action'):
+                self.duckdb_viewer_action.setVisible(True)
+
+            # 获取当前数据源设置 (duckdb 或 xtdata)
+            data_source = self.settings.value('backtest_data_source', 'duckdb')
+
+            if data_source == 'duckdb':
+                # DuckDB回测模式：旧 MiniQMT 工具保持隐藏。
+                if hasattr(self, 'data_viewer_action'):
+                    self.data_viewer_action.setVisible(False)
+                if hasattr(self, 'scheduler_action'):
+                    self.scheduler_action.setVisible(False)
+                if hasattr(self, 'data_module_action'):
+                    self.data_module_action.setVisible(False)
+            else:
+                # miniQMT/其它 live provider 模式：保留旧按钮兼容，同时
+                # 保持上方现代 DuckDB 管理入口可见。
+                if hasattr(self, 'data_viewer_action'):
+                    self.data_viewer_action.setVisible(True)
+                if hasattr(self, 'scheduler_action'):
+                    self.scheduler_action.setVisible(True)
+                if hasattr(self, 'data_module_action'):
+                    self.data_module_action.setVisible(True)
+
+            logging.debug(f"工具栏数据按钮已更新，当前数据源: {data_source}")
+        except Exception as e:
+            logging.warning(f"更新工具栏按钮时出错: {e}")
+
+    def _apply_toolbar_style(self, toolbar):
+        """应用工具栏样式（避免缩放后出现浅色边线）"""
+        if toolbar is None:
+            return
+        ui_font_family = get_preferred_ui_font_family() or "Microsoft YaHei UI"
+        font_size = max(10, int(14 * getattr(self, 'font_scale', 1.0)))
+        spacing = self.ui_metrics["toolbar_spacing"]
+        padding = self.ui_metrics["toolbar_padding"]
+        separator_width = self.ui_metrics["toolbar_separator_width"]
+        button_padding_y = self.ui_metrics["toolbar_button_padding_y"]
+        button_padding_x = self.ui_metrics["toolbar_button_padding_x"]
+        button_min_width = self.ui_metrics["toolbar_button_min_width"]
+        button_min_height = self.ui_metrics.get("toolbar_button_min_height", 0)
+        toolbar.setStyleSheet(f"""
+            QToolBar {{
                 background-color: #333333;
                 border: none;
-                spacing: 10px;
-                padding: 5px;
-            }
-            QToolButton {
-                background-color: #505050;
+                spacing: {spacing}px;
+                padding: {padding}px;
+            }}
+            QToolBar::separator {{
+                background-color: #333333;
                 border: none;
+                width: {separator_width}px;
+                margin: 0px;
+            }}
+            QToolBar::item {{
+                border: 0px;
+                margin: 0px;
+                padding: 0px;
+                background: transparent;
+            }}
+            QWidget {{
+                background-color: #333333;
+                border: none;
+            }}
+            QToolButton {{
+                background-color: #505050;
+                border: 0px solid transparent;
                 border-radius: 4px;
-                padding: 8px 16px;
-                color: #e8e8e8;
-                min-width: 80px;
-                font-weight: bold;
-            }
-            QToolButton:hover {
+                padding: {button_padding_y}px {button_padding_x}px;
+                color: #ffffff;
+                min-width: {button_min_width}px;
+                min-height: {button_min_height}px;
+                font-family: "{ui_font_family}";
+                font-weight: normal;
+                font-size: {font_size}px;
+                outline: none;
+            }}
+            QToolButton:focus {{
+                border: 0px solid transparent;
+                outline: none;
+            }}
+            QToolButton:hover {{
                 background-color: #606060;
-            }
-            QToolButton:pressed {
+                border: 0px solid transparent;
+                outline: none;
+            }}
+            QToolButton:pressed {{
                 background-color: #454545;
-            }
-            QToolButton:disabled {
+                border: 0px solid transparent;
+                outline: none;
+            }}
+            QToolButton:disabled {{
                 background-color: #404040;
                 color: #808080;
-            }
+                border: 0px solid transparent;
+            }}
+            QToolButton:checked {{
+                border: 0px solid transparent;
+                outline: none;
+            }}
         """)
 
     def set_button_colors(self):
         """为运行和停止按钮设置特定颜色样式"""
+        ui_font_family = get_preferred_ui_font_family() or "Microsoft YaHei UI"
+        font_size = max(10, int(14 * getattr(self, 'font_scale', 1.0)))
+        button_padding_y = self.ui_metrics["toolbar_button_padding_y"]
+        button_padding_x = self.ui_metrics["toolbar_button_padding_x"]
+        button_min_width = self.ui_metrics["toolbar_button_min_width"]
         # 获取工具栏中的按钮widget
         toolbar = self.findChild(QToolBar, "mainToolBar")
         if toolbar:
@@ -1193,65 +2462,324 @@ class KhQuantGUI(QMainWindow):
             for action in toolbar.actions():
                 widget = toolbar.widgetForAction(action)
                 if widget and action == self.start_action:
-                    widget.setStyleSheet("""
-                        QToolButton {
+                    widget.setStyleSheet(f"""
+                        QToolButton {{
                             background-color: #2d7a2d;
                             border: none;
                             border-radius: 4px;
-                            padding: 8px 16px;
-                            color: white;
-                            min-width: 80px;
-                            font-weight: bold;
-                        }
-                        QToolButton:hover {
+                            padding: {button_padding_y}px {button_padding_x}px;
+                            color: #ffffff;
+                            min-width: {button_min_width}px;
+                            font-family: "{ui_font_family}";
+                            font-weight: normal;
+                            font-size: {font_size}px;
+                        }}
+                        QToolButton:hover {{
                             background-color: #3d8a3d;
-                        }
-                        QToolButton:pressed {
+                        }}
+                        QToolButton:pressed {{
                             background-color: #1d6a1d;
-                        }
-                        QToolButton:disabled {
+                        }}
+                        QToolButton:disabled {{
                             background-color: #404040;
                             color: #808080;
-                        }
+                        }}
                     """)
                 # 为停止运行按钮设置红色样式
                 elif widget and action == self.stop_action:
-                    widget.setStyleSheet("""
-                        QToolButton {
+                    widget.setStyleSheet(f"""
+                        QToolButton {{
                             background-color: #8b2635;
                             border: none;
                             border-radius: 4px;
-                            padding: 8px 16px;
-                            color: white;
-                            min-width: 80px;
-                            font-weight: bold;
-                        }
-                        QToolButton:hover {
+                            padding: {button_padding_y}px {button_padding_x}px;
+                            color: #ffffff;
+                            min-width: {button_min_width}px;
+                            font-family: "{ui_font_family}";
+                            font-weight: normal;
+                            font-size: {font_size}px;
+                        }}
+                        QToolButton:hover {{
                             background-color: #9b3645;
-                        }
-                        QToolButton:pressed {
+                        }}
+                        QToolButton:pressed {{
                             background-color: #7b1625;
-                        }
-                        QToolButton:disabled {
+                        }}
+                        QToolButton:disabled {{
                             background-color: #404040;
                             color: #808080;
-                        }
+                        }}
                     """)
 
-    def check_software_status(self):
-        """检查MiniQMT软件状态"""
-        try:
-            # 检查进程是否存在
-            is_running = self.is_software_running("XtMiniQmt.exe")
+    def _apply_extra_btn_styles(self):
+        """应用编辑器按钮和帮助按钮的样式（含 font-size，确保缩放后一致）"""
+        ui_font_family = get_preferred_ui_font_family() or "Microsoft YaHei UI"
+        font_size = max(10, int(14 * getattr(self, 'font_scale', 1.0)))
+        extra_button_height = self.ui_metrics["extra_button_height"]
+        help_button_size = self.ui_metrics["help_button_size"]
+        if hasattr(self, '_editor_btn') and self._editor_btn:
+            self._editor_btn.setStyleSheet(f"""
+                QToolButton {{
+                    background-color: #505050;
+                    color: #ffffff;
+                    border: none;
+                    border-radius: 10px;
+                    font-family: "{ui_font_family}";
+                    font-weight: normal;
+                    font-size: {font_size}px;
+                    padding: 5px 10px;
+                    min-height: {extra_button_height}px;
+                }}
+                QToolButton:hover {{
+                    background-color: #606060;
+                }}
+            """)
+        if hasattr(self, '_help_btn') and self._help_btn:
+            self._help_btn.setStyleSheet(f"""
+                QToolButton {{
+                    background-color: #505050;
+                    color: #ffffff;
+                    border: none;
+                    border-radius: 10px;
+                    font-family: "{ui_font_family}";
+                    font-weight: normal;
+                    font-size: {font_size}px;
+                    min-width: {help_button_size}px;
+                    max-width: {help_button_size}px;
+                    min-height: {help_button_size}px;
+                    max-height: {help_button_size}px;
+                }}
+                QToolButton:hover {{
+                    background-color: #606060;
+                }}
+            """)
+        if hasattr(self, '_web_btn') and self._web_btn:
+            icon_size = max(15, int(help_button_size * 0.56))
+            self._web_btn.setIconSize(QSize(icon_size, icon_size))
+            self._web_btn.setStyleSheet(f"""
+                QToolButton {{
+                    background-color: #505050;
+                    border: none;
+                    border-radius: 10px;
+                    min-width: {help_button_size}px;
+                    max-width: {help_button_size}px;
+                    min-height: {help_button_size}px;
+                    max-height: {help_button_size}px;
+                }}
+                QToolButton:hover {{
+                    background-color: #3f617c;
+                }}
+                QToolButton:pressed {{
+                    background-color: #35536b;
+                }}
+                QToolButton:disabled {{
+                    background-color: #454545;
+                }}
+            """)
 
-            if is_running:
-                self.update_status_indicator("green", "MiniQMT已启动")
+    def enable_debug_mode(self):
+        """启用调试模式（由编辑器打开时自动调用）"""
+        from PyQt5.QtWidgets import QMessageBox
+
+        if self.debug_manager is None or not self.debug_manager.is_available():
+            QMessageBox.warning(
+                self,
+                "调试模式",
+                "debugpy未安装，无法启用调试模式。\n\n"
+                "请运行以下命令安装：\n"
+                "pip install debugpy"
+            )
+            return False
+
+        self.debug_mode_enabled = True
+        self.log_message("调试模式已自动启用（编辑器打开）", "INFO")
+        return True
+
+    def disable_debug_mode(self):
+        """禁用调试模式（由编辑器关闭时自动调用）"""
+        self.debug_mode_enabled = False
+        self.log_message("调试模式已自动禁用（编辑器关闭）", "INFO")
+
+    def on_debug_server_started(self, debug_port):
+        """调试服务器启动后的处理
+
+        Args:
+            debug_port: 调试服务器端口号
+        """
+        try:
+            self.log_message(f"调试服务器已启动在端口 {debug_port}", "INFO")
+            self._prepare_vscode_debug_attach(debug_port)
+
+        except Exception as e:
+            self.log_message(f"处理调试服务器启动事件失败: {e}", "ERROR")
+            logging.error(f"处理调试服务器启动事件失败: {e}", exc_info=True)
+
+    def _prepare_vscode_debug_attach(self, debug_port, initial_delay_ms=500):
+        """同步VSCode调试配置，并在需要时自动触发附加"""
+        if self.embedded_vscode_manager and self.embedded_vscode_manager.is_running:
+            workspace = getattr(self.embedded_vscode_manager, 'current_workspace', None)
+            if workspace:
+                self.embedded_vscode_manager._setup_workspace_config(workspace, debug_port)
+
+            self.log_message("正在自动启动VSCode调试会话...", "INFO")
+            QTimer.singleShot(initial_delay_ms, lambda: self._auto_start_vscode_debug(attempt=1))
+        else:
+            self.log_message("VSCode编辑器未运行，无法自动启动调试会话", "WARNING")
+            self.log_message("请手动在VSCode中按F5启动调试", "INFO")
+
+    def _auto_start_vscode_debug(self, attempt=1, max_attempts=3):
+        """自动启动VSCode调试会话"""
+        try:
+            if self.embedded_vscode_manager:
+                success = self.embedded_vscode_manager.auto_start_debug_session()
+                if success:
+                    self.log_message(f"✓ 已发送调试启动命令到VSCode（第{attempt}次）", "INFO")
+                    self.log_message("💡 VSCode应该会自动进入调试模式", "INFO")
+                    if self.debug_manager and self.debug_manager.is_debug_server_running:
+                        QTimer.singleShot(
+                            1800,
+                            lambda current_attempt=attempt, total_attempts=max_attempts: self._verify_vscode_debug_attach(
+                                current_attempt,
+                                total_attempts
+                            )
+                        )
+                else:
+                    self.log_message("⚠ 自动启动调试会话失败", "WARNING")
+                    self.log_message("📍 请手动在VSCode中按F5启动调试", "INFO")
+        except Exception as e:
+            self.log_message(f"自动启动VSCode调试失败: {e}", "ERROR")
+            logging.error(f"自动启动VSCode调试失败: {e}", exc_info=True)
+
+    def _verify_vscode_debug_attach(self, attempt, max_attempts):
+        """检查自动附加结果，必要时重试"""
+        try:
+            if not self.debug_manager or not self.debug_manager.is_debug_server_running:
+                return
+
+            debug_info = self.debug_manager.get_debug_info()
+            if debug_info.get("client_connected"):
+                self.log_message("✓ 调试器已连接，自动附加成功", "INFO")
+                return
+
+            if not self.embedded_vscode_manager or not self.embedded_vscode_manager.is_running:
+                self.log_message("⚠ VSCode编辑器未运行，停止自动重试附加", "WARNING")
+                return
+
+            if attempt >= max_attempts:
+                self.log_message("⚠ 自动附加未成功，请手动在VSCode中按F5启动调试", "WARNING")
+                return
+
+            next_attempt = attempt + 1
+            self.log_message(f"⚠ 第{attempt}次自动附加未成功，准备进行第{next_attempt}次重试", "WARNING")
+            QTimer.singleShot(1200, lambda: self._auto_start_vscode_debug(attempt=next_attempt, max_attempts=max_attempts))
+        except Exception as e:
+            self.log_message(f"检查调试附加状态失败: {e}", "ERROR")
+            logging.error(f"检查调试附加状态失败: {e}", exc_info=True)
+
+    def _ensure_duckdb_data_path(self):
+        """返回用户已设置的 DuckDB 路径，若未设置则返回空字符串（不自动计算）。
+
+        策略：用户显式设置的路径会被保留；
+        未设置时返回空，由需要路径的模块自行计算默认值（避免启动时静默污染设置）。
+        """
+        try:
+            saved_path = self.settings.value('duckdb_data_path', '') or ''
+
+            if saved_path:
+                expanded = os.path.expanduser(os.path.expandvars(saved_path))
+                abs_path = os.path.abspath(expanded)
+                if os.path.isdir(abs_path) and os.access(abs_path, os.W_OK):
+                    return abs_path
+                logging.warning(f"保存的 DuckDB 路径不可写: {saved_path}")
+                return ''
+
+            return ''
+        except Exception as e:
+            logging.warning(f"获取 DuckDB 数据路径失败: {e}")
+            return ''
+
+    def _update_duckdb_path_label(self):
+        """刷新状态栏中低调显示的 DuckDB 数据路径（长路径中间省略，完整路径见悬停）。"""
+        try:
+            label = getattr(self, 'duckdb_path_label', None)
+            if label is None:
+                return
+            path = self._ensure_duckdb_data_path()
+            if not path:
+                label.setText("DuckDB：未设置")
+                label.setToolTip("尚未设置 DuckDB 数据路径，可在设置中配置")
+                return
+            from PyQt5.QtGui import QFontMetrics
+            prefix = "DuckDB："
+            metrics = QFontMetrics(label.font())
+            elided = metrics.elidedText(path, Qt.ElideMiddle, 520)
+            label.setText(f"{prefix}{elided}")
+            label.setToolTip(path)
+        except Exception:
+            pass
+
+    def check_software_status(self):
+        """检查软件状态(根据数据源类型检查不同的状态)"""
+        try:
+            # 顺带刷新 DuckDB 路径显示（设置变更后自动跟随）
+            self._update_duckdb_path_label()
+
+            # 获取当前数据源设置
+            data_source = self.settings.value('backtest_data_source', 'duckdb')
+
+            if data_source == 'duckdb':
+                # DuckDB模式:检查数据库路径和数据
+                self.check_duckdb_status()
             else:
-                self.update_status_indicator("red", "MiniQMT未启动")
+                # MiniQMT模式:检查MiniQMT进程
+                if sys.platform == 'win32':
+                    is_running = self.is_software_running("XtMiniQmt.exe")
+                    if is_running:
+                        self.update_status_indicator("green", "MiniQMT已启动")
+                    else:
+                        self.update_status_indicator("red", "MiniQMT未启动")
+                else:
+                    self.update_status_indicator("yellow", "MiniQMT仅支持Windows")
 
         except Exception as e:
             logging.error(f"检查软件状态时出错: {str(e)}")
             self.update_status_indicator("red", "状态检查失败")
+
+    def check_duckdb_status(self):
+        """检查DuckDB数据库状态"""
+        try:
+            # 从设置中读取DuckDB数据路径，并在受限环境下自动回退到可写目录
+            duckdb_data_path = self._ensure_duckdb_data_path()
+
+            # 检查路径是否设置
+            if not duckdb_data_path:
+                self.update_status_indicator("red", "DuckDB数据路径未设置")
+                return
+
+            # 检查路径是否存在
+            if not os.path.exists(duckdb_data_path):
+                self.update_status_indicator("red", "DuckDB数据路径不存在")
+                return
+
+            # 检查是否有数据库文件
+            has_data = False
+            for market in ['SH', 'SZ', 'BJ']:
+                market_path = os.path.join(duckdb_data_path, market)
+                if os.path.exists(market_path):
+                    # 检查目录下是否有.db文件
+                    db_files = [f for f in os.listdir(market_path) if f.endswith('.db')]
+                    if db_files:
+                        has_data = True
+                        break
+
+            if has_data:
+                self.update_status_indicator("green", "DuckDB数据库正常")
+            else:
+                self.update_status_indicator("red", "DuckDB数据库为空")
+
+        except Exception as e:
+            logging.error(f"检查DuckDB状态时出错: {str(e)}")
+            self.update_status_indicator("red", "DuckDB状态检查失败")
 
     def is_software_running(self, process_name):
         """检查指定的进程是否正在运行"""
@@ -1286,6 +2814,22 @@ class KhQuantGUI(QMainWindow):
         except Exception as e:
             logging.error(f"更新状态指示器时出错: {str(e)}")
 
+    def update_memory_usage_label(self):
+        """Refresh the lightweight system memory label in the status bar."""
+        label = getattr(self, "memory_usage_label", None)
+        if label is None:
+            return
+
+        try:
+            memory = psutil.virtual_memory()
+            gib = 1024 ** 3
+            used_gb = (memory.total - memory.available) / gib
+            total_gb = int(round(memory.total / gib))
+            label.setText(f"{used_gb:.1f}G/{total_gb}G")
+        except Exception as exc:
+            label.setText("--G/--G")
+            logging.debug("Failed to refresh memory usage label: %s", exc)
+
     def init_config(self):
         """初始化配置"""
         self.config = {
@@ -1294,8 +2838,7 @@ class KhQuantGUI(QMainWindow):
             "system": {
                 "userdata_path": "",
                 "session_id": int(datetime.now().timestamp()),
-                "check_interval": 3,
-                "init_data_enabled": False
+                "check_interval": 3
             },
             "data": {
                 "kline_period": "1m",
@@ -1371,8 +2914,19 @@ class KhQuantGUI(QMainWindow):
         # 基准合约设置
         benchmark_layout = QHBoxLayout()
         self.benchmark_input = QLineEdit()
-        self.benchmark_input.setText("sh.000300")  # 默认沪深300
-        self.benchmark_input.setPlaceholderText("请输入基准合约代码")
+        self.benchmark_input.setText("000300.SH")  # 默认沪深300（标准格式）
+        self.benchmark_input.setPlaceholderText("支持两种格式: 000300.SH 或 sh.000300")
+        self.benchmark_input.setToolTip(
+            "基准合约代码，用于计算策略相对基准的收益率\n"
+            "支持两种格式:\n"
+            "  - 标准格式: 000300.SH (沪深300)\n"
+            "  - miniQMT格式: sh.000300\n"
+            "常用指数:\n"
+            "  000300.SH - 沪深300\n"
+            "  000905.SH - 中证500\n"
+            "  000852.SH - 中证1000\n"
+            "  000001.SH - 上证指数"
+        )
         benchmark_layout.addWidget(QLabel("基准合约:"))
         benchmark_layout.addWidget(self.benchmark_input)
         backtest_layout.addLayout(benchmark_layout)
@@ -1408,18 +2962,24 @@ class KhQuantGUI(QMainWindow):
         self.flow_fee.setText("0.0")
         cost_layout.addWidget(QLabel("流量费(元/笔):"), 3, 0)
         cost_layout.addWidget(self.flow_fee, 3, 1)
-        
+
+        # 注：过户费率是中国结算法定固定值、且按成交日期分段（2015-07-09 / 2022-04-29 两次调整），
+        # 不做前台输入，统一在后台 khTrade._transfer_fee_by_date 按成交日期硬编码处理。
+
         # 滑点设置
         slippage_type_label = QLabel("滑点类型:")
         self.slippage_type = NoWheelComboBox()
         self.slippage_type.addItems(["按最小变动价跳数", "按成交金额比例"])
-        self.slippage_type.currentTextChanged.connect(self.slippage_type_changed)
+        self.slippage_type.setCurrentText(_SLIPPAGE_TYPE_TO_LABEL["ratio"])
         cost_layout.addWidget(slippage_type_label, 4, 0)
         cost_layout.addWidget(self.slippage_type, 4, 1)
         
         self.slippage_value = QLineEdit()
-        self.slippage_value.setValidator(QDoubleValidator())
-        self.slippage_value.setText("0.0")
+        self._slippage_value_cache = dict(_SLIPPAGE_UI_DEFAULTS)
+        self._slippage_tick_size = 0.01
+        self._active_slippage_type = None
+        self._apply_slippage_input_mode("ratio", save_current=False, log_change=False)
+        self.slippage_type.currentTextChanged.connect(self.slippage_type_changed)
         cost_layout.addWidget(QLabel("滑点值:"), 5, 0)
         cost_layout.addWidget(self.slippage_value, 5, 1)
         
@@ -1502,6 +3062,8 @@ class KhQuantGUI(QMainWindow):
         }
         
         # K线数据字段
+        # 注: 复权(前/后/等比)由上方"复权类型"下拉(adjust_selector→dividend_type)统一控制,
+        # 数据加载时按所选复权类型对 OHLC 自动调整, 故此处不再单列 *_front/_back/_*_ratio 复权字段以免重复勾选。
         self.kline_fields = {
             "open": "开盘价",
             "high": "最高价",
@@ -1535,13 +3097,9 @@ class KhQuantGUI(QMainWindow):
         common_pool_layout = QGridLayout()
         self.pool_checkboxes = {}
         common_pools = {
-            "上证50": "sh.000016",
-            "沪深300": "sh.000300",
-            "中证500": "sh.000905",
-            "创业板指": "sz.399006",
-            "沪深A股": "all_a",
-            "科创板": "sci_tech",
-            "上证A股": "sh_a"
+            item.label: item.desktop_codes[0]
+            for item in desktop_pool_definitions()
+            if item.id != "custom"
         }
         
         # 添加其他股票池的复选框
@@ -1557,7 +3115,11 @@ class KhQuantGUI(QMainWindow):
             self.pool_checkboxes[code] = cb
             
             # 创建标签并关联到复选框
-            label = QLabel(name)
+            # 三列布局留给每个股票池的横向空间有限。场内基金的完整注册名
+            # 在窄窗口下会被裁掉，主界面使用短名称，悬浮提示保留完整含义。
+            display_name = "场内基金/LOF" if code == "hs_fund" else name
+            label = QLabel(display_name)
+            label.setToolTip(name)
             label.mousePressEvent = lambda event, checkbox=cb: checkbox.setChecked(not checkbox.isChecked())
             # 设置鼠标样式为手型
             label.setCursor(Qt.PointingHandCursor)
@@ -1668,6 +3230,19 @@ class KhQuantGUI(QMainWindow):
         self.trigger_type_combo.currentIndexChanged.connect(self.trigger_type_changed)
         trigger_type_layout.addWidget(self.trigger_type_combo)
         trigger_layout.addLayout(trigger_type_layout)
+        
+        self.daily_trigger_cap_widget = QWidget()
+        self.daily_trigger_cap_widget.setStyleSheet("background-color: transparent;")
+        daily_trigger_cap_layout = QHBoxLayout(self.daily_trigger_cap_widget)
+        daily_trigger_cap_layout.setContentsMargins(0, 0, 0, 0)
+        daily_trigger_cap_layout.addWidget(QLabel("日内触发上限:"))
+        self.daily_trigger_cap_spin = QSpinBox()
+        self.daily_trigger_cap_spin.setMinimum(1)
+        self.daily_trigger_cap_spin.setMaximum(100)
+        self.daily_trigger_cap_spin.setValue(1)
+        daily_trigger_cap_layout.addWidget(self.daily_trigger_cap_spin)
+        daily_trigger_cap_layout.addStretch()
+        trigger_layout.addWidget(self.daily_trigger_cap_widget)
         
         # 创建堆叠小部件用于不同触发类型的配置
         self.trigger_stack = QStackedWidget()
@@ -1857,6 +3432,9 @@ class KhQuantGUI(QMainWindow):
         
         pre_post_group.setLayout(pre_post_layout)
         self.middle_layout.addWidget(pre_post_group)
+
+        # 初始化触发类型相关UI状态（含日内触发上限的显示/隐藏）
+        self.trigger_type_changed(self.trigger_type_combo.currentIndex())
         
     def setup_right_panel(self):
         """设置右侧面板，只包含系统日志"""
@@ -1868,22 +3446,7 @@ class KhQuantGUI(QMainWindow):
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)  # 设置为只读
         self.log_text.setLineWrapMode(QTextEdit.WidgetWidth)  # 自动换行
-        
-        # 设置日志文本框的样式
-        self.log_text.setStyleSheet("""
-            QTextEdit {
-                background-color: #2b2b2b;
-                color: #e8e8e8;
-                border: 1px solid #404040;
-                border-radius: 4px;
-                padding: 5px;
-                font-family: "Consolas", "Microsoft YaHei", monospace;
-                font-size: 16px;
-            }
-            QTextEdit:focus {
-                border: 1px solid #666666;
-            }
-        """)
+        self.apply_log_text_style()
         
         # 创建日志类型过滤复选框
         filter_layout = QHBoxLayout()
@@ -1929,7 +3492,13 @@ class KhQuantGUI(QMainWindow):
         button_layout.addWidget(save_log_btn)
         button_layout.addWidget(test_log_btn)
         button_layout.addStretch()
-
+        
+        # 添加回测历史管理窗口的按钮
+        self.open_backtest_btn = QPushButton("回测历史管理")
+        self.open_backtest_btn.clicked.connect(self.open_history_manager)
+        self.open_backtest_btn.setEnabled(True)  # 初始启用按钮
+        button_layout.addWidget(self.open_backtest_btn)
+        
         # 将组件添加到日志布局
         log_layout.addWidget(self.log_text)
         log_layout.addLayout(filter_layout)
@@ -1981,9 +3550,262 @@ class KhQuantGUI(QMainWindow):
                         "这样可以避免软件升级时策略文件丢失。"
                     )
 
+    def set_strategy_file(self, file_path):
+        if not file_path:
+            return
+        self.strategy_path.setText(file_path)
+        if not hasattr(self, "config") or not self.config:
+            self.init_config()
+        self.config["strategy_file"] = file_path
+        self.settings.setValue('last_strategy_path', file_path)
+        logging.info(f"已设置策略文件: {file_path}")
+
+    def _get_strategy_config_path(self):
+        """获取当前策略配置文件路径，用作 strategy_file 相对路径基准。"""
+        current = getattr(self, "current_config_file", None)
+        if current:
+            return current
+        last_config_path = self.settings.value('last_config_path', '')
+        if last_config_path:
+            return last_config_path
+        return None
+
+    def _resolve_strategy_file_path(self, raw_path=None, config_path=None):
+        """解析策略文件路径，优先相对于当前 .kh 文件所在目录。"""
+        if raw_path is None:
+            raw_path = self.strategy_path.text().strip()
+            if not raw_path and hasattr(self, "config") and self.config:
+                raw_path = self.config.get("strategy_file", "")
+
+        strategy_dir = ""
+        try:
+            strategy_dir = self.get_user_strategies_dir()
+        except Exception:
+            strategy_dir = ""
+
+        return resolve_strategy_file(
+            raw_path,
+            config_path=config_path or self._get_strategy_config_path(),
+            strategy_dir=strategy_dir,
+            extra_base_dirs=[os.path.dirname(os.path.abspath(__file__))],
+        )
+
+    def _strategy_file_value_for_config(self, target_config_path):
+        """保存 .kh 时使用的 strategy_file 值。"""
+        raw_path = self.strategy_path.text().strip()
+        return strategy_file_for_config(raw_path, target_config_path)
+
+    def _load_strategy_config_for_runtime(self):
+        """读取当前 .kh 作为运行配置基准，避免 GUI 默认控件污染策略参数。"""
+        config_path = getattr(self, "current_config_file", None)
+        if config_path and os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return copy.deepcopy(getattr(self, "config", {}) or {})
+
+    def _remember_loaded_config_state(self):
+        """记录加载配置后的 UI 状态，用于运行时判断用户是否真的改过参数。"""
+        try:
+            self._loaded_config_snapshot = strip_runtime_config(copy.deepcopy(getattr(self, "config", {}) or {}))
+            self._ui_loaded_state_snapshot = self._collect_ui_runtime_state()
+        except Exception as e:
+            logging.warning(f"记录GUI配置快照失败: {e}")
+            self._loaded_config_snapshot = strip_runtime_config(copy.deepcopy(getattr(self, "config", {}) or {}))
+            self._ui_loaded_state_snapshot = None
+
+    @staticmethod
+    def _normalize_for_compare(value):
+        if isinstance(value, float):
+            return round(value, 10)
+        if isinstance(value, dict):
+            return {k: KhQuantGUI._normalize_for_compare(v) for k, v in sorted(value.items())}
+        if isinstance(value, list):
+            return [KhQuantGUI._normalize_for_compare(v) for v in value]
+        return value
+
+    def _ui_state_changed(self, ui_state, section):
+        baseline = getattr(self, "_ui_loaded_state_snapshot", None)
+        if not isinstance(baseline, dict):
+            return True
+        return self._normalize_for_compare(ui_state.get(section)) != self._normalize_for_compare(baseline.get(section))
+
+    def _ui_field_changed(self, section, key, value):
+        baseline = getattr(self, "_ui_loaded_state_snapshot", None)
+        if not isinstance(baseline, dict):
+            return True
+        old_section = baseline.get(section, {}) or {}
+        if key not in old_section:
+            return True
+        return self._normalize_for_compare(value) != self._normalize_for_compare(old_section.get(key))
+
+    def _collect_ui_runtime_state(self):
+        """采集 GUI 当前显示的回测相关状态，不直接写入 self.config。"""
+        trigger_type = self.get_trigger_type()
+        trigger_config = {
+            "type": trigger_type,
+            "start_time": self.start_time_edit.time().toString("HH:mm:ss"),
+            "end_time": self.end_time_edit.time().toString("HH:mm:ss"),
+            "interval": self.interval_spin.value(),
+            "daily_trigger_cap": self.daily_trigger_cap_spin.value(),
+        }
+        if trigger_type == "custom":
+            trigger_config["custom_times"] = self.get_custom_time_points()
+
+        backtest = {
+            "start_time": self.start_date.date().toString("yyyyMMdd"),
+            "end_time": self.end_date.date().toString("yyyyMMdd"),
+            "init_capital": float(self.initial_cash.text()),
+            "benchmark": self.benchmark_input.text().strip() or "000300.SH",
+            "min_volume": int(self.min_volume.text()),
+            "trade_cost": {
+                "min_commission": float(self.min_commission.text()),
+                "commission_rate": float(self.commission_rate.text()),
+                "stamp_tax_rate": float(self.stamp_tax.text()),
+                "flow_fee": float(self.flow_fee.text()),
+                "slippage": self.get_slippage_settings(),
+            },
+            "trigger": trigger_config,
+            "pre_trigger": {
+                "enabled": self.pre_trigger_checkbox.isChecked(),
+                "time": self.pre_trigger_time.time().toString("HH:mm:ss"),
+            },
+            "post_trigger": {
+                "enabled": self.post_trigger_checkbox.isChecked(),
+                "time": self.post_trigger_time.time().toString("HH:mm:ss"),
+            },
+        }
+
+        data = {
+            "kline_period": self.period_selector.currentText(),
+            "dividend_type": self.get_dividend_type(),
+            "fields": self.get_selected_fields(),
+            "stock_list": self.get_stock_list(),
+        }
+
+        return {
+            "strategy_file": self.strategy_path.text().strip(),
+            "run_mode": "backtest",
+            "account": {
+                "account_id": self.settings.value('account_id', ''),
+                "account_type": self.settings.value('account_type', 'STOCK'),
+            },
+            "data_mode": self.get_realtime_data_mode(),
+            "backtest": backtest,
+            "data": data,
+            "market_callback": {
+                "pre_market_enabled": self.pre_trigger_checkbox.isChecked(),
+                "pre_market_time": self.pre_trigger_time.time().toString("HH:mm:ss"),
+                "post_market_enabled": self.post_trigger_checkbox.isChecked(),
+                "post_market_time": self.post_trigger_time.time().toString("HH:mm:ss"),
+            },
+        }
+
+    def _apply_ui_changes_to_runtime_config(self, runtime_config, ui_state):
+        """只把用户在 GUI 中实际改过的分组覆盖到运行配置。"""
+        cfg = copy.deepcopy(runtime_config or {})
+        cfg["run_mode"] = "backtest"
+        has_baseline = isinstance(getattr(self, "_ui_loaded_state_snapshot", None), dict)
+
+        if self._ui_state_changed(ui_state, "strategy_file"):
+            cfg["strategy_file"] = ui_state["strategy_file"]
+
+        if "account" not in cfg and (self._ui_state_changed(ui_state, "account") or not has_baseline):
+            cfg.setdefault("account", {}).update(ui_state["account"])
+
+        if "data_mode" in cfg and self._ui_state_changed(ui_state, "data_mode"):
+            cfg["data_mode"] = ui_state["data_mode"]
+
+        raw_base_bt = cfg.get("backtest", {})
+        base_bt = (
+            copy.deepcopy(raw_base_bt)
+            if isinstance(raw_base_bt, dict)
+            else {}
+        )
+        ui_bt = ui_state["backtest"]
+        bt_changed = False
+        for key in ("start_time", "end_time", "init_capital", "benchmark"):
+            if self._ui_field_changed("backtest", key, ui_bt.get(key)):
+                base_bt[key] = ui_bt.get(key)
+                bt_changed = True
+        for key in ("min_volume", "trade_cost", "trigger", "pre_trigger", "post_trigger"):
+            changed = self._ui_field_changed("backtest", key, ui_bt.get(key))
+            if changed or not has_baseline:
+                if key == "trade_cost":
+                    base_bt[key] = _merge_trade_cost_config(
+                        base_bt.get(key),
+                        ui_bt.get(key),
+                    )
+                else:
+                    base_bt[key] = ui_bt.get(key)
+                bt_changed = True
+        if bt_changed or "backtest" in cfg:
+            cfg["backtest"] = base_bt
+
+        raw_base_data = cfg.get("data", {})
+        base_data = (
+            copy.deepcopy(raw_base_data)
+            if isinstance(raw_base_data, dict)
+            else {}
+        )
+        ui_data = ui_state["data"]
+        data_changed = False
+        for key in ("kline_period", "dividend_type", "fields", "stock_list"):
+            baseline = getattr(self, "_ui_loaded_state_snapshot", None) or {}
+            old_value = (baseline.get("data", {}) or {}).get(key)
+            new_value = ui_data.get(key)
+            changed = self._normalize_for_compare(old_value) != self._normalize_for_compare(new_value)
+            if changed or not has_baseline:
+                base_data[key] = new_value
+                data_changed = True
+        if data_changed or "data" in cfg:
+            if "stock_list" in base_data and "stock_list_file" in base_data:
+                base_data.pop("stock_list_file", None)
+            cfg["data"] = base_data
+
+        baseline = getattr(self, "_ui_loaded_state_snapshot", None) or {}
+        market_changed = (
+            self._normalize_for_compare(baseline.get("market_callback"))
+            != self._normalize_for_compare(ui_state.get("market_callback"))
+        )
+        if market_changed or "market_callback" in cfg:
+            if market_changed or not has_baseline:
+                cfg["market_callback"] = copy.deepcopy(ui_state["market_callback"])
+
+        return cfg
+
+    @staticmethod
+    def _sanitize_runtime_slippage_config(runtime_config):
+        """运行前规范化原始费用配置，不能只依赖“UI 是否改过”的判断。"""
+        cfg = copy.deepcopy(runtime_config or {})
+        backtest = cfg.get("backtest")
+        if not isinstance(backtest, dict):
+            if "backtest" in cfg:
+                cfg["backtest"] = {}
+            return cfg
+        if "trade_cost" in backtest:
+            backtest["trade_cost"] = _normalize_trade_cost_config(
+                backtest.get("trade_cost")
+            )
+        return cfg
+
+    def _build_runtime_config_for_run(self):
+        """构建 GUI 回测临时配置，与 CLI 运行语义保持一致。"""
+        base_config = self._load_strategy_config_for_runtime()
+        ui_state = self._collect_ui_runtime_state()
+        runtime_config = self._apply_ui_changes_to_runtime_config(base_config, ui_state)
+        runtime_config = preserve_strategy_runtime_blocks(runtime_config, base_config)
+        runtime_config = self._sanitize_runtime_slippage_config(runtime_config)
+        runtime_config = apply_system_runtime_settings(runtime_config, self.settings.load())
+        runtime_config, _, _ = stamp_memory_decision(
+            runtime_config,
+            config_path=getattr(self, "current_config_file", None),
+        )
+        return runtime_config
+
     def update_config(self):
         """更新配置信息"""
         try:
+            old_config = strip_runtime_config(getattr(self, "config", {}) or {})
             # 更新策略文件路径
             self.config["strategy_file"] = self.strategy_path.text()
             
@@ -1997,7 +3819,7 @@ class KhQuantGUI(QMainWindow):
             # 更新账户设置 - 从设置中读取
             if "account" not in self.config:
                 self.config["account"] = {}
-            self.config["account"]["account_id"] = self.settings.value('account_id', '8888888888')
+            self.config["account"]["account_id"] = self.settings.value('account_id', '')
             self.config["account"]["account_type"] = self.settings.value('account_type', 'STOCK')
             
             # 更新初始资金和最小交易量 - 从虚拟账户设置中获取
@@ -2005,23 +3827,25 @@ class KhQuantGUI(QMainWindow):
             min_volume = int(self.min_volume.text())
             self.config["backtest"]["init_capital"] = initial_capital
             self.config["backtest"]["min_volume"] = min_volume
-            
+
             # 更新基准合约
-            self.config["backtest"]["benchmark"] = self.benchmark_input.text()
-            
+            benchmark_raw = self.benchmark_input.text().strip()
+            if benchmark_raw:
+                self.config["backtest"]["benchmark"] = benchmark_raw
+            else:
+                self.config["backtest"]["benchmark"] = "000300.SH"  # 默认沪深300
+
             # 更新交易成本设置
-            self.config["backtest"]["trade_cost"] = {
-                "min_commission": float(self.min_commission.text()),  # 最低佣金
-                "commission_rate": float(self.commission_rate.text()),  # 佣金比例
-                "stamp_tax_rate": float(self.stamp_tax.text()),  # 卖出印花税
-                "flow_fee": float(self.flow_fee.text()),  # 流量费
-                "slippage": {
-                    "type": "tick" if self.slippage_type.currentText() == "按最小变动价跳数" else "ratio",  # 滑点类型
-                    "tick_size": 0.01,  # A股最小变动价（1分钱）
-                    "tick_count": int(float(self.slippage_value.text())) if self.slippage_type.currentText() == "按最小变动价跳数" else 2,  # 跳数
-                    "ratio": float(self.slippage_value.text()) / 100 if self.slippage_type.currentText() == "按成交金额比例" else 0.001  # 滑点比例
-                }
-            }
+            self.config["backtest"]["trade_cost"] = _merge_trade_cost_config(
+                self.config["backtest"].get("trade_cost"),
+                {
+                    "min_commission": float(self.min_commission.text()),
+                    "commission_rate": float(self.commission_rate.text()),
+                    "stamp_tax_rate": float(self.stamp_tax.text()),
+                    "flow_fee": float(self.flow_fee.text()),
+                    "slippage": self.get_slippage_settings(),
+                },
+            )
             
             # 更新触发方式配置
             trigger_type_map = {
@@ -2034,14 +3858,17 @@ class KhQuantGUI(QMainWindow):
             
             # 添加实盘数据获取模式配置
             self.config["data_mode"] = self.get_realtime_data_mode()
-            
-            self.config["backtest"]["trigger"] = {
-                "type": trigger_type_map[self.trigger_type_combo.currentIndex()],
-                "custom_times": self.get_custom_time_points(),
+            trigger_type = trigger_type_map[self.trigger_type_combo.currentIndex()]
+            trigger_config = {
+                "type": trigger_type,
                 "start_time": self.start_time_edit.time().toString("HH:mm:ss"),
                 "end_time": self.end_time_edit.time().toString("HH:mm:ss"),
-                "interval": self.interval_spin.value()
+                "interval": self.interval_spin.value(),
+                "daily_trigger_cap": self.daily_trigger_cap_spin.value()
             }
+            if trigger_type == "custom":
+                trigger_config["custom_times"] = self.get_custom_time_points()
+            self.config["backtest"]["trigger"] = trigger_config
             
             # 更新数据相关的配置
             if "data" not in self.config:
@@ -2082,28 +3909,28 @@ class KhQuantGUI(QMainWindow):
             
             # 更新股票池配置
             stock_codes = []
+            seen_stock_codes = set()
             
-            # 添加选中的常用股票池中的股票代码
+            # 先添加自定义股票列表中的股票代码（优先级最高）
+            for row in range(self.stock_list.rowCount()):
+                item = self.stock_list.item(row, 0)
+                code = item.text().strip() if item else ""
+                if code and code not in seen_stock_codes:
+                    seen_stock_codes.add(code)
+                    stock_codes.append(code)
+            
+            # 然后添加选中的常用股票池中的股票代码（但排除已在自定义列表中的，以及用户明确删除的）
             for code, cb in self.pool_checkboxes.items():
                 if cb.isChecked():
                     pool_file = self._get_pool_file(code)
                     if pool_file:
                         file_path = self.get_data_path(pool_file)
                         if os.path.exists(file_path):
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                for line in f:
-                                    if line.strip():
-                                        parts = line.strip().split(',')
-                                        if len(parts) >= 1:
-                                            stock_code = parts[0].strip().replace('\ufeff', '')
-                                            if stock_code not in stock_codes:
-                                                stock_codes.append(stock_code)
-            
-            # 添加自定义股票列表中的股票代码
-            for row in range(self.stock_list.rowCount()):
-                code = self.stock_list.item(row, 0).text()
-                if code and code not in stock_codes:
-                    stock_codes.append(code)
+                            for stock_code, _ in self._read_stock_rows_from_file(file_path):
+                                # 排除已在自定义列表中的股票，以及用户明确删除的股票
+                                if stock_code not in seen_stock_codes and stock_code not in self.deleted_stocks:
+                                    seen_stock_codes.add(stock_code)
+                                    stock_codes.append(stock_code)
 
             # 将股票列表直接保存到配置文件中，不再生成单独的csv文件
             self.config["data"]["stock_list"] = stock_codes
@@ -2111,15 +3938,9 @@ class KhQuantGUI(QMainWindow):
             # 移除旧的stock_list_file字段（如果存在）
             if "stock_list_file" in self.config["data"]:
                 del self.config["data"]["stock_list_file"]
-                
+
             self.log_message(f"股票列表已更新到配置文件，共 {len(stock_codes)} 支股票", "INFO")
-            
-            # 更新初始化行情数据设置 - 这个设置只存在于QSettings中，不保存到配置文件
-            # 记录日志，显示当前的设置值
-            init_data_enabled = self.settings.value('init_data_enabled', False, type=bool)
-            logging.info(f"从设置界面读取到 init_data_enabled = {init_data_enabled}")
-            self.log_message(f"数据初始化设置: {'启用' if init_data_enabled else '禁用'}", "INFO")
-            
+
             # 更新盘前盘后触发设置
             self.config["backtest"]["pre_trigger"] = {
                 "enabled": self.pre_trigger_checkbox.isChecked(),
@@ -2129,6 +3950,8 @@ class KhQuantGUI(QMainWindow):
                 "enabled": self.post_trigger_checkbox.isChecked(),
                 "time": self.post_trigger_time.time().toString("HH:mm:ss")
             }
+
+            self.config = preserve_strategy_runtime_blocks(self.config, old_config)
             
             logging.info("配置信息已更新")
             
@@ -2179,32 +4002,62 @@ class KhQuantGUI(QMainWindow):
         except Exception as e:
             logging.error(f"设置T+0模式显示时出错: {str(e)}")
     
-    def show_t0_warning(self, message: str):
+    def show_t0_warning(self, message: str, strategy_file: str = ""):
         """显示T+0模式混合池警告弹窗
         
         Args:
             message: 警告信息
+            strategy_file: 当前策略文件路径，用于判断是否抑制提醒
         """
+        # 若该策略已选择不再提醒，直接跳过
+        if strategy_file and strategy_file in self._t0_warning_suppressed:
+            return
         if QThread.currentThread() != self.thread():
             QMetaObject.invokeMethod(
                 self,
                 "_show_t0_warning",
                 Qt.QueuedConnection,
-                Q_ARG(str, message)
+                Q_ARG(str, message),
+                Q_ARG(str, strategy_file)
             )
             return
-        self._show_t0_warning(message)
+        self._show_t0_warning(message, strategy_file)
 
-    @pyqtSlot(str)
-    def _show_t0_warning(self, message: str):
-        """在GUI线程中显示T+0提示"""
+    @pyqtSlot(str, str)
+    def _show_t0_warning(self, message: str, strategy_file: str = ""):
+        """在GUI线程中显示T+0提示（含"不再提醒"复选框）"""
         try:
-            QMessageBox.warning(
-                self,
-                "T+0模式提醒",
-                message,
-                QMessageBox.Ok
-            )
+            dialog = QDialog(self)
+            dialog.setWindowTitle("T+0模式提醒")
+            dialog.setMinimumWidth(420)
+            layout = QVBoxLayout(dialog)
+            layout.setSpacing(12)
+            layout.setContentsMargins(18, 18, 18, 14)
+
+            # 警告图标 + 文字
+            msg_label = QLabel(message)
+            msg_label.setWordWrap(True)
+            layout.addWidget(msg_label)
+
+            # 分隔线
+            line = QFrame()
+            line.setFrameShape(QFrame.HLine)
+            line.setFrameShadow(QFrame.Sunken)
+            layout.addWidget(line)
+
+            # "不再提醒"复选框
+            suppress_cb = QCheckBox("这个策略不再提醒")
+            layout.addWidget(suppress_cb)
+
+            # 确定按钮
+            btn_box = QDialogButtonBox(QDialogButtonBox.Ok)
+            btn_box.accepted.connect(dialog.accept)
+            layout.addWidget(btn_box)
+
+            dialog.exec_()
+
+            if suppress_cb.isChecked() and strategy_file:
+                self._t0_warning_suppressed.add(strategy_file)
         except Exception as e:
             logging.error(f"显示T+0警告弹窗时出错: {str(e)}")
 
@@ -2226,8 +4079,6 @@ class KhQuantGUI(QMainWindow):
             
             # 更新并保存配置到临时文件
             try:
-                self.update_config()
-                
                 # 确保配置目录存在
                 config_dir = os.path.join(os.path.dirname(__file__), "configs")
                 os.makedirs(config_dir, exist_ok=True)
@@ -2243,19 +4094,35 @@ class KhQuantGUI(QMainWindow):
                     except Exception as e:
                         self.log_message(f"删除旧临时配置文件失败: {str(e)}", "WARNING")
                 
-                # 保存配置到临时文件
+                runtime_config = self._build_runtime_config_for_run()
+                self._current_runtime_config = runtime_config
                 with open(self.temp_config_path, "w", encoding="utf-8") as f:
-                    json.dump(self.config, f, indent=4, ensure_ascii=False)
-                
+                    json.dump(runtime_config, f, indent=4, ensure_ascii=False)
+
             except Exception as e:
                 self.log_error("保存配置文件失败", e)
                 return
-            
-            # 创建并启动策略线程
+
+            # ========== 数据完整性检查 ==========
+            # 只在回测模式下检查数据完整性
+            if self.get_run_mode() == "backtest":
+                if not self._check_data_integrity_before_backtest(runtime_config):
+                    self.log_message("数据完整性检查未通过，回测已取消", "WARNING")
+                    return
+            # =====================================
+
+            strategy_file_raw = runtime_config.get("strategy_file", "")
+            strategy_file_to_run = self._resolve_strategy_file_path(strategy_file_raw)
+            if strategy_file_to_run != strategy_file_raw:
+                self.log_message(f"策略文件已解析为: {strategy_file_to_run}", "INFO")
+
+            # 创建并启动策略线程（传递调试模式参数）
             self.strategy_thread = StrategyThread(
                 self.temp_config_path,
-                self.config["strategy_file"],
-                self.trader_callback
+                strategy_file_to_run,
+                self.trader_callback,
+                debug_mode=self.debug_mode_enabled,  # 新增参数
+                debug_manager=self.debug_manager if self.debug_mode_enabled else None  # 新增参数
             )
             
             # 注册元类型
@@ -2267,6 +4134,7 @@ class KhQuantGUI(QMainWindow):
             self.strategy_thread.error_signal.connect(self.on_strategy_error, Qt.QueuedConnection)
             self.strategy_thread.status_signal.connect(self.update_status, Qt.QueuedConnection)
             self.strategy_thread.finished_signal.connect(self.on_strategy_finished, Qt.QueuedConnection)
+            self.strategy_thread.debug_server_started.connect(self.on_debug_server_started, Qt.QueuedConnection)
             
             # 启动线程
             self.strategy_thread.start()  # 正确使用start()启动子线程
@@ -2284,10 +4152,10 @@ class KhQuantGUI(QMainWindow):
                 # 记录回测开始时间
                 import time
                 self.backtest_start_time = time.time()
+                # 初始化为回测进度（后续会根据阶段改变）
+                self.progress_label_text = "回测进度"
                 self.progress_text.setText("回测进度: 0%")
                 self.progress_container.show()
-                # 强制更新UI
-                QApplication.processEvents()
                 # 更新状态标签
                 self.status_label.setText("回测进行中...")
             else:
@@ -2307,56 +4175,164 @@ class KhQuantGUI(QMainWindow):
     def on_strategy_finished(self):
         """策略完成回调"""
         try:
-            self.log_message("策略运行完成", "INFO")
+            # 检查是否启用了"停止后直接退出"模式
+            stop_exit_immediately = getattr(
+                self,
+                '_strategy_stop_exit_immediately',
+                self.settings.value('stop_exit_immediately', True, type=bool)
+            )
+            was_stop_requested = getattr(self, '_strategy_stop_requested', False)
+
+            self.log_message("策略已停止" if was_stop_requested else "策略运行完成", "INFO")
             # 恢复界面状态
             self.start_action.setEnabled(True)
             self.stop_action.setEnabled(False)
-            
+
             # 处理进度条 - 确保设置为100%并更新状态标签
             if self.get_run_mode() == "backtest":
-                self.progress_bar.setValue(100)
-                self.status_label.setText("回测完成")
-                # 延迟隐藏进度条，让用户看到100%完成状态
-                QTimer.singleShot(2000, lambda: self.hide_progress())
+                if was_stop_requested:
+                    self.status_label.setText("策略已停止")
+                    self.hide_progress()
+                else:
+                    self.progress_bar.setValue(100)
+                    self.status_label.setText("回测完成")
+                    # 延迟隐藏进度条，让用户看到100%完成状态
+                    QTimer.singleShot(2000, lambda: self.hide_progress())
             else:
                 # 非回测模式直接隐藏
                 self.hide_progress()
-                self.status_label.setText("策略运行完成")
-            
+                self.status_label.setText("策略已停止" if was_stop_requested else "策略运行完成")
+
+            # 如果启用了调试模式，在线程真正结束后再清理调试会话，避免停止时阻塞主线程
+            if was_stop_requested and self.debug_mode_enabled and self.debug_manager:
+                self._finish_debug_session_after_stop()
+
             # 如果启用了延迟显示，提示用户正在收集日志
-            if self.delay_log_display:
-                self.log_message("延迟显示模式已启用，正在收集所有日志，请稍候...", "INFO")
-            
+            # 但如果是"停止后直接退出"模式且策略已停止（不是自然完成），则跳过
+            if self.delay_log_display and not was_stop_requested:
+                # 检查是否是用户主动停止（通过检查framework的save_results_on_stop标志）
+                is_user_stopped = False
+                if (hasattr(self, 'strategy_thread') and
+                    hasattr(self.strategy_thread, 'framework') and
+                    self.strategy_thread.framework and
+                    not self.strategy_thread.framework.save_results_on_stop):
+                    is_user_stopped = True
+
+                if not is_user_stopped:
+                    self.log_message("延迟显示模式已启用，正在收集所有日志，请稍候...", "INFO")
+
             # 延迟处理策略结束逻辑，等待所有后续日志产生
             def finalize_strategy():
                 # 检查是否还在等待延迟处理（避免重复处理）
                 if not self.strategy_is_running:
                     return
-                    
+
                 # 清除策略运行状态标志
                 self.strategy_is_running = False
 
                 # 清除回测开始时间记录
                 if hasattr(self, 'backtest_start_time'):
                     delattr(self, 'backtest_start_time')
-                
+
                 # 如果启用了延迟显示，现在显示所有延迟的日志
+                # 但如果是"停止后直接退出"模式且策略已停止，则跳过
                 if self.delay_log_display and self.delayed_logs:
-                    # 再次延迟一点时间确保所有日志都已收集
-                    QTimer.singleShot(200, self.display_delayed_logs)
-                
+                    # 检查是否是用户主动停止
+                    is_user_stopped = False
+                    if (hasattr(self, 'strategy_thread') and
+                        hasattr(self.strategy_thread, 'framework') and
+                        self.strategy_thread.framework and
+                        not self.strategy_thread.framework.save_results_on_stop):
+                        is_user_stopped = True
+
+                    if not is_user_stopped:
+                        # 再次延迟一点时间确保所有日志都已收集
+                        QTimer.singleShot(200, self.display_delayed_logs)
+                    else:
+                        # 直接清空延迟日志，不显示
+                        self.delayed_logs.clear()
+
                 # 清理临时配置文件
-                if hasattr(self, 'temp_config_path') and os.path.exists(self.temp_config_path):
+                temp_paths = [getattr(self, 'temp_config_path', None)]
+                if hasattr(self, 'strategy_thread') and self.strategy_thread:
+                    temp_paths.extend(getattr(self.strategy_thread, 'temp_config_paths', []) or [])
+                for temp_path in dict.fromkeys([p for p in temp_paths if p]):
+                    if not os.path.exists(temp_path):
+                        continue
                     try:
-                        os.remove(self.temp_config_path)
+                        os.remove(temp_path)
                     except Exception as e:
                         self.log_message(f"清理临时配置文件失败: {str(e)}", "WARNING")
-            
+
+                self._strategy_stop_requested = False
+                self._strategy_stop_warning_shown = False
+                self._strategy_stop_exit_immediately = True
+                self.update_status("策略已停止运行" if was_stop_requested else "策略运行完成")
+                self.set_t0_mode_display(False)
+
+                if was_stop_requested:
+                    if stop_exit_immediately:
+                        self.log_message("策略已停止（直接退出模式，不保存回测记录）", "INFO")
+                    else:
+                        self.log_message("策略已停止", "INFO")
+
+                if getattr(self, '_close_after_strategy_stop', False):
+                    self._close_after_strategy_stop = False
+                    self._close_when_strategy_thread_exited()
+
             # 延迟2秒执行最终处理，给策略后续日志留出时间
-            QTimer.singleShot(2000, finalize_strategy)
-                    
+            QTimer.singleShot(0 if was_stop_requested else 2000, finalize_strategy)
+
         except Exception as e:
             self.log_error("处理策略完成回调时出错", e)
+
+    def _finish_debug_session_after_stop(self):
+        """策略线程结束后清理调试会话。"""
+        try:
+            self.debug_manager.stop_debug_server()
+            self.log_message("=" * 60, "INFO")
+            self.log_message("调试会话已结束", "INFO")
+            self.log_message("", "INFO")
+            self.log_message("💡 下次运行时可以继续使用调试功能：", "INFO")
+            self.log_message("   1. 保持主程序开启（无需重启）", "INFO")
+            self.log_message("   2. 点击'开始运行'", "INFO")
+            self.log_message("   3. 在VSCode中按F5重新连接调试器", "INFO")
+            self.log_message("", "INFO")
+            self.log_message("✓ 调试服务器仍在运行，可以随时重新连接", "INFO")
+            self.log_message("=" * 60, "INFO")
+        except Exception as e:
+            self.log_message(f"停止调试会话时出错: {str(e)}", "WARNING")
+
+    def _close_when_strategy_thread_exited(self):
+        """策略线程真正退出后再继续关闭主窗口。"""
+        try:
+            if getattr(self, 'strategy_thread', None) is not None and self.strategy_thread.isRunning():
+                QTimer.singleShot(50, self._close_when_strategy_thread_exited)
+                return
+
+            self._force_close_after_strategy_stop = True
+            self.close()
+        except Exception as e:
+            self.log_message(f"等待策略线程退出后关闭窗口时出错: {str(e)}", "WARNING")
+
+    def _warn_strategy_stop_is_slow(self):
+        """停止请求发出后仍未结束时给出提示，不阻塞界面。"""
+        try:
+            if not getattr(self, '_strategy_stop_requested', False):
+                return
+            if not getattr(self, 'strategy_thread', None) or not self.strategy_thread.isRunning():
+                return
+            if getattr(self, '_strategy_stop_warning_shown', False):
+                return
+
+            self._strategy_stop_warning_shown = True
+            self.update_status("策略仍在停止中，请稍候...")
+            self.log_message(
+                "策略仍在停止中：当前可能正在等待数据源请求、DuckDB I/O 或结果保存完成，界面会保持可响应。",
+                "WARNING"
+            )
+        except Exception as e:
+            logging.warning(f"显示策略停止慢提示时出错: {e}")
 
     def stop_strategy(self):
         """停止策略运行"""
@@ -2364,37 +4340,41 @@ class KhQuantGUI(QMainWindow):
             # 清除回测开始时间记录
             if hasattr(self, 'backtest_start_time'):
                 delattr(self, 'backtest_start_time')
-            
+
             if getattr(self, 'strategy_thread', None) is not None and self.strategy_thread.isRunning():
-                # 设置停止标志
+                if getattr(self, '_strategy_stop_requested', False):
+                    self.update_status("策略正在停止中，请稍候...")
+                    return
+
+                # 检查是否启用了"停止后直接退出"选项
+                stop_exit_immediately = self.settings.value('stop_exit_immediately', True, type=bool)
+                self._strategy_stop_requested = True
+                self._strategy_stop_exit_immediately = stop_exit_immediately
+                self._strategy_stop_warning_shown = False
+
+                # 设置框架的标志，控制是否保存结果
                 if hasattr(self.strategy_thread, 'framework') and self.strategy_thread.framework:
                     self.strategy_thread.framework.is_running = False
+                    # 设置停止后是否保存结果的标志
+                    self.strategy_thread.framework.save_results_on_stop = not stop_exit_immediately
 
-                # 等待线程结束
+                # 请求线程停止，不在GUI线程等待，避免界面未响应
                 self.strategy_thread.stop()
-                self.strategy_thread.wait()
-
-                # 清理临时配置文件
-                if hasattr(self, 'temp_config_path') and os.path.exists(self.temp_config_path):
-                    try:
-                        os.remove(self.temp_config_path)
-                    except Exception as e:
-                        self.log_message(f"清理临时配置文件失败: {str(e)}", "WARNING")
-
-                self.update_status("策略已停止运行")
+                self.update_status("正在停止策略...")
                 self.stop_action.setEnabled(False)
-                self.start_action.setEnabled(True)
+                self.start_action.setEnabled(False)
 
-                # 清除策略运行状态标志
-                self.strategy_is_running = False
+                if hasattr(self, 'status_label'):
+                    self.status_label.setText("正在停止策略...")
 
-                # 隐藏进度条
-                self.hide_progress()
-                
-                # 重置T+0模式显示
-                self.set_t0_mode_display(False)
+                if stop_exit_immediately:
+                    self.log_message("已请求停止策略（直接退出模式，不保存回测记录）", "INFO")
+                else:
+                    self.log_message("已请求停止策略，等待当前步骤安全结束...", "INFO")
 
-                self.log_message("策略已停止", "INFO")
+                QTimer.singleShot(5000, self._warn_strategy_stop_is_slow)
+            else:
+                self.update_status("当前没有正在运行的策略")
 
         except Exception as e:
             error_msg = f"停止策略时出错: {str(e)}"
@@ -2404,20 +4384,47 @@ class KhQuantGUI(QMainWindow):
     def closeEvent(self, event):
         """窗口关闭事件处理"""
         try:
-            # 停止策略线程，如果存在的话
-            if self.strategy_thread and self.strategy_thread.is_running:
+            if getattr(self, '_force_close_after_strategy_stop', False):
+                self._force_close_after_strategy_stop = False
+            elif self.strategy_thread and self.strategy_thread.isRunning():
                 reply = QMessageBox.question(
                     self, '关闭确认',
-                    "策略正在运行中，确定要关闭吗?",
+                    "策略正在运行中，确定要关闭吗?\n\n"
+                    "程序会先请求策略安全停止，停止完成后自动关闭。",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No
                 )
-                
+
                 if reply == QMessageBox.Yes:
+                    self._close_after_strategy_stop = True
                     self.stop_strategy()
-                else:
                     event.ignore()
                     return
-            
+
+                event.ignore()
+                return
+
+            # 数据管理窗几乎与主窗口重合，两者的关闭按钮相距不到 50 像素，
+            # 误点主窗口的 × 会连带退出整个软件。子窗口开着时先让用户确认。
+            if self._duckdb_viewer_is_open():
+                reply = QMessageBox.question(
+                    self, '关闭确认',
+                    "数据管理窗口还开着。\n\n"
+                    "继续将关闭数据管理并退出整个软件；\n"
+                    "只想关掉数据管理的话，请点它自己的关闭按钮。\n\n"
+                    "确定退出软件吗?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if reply != QMessageBox.Yes:
+                    event.ignore()
+                    return
+
+            duckdb_close_state = self._request_duckdb_viewer_close_for_shutdown()
+            if duckdb_close_state != "ready":
+                # 数据管理窗口可能正在等待导入/索引线程安全退出，或者用户在其
+                # 二次确认中取消关闭。两种情况都不能继续 app.quit() 强拆窗口。
+                event.ignore()
+                return
+
             # 恢复窗口标题
             self.setWindowTitle("看海量化回测系统")
             
@@ -2445,23 +4452,105 @@ class KhQuantGUI(QMainWindow):
             if hasattr(self, 'history_manager_window') and self.history_manager_window:
                 self.history_manager_window.close()
                 self.history_manager_window = None
-            
+
+            if self.embedded_vscode_manager:
+                self.embedded_vscode_manager.cleanup()
+
+            # 关闭 DuckDB 数据库连接
+            try:
+                from duckdb_storage import DuckDBManager
+                DuckDBManager.reset_instance()
+                self.log_message("DuckDB 数据库连接已关闭", "INFO")
+            except Exception as e:
+                logging.warning(f"关闭 DuckDB 连接时出错: {e}")
+
             # 停止日志刷新定时器
             if hasattr(self, 'log_flush_timer'):
                 self.log_flush_timer.stop()
-            
+
             # 最后一次刷新日志，确保所有日志都写入文件
             self.flush_logs()
+
+            # 移除GUI日志处理器，避免root logger残留已关闭窗口引用
+            self._remove_gui_log_handler()
             
             # 接受关闭事件
             event.accept()
+            app = QApplication.instance()
+            if app is not None:
+                QTimer.singleShot(0, app.quit)
             
         except Exception as e:
             logging.error(f"程序退出时出错: {str(e)}", exc_info=True)
             # 确保日志写入
             self.flush_logs()
+            self._remove_gui_log_handler()
             # 即使出错也接受事件，确保程序能够退出
             event.accept()
+            app = QApplication.instance()
+            if app is not None:
+                QTimer.singleShot(0, app.quit)
+
+    def _duckdb_viewer_is_open(self):
+        """数据管理窗口是否仍在显示（已被 Qt 销毁的窗口不算）。"""
+        window = getattr(self, "duckdb_viewer_window", None)
+        if window is None:
+            return False
+        try:
+            from PyQt5 import sip
+            if sip.isdeleted(window):
+                return False
+        except (ImportError, TypeError, RuntimeError):
+            pass
+        try:
+            return bool(window.isVisible())
+        except RuntimeError:
+            return False
+
+    def _request_duckdb_viewer_close_for_shutdown(self):
+        """关闭 DuckDB 数据管理窗口；活动任务存在时让主窗口等待其收尾。"""
+        window = getattr(self, "duckdb_viewer_window", None)
+        if window is None:
+            self._close_after_duckdb_viewer = False
+            return "ready"
+
+        try:
+            from PyQt5 import sip
+            try:
+                window_deleted = sip.isdeleted(window)
+            except TypeError:
+                window_deleted = False
+            if window_deleted:
+                self.duckdb_viewer_window = None
+                self._close_after_duckdb_viewer = False
+                return "ready"
+            accepted = bool(window.close())
+        except RuntimeError:
+            self.duckdb_viewer_window = None
+            self._close_after_duckdb_viewer = False
+            return "ready"
+
+        if accepted:
+            self._close_after_duckdb_viewer = False
+            return "ready"
+
+        if getattr(window, "_viewer_closing", False):
+            self._close_after_duckdb_viewer = True
+            self.log_message("正在等待数据管理任务安全停止，完成后自动退出软件", "INFO")
+            return "waiting"
+
+        self._close_after_duckdb_viewer = False
+        self.log_message("已取消关闭数据管理窗口，软件保持运行", "INFO")
+        return "cancelled"
+
+    def _on_duckdb_viewer_destroyed(self, target):
+        """清理窗口引用，并在主窗口等待退出时继续完成关闭。"""
+        if getattr(self, "duckdb_viewer_window", None) is target:
+            self.duckdb_viewer_window = None
+        if not getattr(self, "_close_after_duckdb_viewer", False):
+            return
+        self._close_after_duckdb_viewer = False
+        QTimer.singleShot(0, self.close)
 
     def mode_changed(self):
         """运行模式改变时的处理（固定为回测模式）"""
@@ -2519,15 +4608,185 @@ class KhQuantGUI(QMainWindow):
             
             # 在日志中记录成功加载
             self.log_message(f"配置已从以下位置加载: {file_path}", "INFO")
+            self._remember_loaded_config_state()
             
             # 检查加载的配置中是否有文件在危险位置
             strategy_file_path = config.get("strategy_file", "")
             if strategy_file_path:
-                self.show_internal_dir_warning(file_path, strategy_file_path)
+                resolved_strategy_file = self._resolve_strategy_file_path(strategy_file_path, config_path=file_path)
+                self.show_internal_dir_warning(file_path, resolved_strategy_file)
             
         except Exception as e:
             QMessageBox.critical(self, "加载失败", f"加载配置文件时出错: {str(e)}")
 
+    def auto_load_last_config(self):
+        """自动加载上次使用的配置文件
+
+        在软件启动时调用，静默加载上次的配置文件
+        """
+        try:
+            # 获取上次的配置文件路径
+            last_config_path = self.settings.value('last_config_path', '')
+
+            # 检查文件是否存在
+            if not last_config_path or not os.path.exists(last_config_path):
+                self.log_message("未找到上次的配置文件，使用默认配置", "INFO")
+                return
+
+            # 静默加载配置文件
+            with open(last_config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+
+            # 保存到实例变量
+            self.config = config
+            self.current_config_file = last_config_path
+
+            # 更新UI
+            self.update_ui_from_config()
+
+            # 更新窗口标题
+            file_name = os.path.basename(last_config_path)
+            self.setWindowTitle(f"看海量化回测系统 - {file_name}")
+
+            # 记录日志
+            self.log_message(f"已自动加载配置: {file_name}", "INFO")
+            self._remember_loaded_config_state()
+
+        except Exception as e:
+            # 静默失败，不弹出错误对话框
+            self.log_message(f"自动加载配置文件失败: {str(e)}", "WARNING")
+            self.log_message("使用默认配置", "INFO")
+
+    def restore_config_from_history(self, config_dict):
+        """从回测历史还原配置到主界面"""
+        try:
+            # 还原策略文件路径
+            if "strategy_file" in config_dict:
+                strategy_file = config_dict["strategy_file"]
+                resolved_strategy_file = self._resolve_strategy_file_path(strategy_file)
+                if strategy_file and os.path.exists(resolved_strategy_file):
+                    self.strategy_path.setText(strategy_file)
+                    self.log_message(f"策略文件路径已还原: {strategy_file}", "INFO")
+                    if resolved_strategy_file != strategy_file:
+                        self.log_message(f"策略文件已解析为: {resolved_strategy_file}", "INFO")
+                else:
+                    self.log_message(f"策略文件不存在，跳过还原: {strategy_file}", "WARNING")
+            
+            # 还原回测参数 - 处理嵌套的backtest配置
+            backtest_config = config_dict.get("backtest", {})
+            
+            # 还原开始时间
+            start_time = backtest_config.get("start_time") or config_dict.get("start_time")
+            if start_time:
+                try:
+                    start_date = QDate.fromString(str(start_time), "yyyyMMdd")
+                    if start_date.isValid():
+                        self.start_date.setDate(start_date)
+                        self.log_message(f"开始时间已还原: {start_time}", "INFO")
+                except Exception as e:
+                    self.log_message(f"还原开始时间失败: {str(e)}", "WARNING")
+                    
+            # 还原结束时间
+            end_time = backtest_config.get("end_time") or config_dict.get("end_time")
+            if end_time:
+                try:
+                    end_date = QDate.fromString(str(end_time), "yyyyMMdd")
+                    if end_date.isValid():
+                        self.end_date.setDate(end_date)
+                        self.log_message(f"结束时间已还原: {end_time}", "INFO")
+                except Exception as e:
+                    self.log_message(f"还原结束时间失败: {str(e)}", "WARNING")
+                    
+            # 还原初始资金
+            init_capital = backtest_config.get("init_capital") or config_dict.get("init_capital")
+            if init_capital:
+                try:
+                    self.initial_cash.setText(str(init_capital))
+                    self.log_message(f"初始资金已还原: {init_capital}", "INFO")
+                except Exception as e:
+                    self.log_message(f"还原初始资金失败: {str(e)}", "WARNING")
+                    
+            # 还原基准合约
+            benchmark = backtest_config.get("benchmark") or config_dict.get("benchmark")
+            if benchmark:
+                try:
+                    self.benchmark_input.setText(str(benchmark))
+                    self.log_message(f"基准合约已还原: {benchmark}", "INFO")
+                except Exception as e:
+                    self.log_message(f"还原基准合约失败: {str(e)}", "WARNING")
+            
+            # 还原最小交易量
+            min_volume = backtest_config.get("min_volume") or config_dict.get("min_volume")
+            if min_volume:
+                try:
+                    self.min_volume.setText(str(min_volume))
+                    self.log_message(f"最小交易量已还原: {min_volume}", "INFO")
+                except Exception as e:
+                    self.log_message(f"还原最小交易量失败: {str(e)}", "WARNING")
+            
+            # 获取触发模式配置
+            trigger_config = backtest_config.get("trigger", {})
+            
+            # 构造临时配置对象，复用主界面的配置加载逻辑
+            temp_config = {
+                "strategy_file": config_dict.get("strategy_file", ""),
+                "data_mode": config_dict.get("data_mode", "single_quote"),
+                "data": {
+                    "kline_period": config_dict.get("kline_period", "1m"),
+                    "dividend_type": config_dict.get("dividend_type", "front"),
+                    "stock_list": []
+                },
+                "backtest": {
+                    "start_time": start_time or "",
+                    "end_time": end_time or "",
+                    "init_capital": init_capital or 1000000,
+                    "benchmark": benchmark or "",
+                    "min_volume": min_volume or 100,
+                    "trigger": trigger_config,
+                    "trade_cost": copy.deepcopy(
+                        backtest_config.get(
+                            "trade_cost",
+                            config_dict.get("trade_cost", {}),
+                        )
+                    ),
+                },
+                "market_callback": config_dict.get("market_callback", {})
+            }
+            
+            # 处理股票池数据
+            stock_list_str = config_dict.get("stock_list")
+            if stock_list_str and isinstance(stock_list_str, str) and stock_list_str.strip():
+                stock_codes = [stock.strip() for stock in stock_list_str.split(',') if stock.strip()]
+                temp_config["data"]["stock_list"] = stock_codes
+            
+            # 保存当前配置
+            original_config = getattr(self, 'config', {})
+            
+            # 临时设置配置并调用主界面的更新方法
+            self.config = temp_config
+            
+            try:
+                # 使用统一的配置更新方法
+                self.update_ui_from_config()
+                self.log_message("配置已通过统一方法还原到主界面", "INFO")
+                    
+            finally:
+                # 恢复原始配置
+                self.config = original_config
+            
+            # 更新内部配置对象
+            self.config.update(config_dict)
+            self.config = self._sanitize_runtime_slippage_config(self.config)
+            
+            self.log_message("配置已从回测历史成功还原到主界面", "INFO")
+            self._remember_loaded_config_state()
+            
+        except Exception as e:
+            self.log_message(f"还原配置时出错: {str(e)}", "ERROR")
+            import traceback
+            self.log_message(f"详细错误信息: {traceback.format_exc()}", "ERROR")
+            raise
+    
     def update_ui_from_config(self):
         """根据已加载的配置更新UI"""
         if not hasattr(self, 'config') or not self.config:
@@ -2550,8 +4809,10 @@ class KhQuantGUI(QMainWindow):
             # 如果是自定义模式(custom)，当触发类型设置为3(自定义)时会自动处理
         
         # 更新回测参数
-        if "backtest" in self.config:
-            backtest_config = self.config["backtest"]
+        backtest_config = self.config.get("backtest", {})
+        if not isinstance(backtest_config, dict):
+            backtest_config = {}
+        if backtest_config:
             if "start_time" in backtest_config:
                 self.start_date.setDate(QDate.fromString(str(backtest_config["start_time"]), "yyyyMMdd"))
             if "end_time" in backtest_config:
@@ -2588,33 +4849,30 @@ class KhQuantGUI(QMainWindow):
                     self.end_time_edit.setTime(QTime.fromString(trigger_config["end_time"], "HH:mm:ss"))
                 if "interval" in trigger_config:
                     self.interval_spin.setValue(int(trigger_config["interval"]))
+                daily_trigger_cap = int(trigger_config.get("daily_trigger_cap", 1) or 1)
+                self.daily_trigger_cap_spin.setValue(daily_trigger_cap)
         
-        # 更新交易成本设置
-        if "trade_cost" in backtest_config:
-            trade_cost = backtest_config["trade_cost"]
-            if "min_commission" in trade_cost:
-                self.min_commission.setText(str(trade_cost["min_commission"]))
-            if "commission_rate" in trade_cost:
-                self.commission_rate.setText(f"{trade_cost['commission_rate']:.7g}")
-            if "stamp_tax_rate" in trade_cost:
-                self.stamp_tax.setText(f"{trade_cost['stamp_tax_rate']:.7g}")
-            if "flow_fee" in trade_cost:
-                self.flow_fee.setText(str(trade_cost["flow_fee"]))
-            
-            # 添加滑点设置的读取
-            if "slippage" in trade_cost:
-                slippage = trade_cost["slippage"]
-                # 设置滑点类型
-                if "type" in slippage:
-                    slippage_type = "按最小变动价跳数" if slippage["type"] == "tick" else "按成交金额比例"
-                    self.slippage_type.setCurrentText(slippage_type)
-                    
-                # 设置滑点值
-                if slippage["type"] == "tick" and "tick_count" in slippage:
-                    self.slippage_value.setText(str(slippage["tick_count"]))
-                elif slippage["type"] == "ratio" and "ratio" in slippage:
-                    # 比例值需要转换为百分比显示
-                    self.slippage_value.setText(str(slippage["ratio"] * 100))
+        # 更新交易成本设置。即使旧配置没有滑点字段，也必须恢复默认值，
+        # 不能残留上一个策略文件的 tick/ratio 状态。
+        trade_cost = backtest_config.get("trade_cost")
+        normalized_trade_cost = _normalize_trade_cost_config(trade_cost)
+        self.min_commission.setText(
+            format(normalized_trade_cost["min_commission"], ".12g")
+        )
+        self.commission_rate.setText(
+            format(normalized_trade_cost["commission_rate"], ".12g")
+        )
+        self.stamp_tax.setText(
+            format(normalized_trade_cost["stamp_tax_rate"], ".12g")
+        )
+        self.flow_fee.setText(
+            format(normalized_trade_cost["flow_fee"], ".12g")
+        )
+        self._load_slippage_settings(normalized_trade_cost["slippage"])
+        if isinstance(trade_cost, dict):
+            # 把内存中的旧/异常值同步收敛，保存和立即运行使用同一语义；
+            # 未配置 trade_cost 时只重置界面，不擅自向原配置注入字段。
+            backtest_config["trade_cost"] = normalized_trade_cost
         
         # 更新市场回调设置
         if "market_callback" in self.config:
@@ -2669,10 +4927,7 @@ class KhQuantGUI(QMainWindow):
                 self.full_quote_radio.setChecked(True)
             else:  # single_quote
                 self.single_quote_radio.setChecked(True)
-        
-        # 处理系统设置 - init_data_enabled不存在于配置文件中，只存在于QSettings
-        # 移除相关处理代码，因为init_data_enabled只通过设置界面管理
-        
+
         # 更新实盘数据获取模块的状态 - 需要在运行模式和触发类型都设置好后调用
         self.update_realtime_data_group_status()
 
@@ -2688,76 +4943,185 @@ class KhQuantGUI(QMainWindow):
         """开始日期变化时更新结束日期的最小值"""
         self.end_date.setMinimumDate(date)
 
+    def _load_all_stock_entries(self):
+        """加载本地股票和场内基金列表，返回去重后的 [(code, name), ...]。"""
+        entries = []
+        seen_codes = set()
+        for filename in (
+            "全部股票_股票列表.csv",
+            "沪深ETF_成分股列表.csv",
+            "沪深基金_列表.csv",
+        ):
+            try:
+                path = self.get_data_path(filename)
+                if not os.path.exists(path):
+                    continue
+                with open(path, 'r', encoding='utf-8-sig') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        parts = line.split(',')
+                        code = parts[0].strip().replace('﻿', '')
+                        name = parts[1].strip() if len(parts) >= 2 else ""
+                        if not code or self._is_csv_header_row(code, name):
+                            continue
+                        normalized_code = code.upper()
+                        if normalized_code in seen_codes:
+                            continue
+                        seen_codes.add(normalized_code)
+                        entries.append((normalized_code, name))
+            except Exception:
+                continue
+        return entries
+
+    @staticmethod
+    def _normalize_name(text):
+        """名称归一化：去除所有空白并转小写，便于容错匹配。"""
+        return ''.join(str(text).split()).casefold()
+
+    def _resolve_stock_input(self, raw):
+        """将用户输入解析为 (code, name)。
+
+        支持三种输入：
+        - 完整代码（000001.SZ / 600000.SH）
+        - 6 位纯数字代码（自动按本地列表补全交易所后缀）
+        - 股票名称（精确优先，其次模糊包含；多结果弹窗选择）
+
+        返回 (code, name)；无法解析时返回 (None, None)。
+        """
+        import re
+        raw = raw.strip()
+        if not raw:
+            return None, None
+
+        upper = raw.upper()
+        entries = self._load_all_stock_entries()
+        code_to_name = {c: n for c, n in entries}
+
+        # 1) 完整代码
+        if re.match(r'^\d{6}\.(SH|SZ)$', upper):
+            return upper, code_to_name.get(upper, "")
+
+        # 2) 6 位纯数字（缺交易所后缀）—— 用本地列表补全
+        if re.match(r'^\d{6}$', upper):
+            matched = [(c, n) for c, n in entries if c.split('.')[0] == upper]
+            if len(matched) == 1:
+                return matched[0]
+            if len(matched) > 1:
+                return self._pick_from_matches(matched)
+            QMessageBox.warning(
+                self, "格式错误",
+                f"未在本地股票列表中找到代码 {upper}，\n"
+                "请补全交易所后缀，例如 {0}.SZ 或 {0}.SH".format(upper))
+            return None, None
+
+        # 3) 按名称解析
+        if not entries:
+            QMessageBox.warning(self, "无法解析",
+                "本地股票列表文件缺失，无法按名称查找，请输入完整股票代码。")
+            return None, None
+
+        norm = self._normalize_name(raw)
+        exact = [(c, n) for c, n in entries if self._normalize_name(n) == norm]
+        if exact:
+            return exact[0] if len(exact) == 1 else self._pick_from_matches(exact)
+
+        partial = [(c, n) for c, n in entries if norm in self._normalize_name(n)]
+        if not partial:
+            QMessageBox.warning(self, "未找到",
+                f"未找到与“{raw}”匹配的股票代码或名称。")
+            return None, None
+        if len(partial) == 1:
+            return partial[0]
+        # 结果过多时截断，避免选择框过长
+        return self._pick_from_matches(partial[:50])
+
+    def _ask_text(self, title, label, default=""):
+        """文本输入弹窗（深色标题栏），返回 (text, ok)。"""
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setLabelText(label)
+        dlg.setInputMode(QInputDialog.TextInput)
+        dlg.setTextValue(default)
+        self.apply_dark_titlebar(dlg)
+        ok = bool(dlg.exec_())
+        return dlg.textValue(), ok
+
+    def _ask_item(self, title, label, items):
+        """下拉选择弹窗（深色标题栏），返回 (text, ok)。"""
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setLabelText(label)
+        dlg.setComboBoxEditable(False)
+        dlg.setComboBoxItems(items)
+        self.apply_dark_titlebar(dlg)
+        ok = bool(dlg.exec_())
+        return dlg.textValue(), ok
+
+    def _pick_from_matches(self, matches):
+        """多结果时弹出选择框，返回选中的 (code, name)。"""
+        display = [f"{c}  {n}" for c, n in matches]
+        choice, ok = self._ask_item(
+            "选择股票", "匹配到多只股票，请选择：", display)
+        if not ok or not choice:
+            return None, None
+        idx = display.index(choice)
+        return matches[idx]
+
     def add_single_stock(self):
-        """手动添加单只股票"""
+        """手动添加单只股票（支持输入股票代码或股票名称）"""
         try:
             # 弹出输入对话框
-            stock_code, ok = QInputDialog.getText(
-                self, 
-                "添加股票", 
-                "请输入股票代码（例如：000001.SZ 或 600000.SH）:",
-                text=""
+            user_input, ok = self._ask_text(
+                "添加股票",
+                "请输入股票代码或名称\n"
+                "（例如：600000.SH、000001.SZ，或 平安银行）:"
             )
-            
-            if ok and stock_code.strip():
-                code = stock_code.strip().upper()
-                
-                # 简单的股票代码格式验证
-                if not self.validate_stock_code(code):
-                    QMessageBox.warning(self, "格式错误", 
-                        "股票代码格式不正确！\n"
-                        "请使用以下格式：\n"
-                        "• 000001.SZ（深圳）\n"
-                        "• 600000.SH（上海）\n"
-                        "• 002001.SZ（深圳中小板）\n"
-                        "• 300001.SZ（创业板）\n"
-                        "• 688001.SH（科创板）")
+
+            if ok and user_input.strip():
+                code, name = self._resolve_stock_input(user_input)
+                if not code:
                     return
-                
+
+                code = code.upper()
+
+                # 解析后再做一次代码格式校验（兜底）
+                if not self.validate_stock_code(code):
+                    QMessageBox.warning(self, "格式错误",
+                        f"解析得到的股票代码 {code} 格式不正确。")
+                    return
+
                 # 检查是否已存在
                 for row in range(self.stock_list.rowCount()):
                     if self.stock_list.item(row, 0).text() == code:
                         QMessageBox.information(self, "提示", f"股票 {code} 已存在于列表中")
                         return
-                
-                # 获取股票名称（尝试从系统数据文件中查找）
-                name = ""
-                try:
-                    # 尝试从全部股票列表文件中获取股票名称
-                    all_stocks_file = self.get_data_path("全部股票_股票列表.csv")
-                    if os.path.exists(all_stocks_file):
-                        with open(all_stocks_file, 'r', encoding='utf-8-sig') as f:
-                            for line in f:
-                                if line.strip():
-                                    parts = line.strip().split(',')
-                                    if len(parts) >= 2 and parts[0].strip() == code:
-                                        name = parts[1].strip()
-                                        break
-                except Exception:
-                    pass
-                
-                # 如果没有找到名称，让用户输入
+
+                # 名称未知时，让用户补充输入（可选）
                 if not name:
-                    input_name, ok_name = QInputDialog.getText(
-                        self,
+                    input_name, ok_name = self._ask_text(
                         "股票名称",
-                        f"未找到股票 {code} 的名称，请输入股票名称（可选）:",
-                        text=""
+                        f"未找到股票 {code} 的名称，请输入股票名称（可选）:"
                     )
                     if ok_name:
                         name = input_name.strip()
-                
+
                 # 添加到表格
                 row = self.stock_list.rowCount()
                 self.stock_list.insertRow(row)
                 self.stock_list.setItem(row, 0, QTableWidgetItem(code))
                 self.stock_list.setItem(row, 1, QTableWidgetItem(name))
-                
+
+                # 如果该股票在删除集合中，从删除集合中移除（用户手动添加回来了）
+                if code in self.deleted_stocks:
+                    self.deleted_stocks.discard(code)
+
                 # 选中新添加的行
                 self.stock_list.selectRow(row)
-                
-                self.update_status(f"已添加股票: {code}")
-                
+
+                self.update_status(f"已添加股票: {code} {name}".strip())
+
         except Exception as e:
             error_msg = f"添加股票时出错: {str(e)}"
             self.update_status(error_msg)
@@ -2775,7 +5139,7 @@ class KhQuantGUI(QMainWindow):
         """导入股票列表"""
         try:
             # 设置默认目录为data
-            default_dir = os.path.join(os.path.dirname(__file__), 'data')
+            default_dir = get_stock_pool_write_dir(create=True)
             
             file_name, _ = QFileDialog.getOpenFileName(
                 self,
@@ -2785,25 +5149,23 @@ class KhQuantGUI(QMainWindow):
             )
             
             if file_name:
-                # 读取文件
-                with open(file_name, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
+                rows = self._read_stock_rows_from_file(file_name)
+                existing_codes = self._get_stock_table_codes()
+                rows_to_add = [
+                    (code, name)
+                    for code, name in rows
+                    if code not in existing_codes
+                ]
+                added_count = self._append_stock_list_rows(rows_to_add)
+
+                # 用户显式导入相当于手动添加回来，移除删除标记。
+                for code, _ in rows_to_add:
+                    self.deleted_stocks.discard(code)
                 
-                # 解析并添加股票
-                for line in lines:
-                    line = line.strip()
-                    if line:
-                        parts = line.split(',')
-                        code = parts[0].strip()
-                        name = parts[1].strip() if len(parts) > 1 else ""
-                        
-                        # 添加到表格
-                        row = self.stock_list.rowCount()
-                        self.stock_list.insertRow(row)
-                        self.stock_list.setItem(row, 0, QTableWidgetItem(code))
-                        self.stock_list.setItem(row, 1, QTableWidgetItem(name))
-                
-                self.update_status(f"已导入股票列表: {os.path.basename(file_name)}")
+                if added_count > 0:
+                    self.update_status(f"已导入 {added_count} 只股票: {os.path.basename(file_name)}")
+                else:
+                    self.update_status(f"导入完成，但所有股票已存在于列表中: {os.path.basename(file_name)}")
                 
         except Exception as e:
             error_msg = f"导入股票列表时出错: {str(e)}"
@@ -2814,65 +5176,53 @@ class KhQuantGUI(QMainWindow):
     def delete_selected_stocks(self):
         """删除选中的股票"""
         selected_rows = set(item.row() for item in self.stock_list.selectedItems())
+        
+        # 收集要删除的股票代码
+        deleted_codes = []
+        for row in sorted(selected_rows):
+            code = self.stock_list.item(row, 0).text()
+            if code:
+                deleted_codes.append(code)
+        
         for row in sorted(selected_rows, reverse=True):
             self.stock_list.removeRow(row)
-            
-        # 添加以下代码：更新股票清单文件
-        # 生成新的股票清单文件
+        
         stock_codes = []
-        
-        # 添加选中的常用股票池中的股票代码
-        for code, cb in self.pool_checkboxes.items():
-            if cb.isChecked():
-                pool_file = self._get_pool_file(code)
-                if pool_file:
-                    file_path = self.get_data_path(pool_file)
-                    if os.path.exists(file_path):
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            for line in f:
-                                if line.strip():
-                                    parts = line.strip().split(',')
-                                    if len(parts) >= 1:
-                                        stock_code = parts[0].strip().replace('\ufeff', '')
-                                        if stock_code not in stock_codes:
-                                            stock_codes.append(stock_code)
-        
-        # 添加剩余的自定义股票列表中的股票代码
+        seen_codes = set()
         for row in range(self.stock_list.rowCount()):
-            code = self.stock_list.item(row, 0).text()
-            if code and code not in stock_codes:
+            item = self.stock_list.item(row, 0)
+            code = item.text().strip() if item else ""
+            if code and code not in seen_codes:
+                seen_codes.add(code)
                 stock_codes.append(code)
-                
+        
+        if "data" not in self.config:
+            self.config["data"] = {}
+        self.config["data"]["stock_list"] = stock_codes
+        if "stock_list_file" in self.config["data"]:
+            del self.config["data"]["stock_list_file"]
+        
+        # 记录被删除的股票到删除集合中（用于防止从股票池中重新添加）
+        for code in deleted_codes:
+            self.deleted_stocks.add(code)
+        
         if stock_codes:
-            # 生成股票清单文件
-            stock_list_dir = os.path.join(os.path.dirname(__file__), 'data', 'stock_list')
-            os.makedirs(stock_list_dir, exist_ok=True)
-            stock_list_file = os.path.join(stock_list_dir, f"stock_list_{int(time.time())}.csv")
-            
-            with open(stock_list_file, 'w', encoding='utf-8') as f:
-                for code in stock_codes:
-                    f.write(f"{code}\n")
-            
-            # 更新配置
-            if "data" not in self.config:
-                self.config["data"] = {}
-            self.config["data"]["stock_list_file"] = stock_list_file
-            
-            self.update_status(f"已删除选中股票并更新股票清单，保留{len(stock_codes)}只股票")
+            self.update_status(f"已删除选中股票，当前股票池共{len(stock_codes)}只股票")
         else:
-            # 清空股票清单文件路径
-            if "data" in self.config:
-                self.config["data"]["stock_list_file"] = ""
             self.update_status("已删除所有股票")
 
     def clear_stock_list(self):
         """清空股票列表和取消所有股票池的勾选"""
         # 清空股票列表
-        self.stock_list.setRowCount(0)
+        self._set_stock_list_rows([])
         
         # 取消所有股票池的勾选
         for checkbox in self.pool_checkboxes.values():
-            checkbox.setChecked(False)
+            was_blocked = checkbox.blockSignals(True)
+            try:
+                checkbox.setChecked(False)
+            finally:
+                checkbox.blockSignals(was_blocked)
         
         self.update_status("已清空股票列表和股票池选择")
 
@@ -2880,35 +5230,22 @@ class KhQuantGUI(QMainWindow):
         """股票池选择变化时的处理"""
         try:
             if state == Qt.Checked:
+                # 检查是否选中了T0型ETF，如果是则弹出警告
+                if code in ['t0_etf', 't0_stock_etf']:
+                    warning_msg = "提示：T0型ETF和T0股票型ETF清单可能存在滞后，请仔细甄别后使用。\n\n这些清单基于历史数据整理，实际交易规则可能已发生变化，请以交易所最新公告为准。"
+                    QMessageBox.warning(self, "数据滞后提示", warning_msg)
+                
                 # 获取对应的股票列表文件
                 pool_file = self._get_pool_file(code)
                 if pool_file:
                     file_path = self.get_data_path(pool_file)
                     if os.path.exists(file_path):
-                        # 读取文件中的股票
-                        with open(file_path, 'r', encoding='utf-8-sig') as f:  # 使用 utf-8-sig 编码处理BOM
-                            added_count = 0
-                            for line in f:
-                                if line.strip():
-                                    parts = line.strip().split(',')
-                                    if len(parts) >= 2:  # 确保有代码和名称
-                                        stock_code = parts[0].strip().replace('\ufeff', '')  # 移除BOM字符
-                                        stock_name = parts[1].strip()
-                                        
-                                        # 检查是否已存在
-                                        exists = False
-                                        for row in range(self.stock_list.rowCount()):
-                                            if self.stock_list.item(row, 0).text() == stock_code:
-                                                exists = True
-                                                break
-                                        
-                                        # 如果不存在则添加
-                                        if not exists:
-                                            row = self.stock_list.rowCount()
-                                            self.stock_list.insertRow(row)
-                                            self.stock_list.setItem(row, 0, QTableWidgetItem(stock_code))
-                                            self.stock_list.setItem(row, 1, QTableWidgetItem(stock_name))
-                                            added_count += 1
+                        rows = [
+                            (stock_code, stock_name)
+                            for stock_code, stock_name in self._read_stock_rows_from_file(file_path, require_name=True)
+                            if stock_code not in self.deleted_stocks
+                        ]
+                        added_count = self._append_stock_list_rows(rows)
                         
                         self.update_status(f"已添加{added_count}只股票")
                     else:
@@ -2925,20 +5262,12 @@ class KhQuantGUI(QMainWindow):
                         if pool_file:
                             file_path = self.get_data_path(pool_file)
                             if os.path.exists(file_path):
-                                with open(file_path, 'r', encoding='utf-8') as f:
-                                    for line in f:
-                                        if line.strip():
-                                            parts = line.strip().split(',')
-                                            if len(parts) >= 2:
-                                                stocks_to_keep.add((parts[0].strip(), parts[1].strip()))
+                                for stock_code, stock_name in self._read_stock_rows_from_file(file_path, require_name=True):
+                                    if stock_code not in self.deleted_stocks:
+                                        stocks_to_keep.add((stock_code, stock_name))
                 
                 # 清空并重新填充表格
-                self.stock_list.setRowCount(0)
-                for code, name in sorted(stocks_to_keep):
-                    row = self.stock_list.rowCount()
-                    self.stock_list.insertRow(row)
-                    self.stock_list.setItem(row, 0, QTableWidgetItem(code))
-                    self.stock_list.setItem(row, 1, QTableWidgetItem(name))
+                self._set_stock_list_rows(sorted(stocks_to_keep))
                 
                 self.update_status(f"更新后保留{len(stocks_to_keep)}只股票")
                 
@@ -2949,30 +5278,13 @@ class KhQuantGUI(QMainWindow):
 
     def _get_pool_file(self, code):
         """获取股票池对应的文件名"""
-        if code == "sh.000016":
-            return "上证50成分股_股票列表.csv"
-        elif code == "sh.000300":
-            return "沪深300成分股_股票列表.csv"
-        elif code == "sh.000905":
-            return "中证500成分股_股票列表.csv"
-        elif code == "sz.399006":
-            return "创业板_股票列表.csv"
-        elif code == "sh.000688":
-            return "科创板_股票列表.csv"
-        elif code == "all_a":
-            return "沪深A股_股票列表.csv"
-        elif code == "sci_tech":
-            return "科创板_股票列表.csv"
-        elif code == "sh_a":
-            return "上证A股_股票列表.csv"
-        elif code == "custom":
-            return "otheridx.csv"  # 添加自选清单文件
-        return None
+        definition = DESKTOP_CODE_INDEX.get(code)
+        return definition.aliases[0] if definition else None
 
     def open_custom_list(self):
         """打开自选清单文件"""
         try:
-            file_path = self.get_data_path("otheridx.csv")
+            file_path = get_custom_stock_pool_path(for_write=True)
             
             # 如果文件不存在，创建一个示例文件
             if not os.path.exists(file_path):
@@ -2995,16 +5307,28 @@ class KhQuantGUI(QMainWindow):
                     return
             
             if os.path.exists(file_path):
-                # 使用系统默认程序打开文件
-                if sys.platform == 'win32':
-                    os.startfile(file_path)
-                elif sys.platform == 'darwin':  # macOS
-                    subprocess.call(['open', file_path])
-                else:  # linux
-                    subprocess.call(['xdg-open', file_path])
-                self.update_status(f"已打开自选清单文件: {file_path}")
-            else:
-                self.update_status("找不到自选清单文件")
+                vscode_path = find_vscode_executable()
+                if vscode_path:
+                    try:
+                        subprocess.Popen(
+                            [vscode_path, '--goto', file_path],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        self.log_message(f"内置编辑器路径: {vscode_path}", "INFO")
+                        self.update_status(f"已用内置VSCode打开自选清单文件: {file_path}")
+                        return
+                    except Exception as open_error:
+                        self.log_message(f"内置VSCode打开失败: {str(open_error)}", "WARNING")
+                        QMessageBox.warning(self, "错误", f"内置VSCode打开失败: {str(open_error)}")
+                        return
+
+                warning_msg = "未找到与主界面编辑器按钮一致的VSCode，已取消打开自选清单"
+                self.log_message(warning_msg, "WARNING")
+                QMessageBox.warning(self, "提示", "未找到可用的VSCode，已取消打开自选清单文件。")
+                return
+
+            self.update_status("找不到自选清单文件")
                 
         except Exception as e:
             error_msg = f"打开自选清单文件时出错: {str(e)}"
@@ -3018,6 +5342,22 @@ class KhQuantGUI(QMainWindow):
 
     def update_fields_list(self, period):
         """更新字段列表"""
+        selected_before = set()
+        try:
+            selected_before = {
+                field for field, cb in self.fields_checkboxes.items() if cb.isChecked()
+            }
+        except Exception:
+            selected_before = set()
+
+        configured_fields = None
+        try:
+            data_fields = (getattr(self, "config", {}) or {}).get("data", {}).get("fields")
+            if isinstance(data_fields, list) and data_fields:
+                configured_fields = set(data_fields)
+        except Exception:
+            configured_fields = None
+
         # 清空现有的字段复选框
         for cb in self.fields_checkboxes.values():
             cb.setParent(None)
@@ -3031,7 +5371,12 @@ class KhQuantGUI(QMainWindow):
         col = 0
         for field_code, field_name in fields.items():
             cb = QCheckBox(field_name)  # 使用中文显示
-            cb.setChecked(True)  # 默认全选
+            if configured_fields is not None:
+                cb.setChecked(field_code in configured_fields)
+            elif selected_before:
+                cb.setChecked(field_code in selected_before)
+            else:
+                cb.setChecked(True)  # 默认全选
             
             self.fields_checkboxes[field_code] = cb  # 使用英文代码作为key
             self.fields_grid.addWidget(cb, row, col)
@@ -3059,8 +5404,12 @@ class KhQuantGUI(QMainWindow):
             # 自动滚动到顶部
             self.status_table.scrollToTop()
             
-            # 调整列宽以适应内容
-            self.status_table.resizeColumnsToContents()
+            # 列宽自适应较重，运行中高频状态更新时做节流
+            now_ts = time.time()
+            last_resize_ts = getattr(self, '_last_status_table_resize_ts', 0.0)
+            if self.status_table.rowCount() <= 3 or now_ts - last_resize_ts >= 1.0:
+                self.status_table.resizeColumnsToContents()
+                self._last_status_table_resize_ts = now_ts
             
         except Exception as e:
             print(f"更新状态表格时出错: {str(e)}")
@@ -3076,45 +5425,76 @@ class KhQuantGUI(QMainWindow):
 
 
 
+    def _apply_slippage_input_mode(self, slippage_type, *, save_current=True, log_change=True):
+        """切换滑点输入单位，同时保留离开单位的独立值。"""
+        normalized_type = "tick" if slippage_type == "tick" else "ratio"
+        cache = getattr(self, "_slippage_value_cache", None)
+        if not isinstance(cache, dict):
+            cache = dict(_SLIPPAGE_UI_DEFAULTS)
+            self._slippage_value_cache = cache
+
+        previous_type = getattr(self, "_active_slippage_type", None)
+        if save_current and previous_type in {"tick", "ratio"}:
+            cache[previous_type] = _normalize_slippage_ui_value(
+                previous_type,
+                self.slippage_value.text(),
+            )
+
+        if normalized_type == "tick":
+            self.slippage_value.setValidator(QIntValidator(0, 100))
+            self.slippage_value.setPlaceholderText("请输入跳数(0-100)")
+            self.slippage_value.setToolTip(
+                "0 表示不加跳；每跳按配置中的 tick_size 计算（默认0.01）"
+            )
+            log_text = "已切换到按最小变动价跳数模式，请输入整数跳数"
+        else:
+            self.slippage_value.setValidator(QDoubleValidator(0.0, 10.0, 4))
+            self.slippage_value.setPlaceholderText("请输入双边总滑点比例(0-10)%")
+            self.slippage_value.setToolTip(
+                "输入双边总滑点百分比；买入和卖出分别按该比例的一半调整成交价"
+            )
+            log_text = "已切换到按成交金额比例模式，请输入双边总滑点百分比"
+
+        cache[normalized_type] = _normalize_slippage_ui_value(
+            normalized_type,
+            cache.get(normalized_type),
+        )
+        self.slippage_value.setText(cache[normalized_type])
+        self._active_slippage_type = normalized_type
+        if log_change:
+            self.log_message(log_text, "INFO")
+
+    def _load_slippage_settings(self, slippage):
+        """从配置加载两套滑点值，并显示配置指定的单位。"""
+        normalized = _normalize_slippage_config(slippage)
+        slippage_type = normalized["type"]
+        self._slippage_tick_size = normalized["tick_size"]
+
+        # 两种单位分别加载、分别缓存。切换类型时只恢复该类型自己的值，
+        # 绝不能把“2 跳”的数字直接解释成“2%”。
+        cache = dict(_SLIPPAGE_UI_DEFAULTS)
+        cache["tick"] = _normalize_slippage_ui_value(
+            "tick", normalized["tick_count"]
+        )
+        ratio_percent = normalized["ratio"] * 100
+        cache["ratio"] = _normalize_slippage_ui_value("ratio", ratio_percent)
+        self._slippage_value_cache = cache
+
+        self.slippage_type.blockSignals(True)
+        self.slippage_type.setCurrentText(_SLIPPAGE_TYPE_TO_LABEL[slippage_type])
+        self.slippage_type.blockSignals(False)
+        self._apply_slippage_input_mode(
+            slippage_type,
+            save_current=False,
+            log_change=False,
+        )
+        return normalized
+
     def slippage_type_changed(self, text):
-        """滑点类型变更时的处理"""
+        """滑点类型变更时恢复该单位上次使用的值。"""
         try:
-            # 清空当前滑点值
-            current_value = self.slippage_value.text()
-            
-            if text == "按最小变动价跳数":
-                # 如果切换到跳数模式，设置默认值为2跳
-                # 如果当前有比例值，尝试转换为整数跳数
-                if current_value and (not current_value.isdigit() or float(current_value) < 1):
-                    self.slippage_value.setText("2")  # 默认值
-                
-                # 设置整数输入验证器
-                self.slippage_value.setValidator(QIntValidator(1, 100))
-                
-                # 设置提示文本
-                self.slippage_value.setPlaceholderText("请输入跳数(1-100)")
-                self.log_message("已切换到按最小变动价跳数模式，请输入整数跳数", "INFO")
-                
-            else:  # "按成交金额比例"
-                # 如果切换到比例模式，设置默认比例为0.1%
-                # 如果当前有整数跳数，尝试保留数值
-                if current_value and current_value.isdigit() and int(current_value) > 0:
-                    # 如果是较大的数值，可能需要缩小到合理范围
-                    if int(current_value) > 20:
-                        self.slippage_value.setText("0.1")  # 默认值
-                    else:
-                        # 否则可以保留数值作为百分比值
-                        self.slippage_value.setText(current_value)
-                elif not current_value or current_value == "0" or current_value == "0.0":
-                    self.slippage_value.setText("0.1")  # 默认值
-                
-                # 设置浮点数输入验证器，限制在0-10之间，2位小数
-                self.slippage_value.setValidator(QDoubleValidator(0.0, 10.0, 2))
-                
-                # 设置提示文本
-                self.slippage_value.setPlaceholderText("请输入比例(0-10)%")
-                self.log_message("已切换到按成交金额比例模式，请输入百分比值", "INFO")
-                
+            slippage_type = _SLIPPAGE_LABEL_TO_TYPE.get(text, "ratio")
+            self._apply_slippage_input_mode(slippage_type)
         except Exception as e:
             self.log_message(f"滑点类型变更处理出错: {str(e)}", "ERROR")
 
@@ -3186,11 +5566,7 @@ class KhQuantGUI(QMainWindow):
                         progress_value = int(float(progress_matches[0]))
                         # 确保值在有效范围内
                         if 0 <= progress_value <= 100:
-                            # 发射进度信号
-                            self.progress_signal.emit(progress_value)
-                            # 确保进度条可见
-                            if self.get_run_mode() == "backtest" and not self.progress_container.isVisible():
-                                self.progress_container.show()
+                            self.update_progress_bar(progress_value)
                     # 直接返回，不将进度消息添加到日志
                     return
                 except (IndexError, ValueError):
@@ -3207,6 +5583,14 @@ class KhQuantGUI(QMainWindow):
             
             # 获取颜色
             color = color_map.get(level, "#e8e8e8")
+            
+            # Map dark colors to light colors if macos light theme is active
+            import sys
+            if sys.platform == 'darwin':
+                if color == '#e8e8e8': color = '#333333'  # White -> Dark Gray
+                elif color == '#FFA500': color = '#d35400' # Orange -> Darker Orange
+                elif color == '#FF0000': color = '#cc0000' # Red -> Darker Red
+                elif color == '#BB8FCE': color = '#8e44ad' # Light Purple -> Dark Purple
             
             # 格式化日志消息
             formatted_message = f'<span style="color: {color}">[{current_time}] [{level}] {message}</span><br>'
@@ -3278,17 +5662,7 @@ class KhQuantGUI(QMainWindow):
                 
                 # 检查是否应该显示这条日志（根据过滤器设置）
                 if hasattr(self, 'log_filters') and level in self.log_filters and self.log_filters[level].isChecked():
-                    # 添加到文本框
-                    self.log_text.moveCursor(self.log_text.textCursor().End)
-                    self.log_text.insertHtml(formatted_message)
-
-                    # 检查并限制日志行数
-                    self._trim_log_lines()
-
-                    # 滚动到底部
-                    self.log_text.verticalScrollBar().setValue(
-                        self.log_text.verticalScrollBar().maximum()
-                    )
+                    self._queue_log_display(formatted_message)
             else:
                 # 即使是被跳过的系统日志，如果启用了延迟显示模式且策略正在运行，也要保存
                 if hasattr(self, 'delay_log_display') and self.delay_log_display and hasattr(self, 'strategy_is_running') and self.strategy_is_running:
@@ -3304,6 +5678,56 @@ class KhQuantGUI(QMainWindow):
             print(f"记录日志时出错: {str(e)}")
             import traceback
             print(traceback.format_exc())
+
+    def _queue_log_display(self, formatted_message):
+        """将日志HTML加入UI批量刷新队列，避免高频日志逐条重绘。"""
+        try:
+            if not hasattr(self, '_pending_log_html'):
+                self._pending_log_html = []
+            self._pending_log_html.append(formatted_message)
+
+            if not getattr(self, '_log_flush_scheduled', False):
+                self._log_flush_scheduled = True
+                interval = getattr(self, '_log_display_interval_ms', 50)
+                QTimer.singleShot(interval, self._flush_pending_log_display)
+        except Exception as e:
+            print(f"加入日志刷新队列时出错: {str(e)}")
+
+    def _flush_pending_log_display(self):
+        """批量刷新待显示日志，降低QTextEdit重排次数。"""
+        try:
+            self._log_flush_scheduled = False
+            if not hasattr(self, 'log_text') or not getattr(self, '_pending_log_html', None):
+                return
+
+            batch_size = getattr(self, '_log_display_batch_size', 200)
+            pending = self._pending_log_html
+            batch = pending[:batch_size]
+            del pending[:batch_size]
+
+            if batch:
+                self.log_text.setUpdatesEnabled(False)
+                cursor = self.log_text.textCursor()
+                cursor.movePosition(QTextCursor.End)
+                cursor.insertHtml(''.join(batch))
+                self.log_text.setTextCursor(cursor)
+                self._trim_log_lines()
+                self.log_text.verticalScrollBar().setValue(
+                    self.log_text.verticalScrollBar().maximum()
+                )
+                self.log_text.setUpdatesEnabled(True)
+
+            if pending:
+                self._log_flush_scheduled = True
+                interval = getattr(self, '_log_display_interval_ms', 50)
+                QTimer.singleShot(interval, self._flush_pending_log_display)
+        except Exception as e:
+            try:
+                if hasattr(self, 'log_text'):
+                    self.log_text.setUpdatesEnabled(True)
+            except Exception:
+                pass
+            print(f"批量刷新日志时出错: {str(e)}")
 
     def _trim_log_lines(self):
         """限制日志显示行数，删除最旧的日志行（批量处理以提高性能）"""
@@ -3353,6 +5777,9 @@ class KhQuantGUI(QMainWindow):
 
     def clear_log(self):
         """清空日志"""
+        if hasattr(self, '_pending_log_html'):
+            self._pending_log_html.clear()
+        self._log_flush_scheduled = False
         self.log_text.clear()
         self.log_entries = []
         self.log_message("日志已清空", "INFO")
@@ -3381,9 +5808,33 @@ class KhQuantGUI(QMainWindow):
         except Exception as e:
             self.log_message(f"保存日志失败: {str(e)}", "ERROR")
 
+    def apply_dark_titlebar(self, widget):
+        if sys.platform == 'win32':
+            try:
+                from ctypes import windll, c_int, byref, sizeof
+                from ctypes.wintypes import DWORD
+                DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                DWMWA_CAPTION_COLOR = 35
+                windll.dwmapi.DwmSetWindowAttribute(
+                    int(widget.winId()),
+                    DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    byref(c_int(2)),
+                    sizeof(c_int)
+                )
+                caption_color = DWORD(0x333333)
+                windll.dwmapi.DwmSetWindowAttribute(
+                    int(widget.winId()),
+                    DWMWA_CAPTION_COLOR,
+                    byref(caption_color),
+                    sizeof(caption_color)
+                )
+            except Exception:
+                pass
+
     def show_error_dialog(self, title, message, details=None):
         """显示错误弹窗"""
         msg_box = QMessageBox(self)
+        self.apply_dark_titlebar(msg_box)
         msg_box.setIcon(QMessageBox.Critical)
         msg_box.setWindowTitle(title)
         msg_box.setText(message)
@@ -3420,8 +5871,415 @@ class KhQuantGUI(QMainWindow):
                 border: 1px solid #404040;
             }
         """)
-        
+
         msg_box.exec_()
+
+    def _check_data_integrity_before_backtest(self, runtime_config=None) -> bool:
+        """
+        在回测开始前检查股票池数据的完整性（使用后台线程和进度对话框）
+        注意：仅在DuckDB数据源模式下执行检查，miniQMT模式不支持数据完整性检查
+
+        Returns:
+            bool: True表示数据完整或用户选择继续，False表示用户取消回测
+        """
+        try:
+            cfg = runtime_config or getattr(self, "_current_runtime_config", None) or self.config
+            # 检查数据源类型，只在DuckDB模式下检查
+            data_source = self.settings.value('backtest_data_source', 'duckdb')
+            if data_source != 'duckdb':
+                self.log_message(f"当前使用非DuckDB数据源（{data_source}），跳过本地数据库完整性检查", "INFO")
+                return True
+
+            # 检查是否启用数据完整性检查
+            check_enabled = self.settings.value('check_data_integrity', True, type=bool)
+            if not check_enabled:
+                self.log_message("数据完整性检查已禁用（可在设置中启用）", "INFO")
+                return True
+
+            import khQTTools
+
+            # 获取股票池
+            stock_list = cfg.get("data", {}).get("stock_list", [])
+            if not stock_list:
+                self.log_message("股票池为空，跳过数据完整性检查", "WARNING")
+                return True
+
+            # 获取数据周期
+            period = cfg.get("data", {}).get("kline_period", "1d")
+            periods = [period]  # 只检查当前选择的周期
+
+            # 准备检查列表和各股票对应的周期
+            check_list = stock_list.copy()
+            stock_periods = {stock: periods for stock in stock_list}
+
+            # 获取基准合约
+            benchmark = cfg.get("backtest", {}).get("benchmark", "")
+            if benchmark:
+                # 标准化基准合约代码
+                benchmark = khQTTools.normalize_stock_code(benchmark)
+                # 将基准合约加入检查列表（如果不在股票池中）
+                if benchmark not in check_list:
+                    check_list.append(benchmark)
+                    self.log_message(f"基准合约 {benchmark} 将被加入数据完整性检查", "INFO")
+                    stock_periods[benchmark] = ['1d']
+                else:
+                    # 如果基准合约同时也是交易标的，它既需要检查交易周期，也需要检查日线
+                    if '1d' not in stock_periods[benchmark]:
+                        stock_periods[benchmark] = stock_periods[benchmark] + ['1d']
+            else:
+                self.log_message("未设置基准合约", "WARNING")
+
+            # 获取回测时间范围
+            start_date = cfg.get("backtest", {}).get("start_time", "")
+            end_date = cfg.get("backtest", {}).get("end_time", "")
+            if not start_date or not end_date:
+                self.log_message("回测时间范围未设置，跳过数据完整性检查", "WARNING")
+                return True
+
+            check_mode = self.settings.value('check_data_integrity_mode', 'auto')
+            decision = should_run_integrity_check(
+                mode=check_mode,
+                legacy_enabled=check_enabled,
+                stock_count=len(check_list),
+                period=period,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            if not decision.should_run:
+                if decision.reason == "disabled":
+                    self.log_message("数据完整性检查已禁用（可在设置中启用）", "INFO")
+                else:
+                    days_text = (
+                        f"{decision.estimated_trading_days} 个交易日"
+                        if decision.estimated_trading_days is not None else "未知交易日数"
+                    )
+                    bars_text = (
+                        f"，估算约 {decision.estimated_bars:,} 条待扫描K线"
+                        if decision.estimated_bars is not None else ""
+                    )
+                    self.log_message(
+                        "数据完整性检查采用自动模式：检测到大规模回测 "
+                        f"({decision.stock_count} 只股票，周期 {decision.period or period}，{days_text}{bars_text})，"
+                        "已跳过 GUI 前置全量扫描；回测过程中仍会汇总提示空数据/缺历史数据。",
+                        "INFO",
+                    )
+                return True
+
+            # 获取DuckDB数据路径
+            duckdb_data_path = self.settings.value('duckdb_data_path', '')
+            if not duckdb_data_path or not os.path.exists(duckdb_data_path):
+                self.log_message("DuckDB数据路径未设置或不存在，跳过数据完整性检查", "WARNING")
+                return True
+
+            self.log_message(f"正在检查 {len(check_list)} 只股票的数据完整性（含基准合约）...", "INFO")
+
+            # 创建进度对话框
+            progress_dialog = QProgressDialog(
+                "正在检查数据完整性...\n"
+                "注意：仅检查股票池在回测时间段和周期的数据完整性\n"
+                "策略若需更早历史数据（如均线计算），请自行确认",
+                "取消",
+                0,
+                len(check_list),
+                self
+            )
+            progress_dialog.setWindowTitle("数据完整性检查")
+            progress_dialog.setWindowModality(Qt.ApplicationModal)
+            progress_dialog.setMinimumDuration(0)  # 立即显示
+            progress_dialog.setAutoClose(False)
+            progress_dialog.setAutoReset(False)
+
+            # 创建检查线程
+            self.integrity_check_thread = IntegrityCheckThread(
+                stock_list=check_list,
+                periods=periods,
+                start_date=start_date,
+                end_date=end_date,
+                duckdb_data_path=duckdb_data_path,
+                stock_periods=stock_periods,
+                dividend_type=cfg.get("data", {}).get("dividend_type", "none")
+            )
+
+            # 用于存储检查结果
+            check_result = {'completed': False, 'result': None, 'error': None}
+            last_integrity_progress = {'ts': 0.0, 'current': -1}
+
+            # 连接进度信号
+            def update_progress(current, total, message, task_count):
+                now_ts = time.time()
+                should_update = (
+                    current >= total
+                    or current != last_integrity_progress['current']
+                    and now_ts - last_integrity_progress['ts'] >= 0.1
+                )
+                if not should_update:
+                    return
+
+                last_integrity_progress['ts'] = now_ts
+                last_integrity_progress['current'] = current
+                progress_dialog.setMaximum(total)
+                progress_dialog.setValue(current)
+                progress_dialog.setLabelText(
+                    f"{message}\n"
+                    f"已发现 {task_count} 处缺失数据\n"
+                    f"（提示：可在设置中关闭数据完整性检查）"
+                )
+
+            self.integrity_check_thread.progress_signal.connect(update_progress)
+
+            # 连接完成信号
+            def on_check_finished(result):
+                check_result['completed'] = True
+                check_result['result'] = result
+                progress_dialog.close()
+
+            self.integrity_check_thread.finished_signal.connect(on_check_finished)
+
+            # 连接错误信号
+            def on_check_error(error_msg):
+                check_result['completed'] = True
+                check_result['error'] = error_msg
+                progress_dialog.close()
+
+            self.integrity_check_thread.error_signal.connect(on_check_error)
+
+            # 连接取消按钮
+            def on_cancel():
+                self.integrity_check_thread.stop()
+                progress_dialog.setLabelText("正在取消检查...")
+
+            progress_dialog.canceled.connect(on_cancel)
+
+            # 如果数据管理窗口(DuckDBViewer)已打开，要求其释放连接池以免扫描时抛出锁冲突异常
+            if hasattr(self, 'duckdb_viewer_window') and self.duckdb_viewer_window:
+                if hasattr(self.duckdb_viewer_window, 'manager') and self.duckdb_viewer_window.manager:
+                    mgr = self.duckdb_viewer_window.manager
+                    if hasattr(mgr, 'close_all_no_checkpoint'):
+                        mgr.close_all_no_checkpoint()
+                    elif hasattr(mgr, 'close_all'):
+                        mgr.close_all()
+
+            # 启动线程
+            self.integrity_check_thread.start()
+
+            # 显示进度对话框（阻塞等待）
+            progress_dialog.exec_()
+
+            # 处理错误
+            if check_result.get('error'):
+                self.log_message(f"数据完整性检查时发生异常: {check_result['error']}", "WARNING")
+                return True  # 发生异常时仍允许继续
+
+            # 处理取消
+            if not check_result['completed']:
+                if getattr(self, 'integrity_check_thread', None) is not None and self.integrity_check_thread.isRunning():
+                    self.integrity_check_thread.stop()
+                self.log_message("数据完整性检查被用户取消", "INFO")
+                return False
+
+            result = check_result.get('result')
+            if not result:
+                return False
+
+            # 分析结果
+            missing_tasks = result.get('missing_tasks', [])
+
+            if not missing_tasks:
+                self.log_message("数据完整性检查通过，所有股票数据完整", "INFO")
+                return True
+
+            # 统计缺失情况
+            missing_stocks = set()
+            benchmark_missing = False
+            total_missing_days = 0
+            for task in missing_tasks:
+                stock_code = task['stock']
+                missing_stocks.add(stock_code)
+                total_missing_days += task.get('missing_days', 1)
+                # 检查是否为基准合约
+                if benchmark and stock_code == benchmark:
+                    benchmark_missing = True
+
+            # 构建提示信息
+            msg_lines = []
+
+            # 特别提示基准合约缺失
+            if benchmark_missing:
+                msg_lines.extend([
+                    "⚠️ 警告：基准合约数据缺失！",
+                    f"基准合约 {benchmark} 的 {period} 周期数据不完整",
+                    "这将严重影响回测收益率计算和基准对比",
+                    ""
+                ])
+
+            msg_lines.extend([
+                f"检测到 {len(missing_stocks)} 只股票的 {period} 周期数据不完整",
+                f"共缺失约 {total_missing_days} 个交易日的数据",
+                "",
+                f"时间范围: {start_date[:4]}-{start_date[4:6]}-{start_date[6:]} ~ {end_date[:4]}-{end_date[4:6]}-{end_date[6:]}",
+                "",
+                "缺失数据明细已在下方列表展示",
+                "",
+                "建议：",
+                "1. 打开「数据管理模块」补充缺失数据",
+                "2. 或者缩小回测时间范围",
+                "",
+                "是否仍要继续回测？（可能导致回测结果不准确）"
+            ])
+
+            self.log_message(f"数据完整性检查发现 {len(missing_stocks)} 只股票数据不完整", "WARNING")
+
+            detail_text = ""
+            try:
+                from collections import defaultdict
+
+                stock_tasks_map = defaultdict(list)
+                for task in missing_tasks:
+                    stock_tasks_map[task.get('stock', '')].append(task)
+
+                detail_lines = []
+                for idx, stock in enumerate(sorted(stock_tasks_map.keys())):
+                    tasks_for_stock = stock_tasks_map[stock]
+                    # 股票名称
+                    try:
+                        stock_name = khQTTools.get_stock_name(stock)
+                        header = f"{idx + 1}. {stock} ({stock_name})"
+                    except Exception:
+                        header = f"{idx + 1}. {stock}"
+                    detail_lines.append(header)
+
+                    # 该股票各周期、各缺失区间
+                    def _fmt_date(d):
+                        if isinstance(d, str) and len(d) == 8 and d.isdigit():
+                            return f"{d[:4]}-{d[4:6]}-{d[6:]}"
+                        return str(d)
+
+                    for t in sorted(
+                        tasks_for_stock,
+                        key=lambda x: (x.get('period', ''), x.get('start', '')),
+                    ):
+                        p = t.get('period', period)
+                        s = t.get('start')
+                        e = t.get('end')
+                        cnt = int(t.get('missing_days', 1))
+                        s_txt = _fmt_date(s)
+                        e_txt = _fmt_date(e)
+
+                        if s and e and s != e:
+                            line = f"    - 周期 {p}: {s_txt} ~ {e_txt}，缺失 {cnt} 个交易日"
+                        else:
+                            line = f"    - 周期 {p}: {s_txt}，缺失 {cnt} 个交易日"
+                        detail_lines.append(line)
+
+                    detail_lines.append("")  # 股票之间空一行
+
+                detail_text = "\n".join(detail_lines).strip()
+            except Exception:
+                pass
+            dialog = QDialog(self)
+            dialog.setWindowTitle("数据完整性检查")
+            dialog.setWindowModality(Qt.ApplicationModal)
+            dialog.setMinimumWidth(680)
+            if sys.platform == 'win32':
+                try:
+                    from ctypes import windll, c_int, byref, sizeof
+                    from ctypes.wintypes import DWORD
+                    DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                    DWMWA_CAPTION_COLOR = 35
+                    windll.dwmapi.DwmSetWindowAttribute(
+                        int(dialog.winId()),
+                        DWMWA_USE_IMMERSIVE_DARK_MODE,
+                        byref(c_int(2)),
+                        sizeof(c_int)
+                    )
+                    caption_color = DWORD(0x333333)
+                    windll.dwmapi.DwmSetWindowAttribute(
+                        int(dialog.winId()),
+                        DWMWA_CAPTION_COLOR,
+                        byref(caption_color),
+                        sizeof(caption_color)
+                    )
+                except Exception:
+                    pass
+
+            dialog_layout = QVBoxLayout(dialog)
+            summary_label = QLabel("\n".join(msg_lines))
+            summary_label.setWordWrap(True)
+            dialog_layout.addWidget(summary_label)
+
+            detail_label = QLabel("缺失数据明细列表")
+            dialog_layout.addWidget(detail_label)
+
+            detail_box = QTextEdit()
+            detail_box.setReadOnly(True)
+            detail_box.setText(detail_text if detail_text else "无")
+            detail_box.setFixedHeight(260)
+            dialog_layout.addWidget(detail_box)
+
+            button_layout = QHBoxLayout()
+            open_data_button = QPushButton("打开数据管理")
+            cancel_button = QPushButton("取消")
+            continue_button = QPushButton("继续回测")
+            button_layout.addWidget(open_data_button)
+            button_layout.addStretch()
+            button_layout.addWidget(cancel_button)
+            button_layout.addWidget(continue_button)
+            dialog_layout.addLayout(button_layout)
+
+            result = {"action": None}
+
+            def on_open_data():
+                result["action"] = "open_data"
+                dialog.reject()
+
+            def on_cancel():
+                result["action"] = "cancel"
+                dialog.reject()
+
+            def on_continue():
+                result["action"] = "continue"
+                dialog.accept()
+
+            open_data_button.clicked.connect(on_open_data)
+            cancel_button.clicked.connect(on_cancel)
+            continue_button.clicked.connect(on_continue)
+            cancel_button.setDefault(True)
+
+            dialog.exec_()
+
+            if result["action"] == "open_data":
+                self._open_data_manager_for_supplement()
+                return False
+            if result["action"] == "continue":
+                self.log_message("用户选择继续回测（数据可能不完整）", "WARNING")
+                return True
+            return False
+
+        except Exception as e:
+            self.log_message(f"数据完整性检查时发生异常: {str(e)}", "WARNING")
+            import traceback
+            traceback.print_exc()
+            return True  # 出错时默认允许继续
+
+    def _open_data_manager_for_supplement(self):
+        """打开数据管理模块用于数据补充"""
+        try:
+            duckdb_data_path = self._ensure_duckdb_data_path()
+            if not duckdb_data_path:
+                QMessageBox.warning(self, "错误", "未设置DuckDB数据路径，请先在设置中配置")
+                return
+
+            from duckdb_storage.viewer import DuckDBViewer
+            history_source = self.settings.value('history_import_source', None)
+            self.data_viewer = DuckDBViewer(
+                data_root=duckdb_data_path,
+                read_only=False,
+                history_import_source=history_source,
+            )
+            self.data_viewer.show()
+            self.log_message("已打开数据管理模块", "INFO")
+        except Exception as e:
+            self.log_message(f"打开数据管理模块失败: {str(e)}", "ERROR")
 
     def on_strategy_error(self, error_msg, error):
         """策略错误处理"""
@@ -3449,9 +6307,14 @@ class KhQuantGUI(QMainWindow):
                     QTimer.singleShot(200, self.display_delayed_logs)
                 
                 # 清理临时配置文件
-                if hasattr(self, 'temp_config_path') and os.path.exists(self.temp_config_path):
+                temp_paths = [getattr(self, 'temp_config_path', None)]
+                if hasattr(self, 'strategy_thread') and self.strategy_thread:
+                    temp_paths.extend(getattr(self.strategy_thread, 'temp_config_paths', []) or [])
+                for temp_path in dict.fromkeys([p for p in temp_paths if p]):
+                    if not os.path.exists(temp_path):
+                        continue
                     try:
-                        os.remove(self.temp_config_path)
+                        os.remove(temp_path)
                     except Exception as e:
                         self.log_message(f"清理临时配置文件失败: {str(e)}", "WARNING")
             
@@ -3488,8 +6351,12 @@ class KhQuantGUI(QMainWindow):
             # 自动滚动到顶部
             self.status_table.scrollToTop()
             
-            # 调整列宽以适应内容
-            self.status_table.resizeColumnsToContents()
+            # 列宽自适应会扫描表格内容，高频状态更新时做节流
+            now_ts = time.time()
+            last_resize_ts = getattr(self, '_last_status_table_resize_ts', 0.0)
+            if self.status_table.rowCount() <= 3 or now_ts - last_resize_ts >= 1.0:
+                self.status_table.resizeColumnsToContents()
+                self._last_status_table_resize_ts = now_ts
             
         except Exception as e:
             print(f"更新状态表格时出错: {str(e)}")
@@ -3571,26 +6438,49 @@ class KhQuantGUI(QMainWindow):
             from backtest_result_window import BacktestResultWindow
             # 记录最近的回测目录
             self.last_backtest_dir = backtest_dir
+            old_window = getattr(self, 'result_window', None)
+            if old_window is not None:
+                try:
+                    old_window.close()
+                except RuntimeError:
+                    pass
             # 确保窗口在主线程创建
             self.result_window = BacktestResultWindow(backtest_dir)
+            result_window = self.result_window
+            result_window.destroyed.connect(
+                lambda _obj=None, target=result_window: self._forget_result_window(target)
+            )
             
             # 先显示窗口，让Qt完成窗口的初始化
             self.result_window.show()
-            # 强制处理事件队列，确保窗口完全初始化
-            QApplication.processEvents()
-            
-            # 获取屏幕和窗口的实际大小，然后居中
-            screen = QDesktopWidget().availableGeometry()
-            window_geometry = self.result_window.frameGeometry()
-            x = (screen.width() - window_geometry.width()) // 2
-            y = (screen.height() - window_geometry.height()) // 2
-            self.result_window.move(x, y)
+            QTimer.singleShot(0, lambda window=self.result_window: self._center_backtest_result_window(window))
             
             self.log_message("回测结果窗口已打开", "INFO")
         except Exception as e:
             self.log_message(f"显示回测结果窗口时出错: {str(e)}", "ERROR")
             import traceback
             self.log_message(traceback.format_exc(), "ERROR")
+
+    def _forget_result_window(self, window):
+        """只清除与销毁信号对应的结果窗口，避免旧窗口误清新引用。"""
+        if getattr(self, 'result_window', None) is window:
+            self.result_window = None
+
+    def _center_backtest_result_window(self, window):
+        """在下一轮事件里居中结果窗口，避免手动processEvents造成重入。"""
+        try:
+            if window is None or not window.isVisible():
+                return
+            if window.isMaximized() or window.windowState() & Qt.WindowMaximized:
+                return
+
+            screen = QDesktopWidget().availableGeometry()
+            window_geometry = window.frameGeometry()
+            x = screen.x() + (screen.width() - window_geometry.width()) // 2
+            y = screen.y() + (screen.height() - window_geometry.height()) // 2
+            window.move(x, y)
+        except Exception as e:
+            self.log_message(f"居中回测结果窗口时出错: {str(e)}", "WARNING")
 
     def open_backtest_result(self):
         """重新打开回测指标窗口"""
@@ -3628,6 +6518,9 @@ class KhQuantGUI(QMainWindow):
             self.full_quote_radio.hide()
             self.single_quote_radio.hide()
             self.custom_data_label.show()
+        show_daily_trigger_cap = (index == 3)
+        self.daily_trigger_cap_widget.setVisible(show_daily_trigger_cap)
+        self.daily_trigger_cap_spin.setEnabled(show_daily_trigger_cap)
         
         # 检查是否需要启用实盘数据获取模块
         self.update_realtime_data_group_status()
@@ -3742,22 +6635,28 @@ class KhQuantGUI(QMainWindow):
         
     def get_slippage_settings(self):
         """获取滑点设置"""
-        slippage_type = "tick" if self.slippage_type.currentText() == "按最小变动价跳数" else "ratio"
-        
-        if slippage_type == "tick":
-            return {
-                "type": "tick",
-                "tick_size": 0.01,  # A股最小变动价（1分钱）
-                "tick_count": int(float(self.slippage_value.text())),
-                "ratio": 0.001
-            }
-        else:
-            return {
-                "type": "ratio",
-                "tick_size": 0.01,
-                "tick_count": 2,
-                "ratio": float(self.slippage_value.text()) / 100  # 转换为小数
-            }
+        slippage_type = _SLIPPAGE_LABEL_TO_TYPE.get(
+            self.slippage_type.currentText(),
+            "ratio",
+        )
+        cache = getattr(self, "_slippage_value_cache", dict(_SLIPPAGE_UI_DEFAULTS))
+        cache[slippage_type] = _normalize_slippage_ui_value(
+            slippage_type,
+            self.slippage_value.text(),
+        )
+        cache["tick"] = _normalize_slippage_ui_value("tick", cache.get("tick"))
+        cache["ratio"] = _normalize_slippage_ui_value("ratio", cache.get("ratio"))
+        self._slippage_value_cache = cache
+        self.slippage_value.setText(cache[slippage_type])
+        normalized = _normalize_slippage_config({
+            "type": slippage_type,
+            "tick_size": getattr(self, "_slippage_tick_size", 0.01),
+            "tick_count": int(cache["tick"]),
+            # 配置保存小数；界面显示百分比。该值是双边总滑点，成交时单边取一半。
+            "ratio": float(cache["ratio"]) / 100,
+        })
+        self._slippage_tick_size = normalized["tick_size"]
+        return normalized
     
     def get_dividend_type(self):
         """获取复权类型"""
@@ -3781,6 +6680,7 @@ class KhQuantGUI(QMainWindow):
     def get_stock_list(self):
         """获取当前股票列表"""
         stock_codes = []
+        seen_codes = set()
         
         # 添加选中的常用股票池中的股票代码
         for code, cb in self.pool_checkboxes.items():
@@ -3789,19 +6689,17 @@ class KhQuantGUI(QMainWindow):
                 if pool_file:
                     file_path = self.get_data_path(pool_file)
                     if os.path.exists(file_path):
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            for line in f:
-                                if line.strip():
-                                    parts = line.strip().split(',')
-                                    if len(parts) >= 1:
-                                        stock_code = parts[0].strip().replace('\ufeff', '')
-                                        if stock_code not in stock_codes:
-                                            stock_codes.append(stock_code)
+                        for stock_code, _ in self._read_stock_rows_from_file(file_path):
+                            if stock_code not in seen_codes:
+                                seen_codes.add(stock_code)
+                                stock_codes.append(stock_code)
         
         # 添加自定义股票列表中的股票代码
         for row in range(self.stock_list.rowCount()):
-            code = self.stock_list.item(row, 0).text()
-            if code and code not in stock_codes:
+            item = self.stock_list.item(row, 0)
+            code = item.text().strip() if item else ""
+            if code and code not in seen_codes:
+                seen_codes.add(code)
                 stock_codes.append(code)
                 
         return stock_codes
@@ -3823,20 +6721,25 @@ class KhQuantGUI(QMainWindow):
             return
             
         # 清空当前显示
-        self.stock_list.setRowCount(0)
         for cb in self.pool_checkboxes.values():
-            cb.setChecked(False)
+            was_blocked = cb.blockSignals(True)
+            try:
+                cb.setChecked(False)
+            finally:
+                cb.blockSignals(was_blocked)
             
-        # 获取股票名称
-        from khQTTools import get_stock_names
-        stock_names = get_stock_names(stock_list, self.get_data_path("全部股票_股票列表.csv"))
+        # 从股票、ETF、LOF/场内基金的统一本地清单获取名称。
+        stock_names = dict(self._load_all_stock_entries())
         
         # 添加到表格中
+        rows = []
+        seen_codes = set()
         for code in stock_list:
-            row = self.stock_list.rowCount()
-            self.stock_list.insertRow(row)
-            self.stock_list.setItem(row, 0, QTableWidgetItem(code))
-            self.stock_list.setItem(row, 1, QTableWidgetItem(stock_names.get(code, "--")))
+            if not code or code in seen_codes:
+                continue
+            seen_codes.add(code)
+            rows.append((code, stock_names.get(code, "--")))
+        self._set_stock_list_rows(rows)
 
     def update_realtime_data_group_status(self):
         """更新实盘数据获取模块的显示和启用状态（固定隐藏）"""
@@ -3849,7 +6752,7 @@ class KhQuantGUI(QMainWindow):
         trigger_type = self.trigger_type_combo.currentIndex()
         
         # 对于自定义定时触发，返回None或特殊值
-        if trigger_type == 3:
+        if trigger_type == 4:
             return "custom"
             
         # 对于其他触发方式，检查单选按钮状态
@@ -3871,6 +6774,10 @@ class KhQuantGUI(QMainWindow):
 
     def refresh_log_display(self):
         """根据过滤设置重新显示日志"""
+        if hasattr(self, '_pending_log_html'):
+            self._pending_log_html.clear()
+        self._log_flush_scheduled = False
+
         # 清空当前显示
         self.log_text.clear()
         
@@ -3889,44 +6796,83 @@ class KhQuantGUI(QMainWindow):
     def show_settings(self):
         """显示设置对话框"""
         try:
+            # 保存修改前的DuckDB路径
+            old_duckdb_path = self.settings.value('duckdb_data_path', '')
+
             # 创建并显示设置对话框
             settings_dialog = SettingsDialog(self)
             result = settings_dialog.exec_()
-            
+
             # 如果用户点击了保存按钮，更新延迟显示设置并强制更新配置
             if result == QDialog.Accepted:
                 self.update_delay_log_setting()
 
                 # 更新最大日志行数设置
                 self.max_log_lines = self.settings.value('max_log_lines', 1000, type=int)
+                self.log_message(f"设置已更新 - 最大日志行数: {self.max_log_lines}", "INFO")
 
-                # 记录设置变更日志 - init_data_enabled只存在于QSettings中
-                init_data_enabled = self.settings.value('init_data_enabled', False, type=bool)
-                self.log_message(f"设置已更新 - 数据初始化: {'启用' if init_data_enabled else '禁用'}, 最大日志行数: {self.max_log_lines}", "INFO")
-            
+                # 应用界面字号倍率（仅在倍率发生变化时才重新应用，避免不必要的样式重刷导致视觉跳变）
+                scale = get_ui_font_scale(self.settings)
+                old_scale = getattr(self, 'font_scale', None)
+                if old_scale != scale:
+                    apply_app_font(scale)
+                    self.apply_ui_scale(scale)
+                    try:
+                        app = QApplication.instance()
+                        if app:
+                            for widget in app.topLevelWidgets():
+                                if widget is self:
+                                    continue
+                                if hasattr(widget, "apply_ui_scale"):
+                                    widget.apply_ui_scale(scale)
+                    except Exception as e:
+                        logging.warning(f"应用界面字号倍率时出错: {e}")
+
+                # 检查DuckDB路径是否改变
+                new_duckdb_path = self.settings.value('duckdb_data_path', '')
+                if old_duckdb_path != new_duckdb_path:
+                    self.log_message(f"DuckDB数据路径已更新: {new_duckdb_path}", "INFO")
+
+                    # 如果DuckDB Viewer窗口已打开，关闭它
+                    if hasattr(self, 'duckdb_viewer_window') and self.duckdb_viewer_window:
+                        try:
+                            self.log_message("检测到DuckDB数据路径改变，关闭当前DuckDB Viewer窗口", "INFO")
+                            if self.duckdb_viewer_window.close():
+                                self.log_message("请重新点击【DuckDB数据管理】按钮以使用新路径", "INFO")
+                            else:
+                                self.log_message(
+                                    "数据管理窗口仍有任务或用户取消关闭；窗口安全关闭后再按新路径重新打开",
+                                    "WARNING",
+                                )
+                        except Exception as e:
+                            logging.warning(f"关闭DuckDB Viewer窗口时出错: {e}")
+
+                # 更新工具栏数据管理按钮可见性（根据数据源设置）
+                self.update_data_toolbar_buttons()
+
             # 如果需要，可以在这里处理设置对话框关闭后的操作
             self.check_software_status()
-            
+
             # 加载可能更新的配置
-            qsettings = QSettings('KHQuant', 'StockAnalyzer')
+            qsettings = KhQtSettings('KHQuant', 'StockAnalyzer')
             client_path = qsettings.value('client_path', '')
             if client_path:
                 # 更新配置中的客户端路径
                 if 'client_path' not in self.config:
                     self.config['client_path'] = client_path
-                
+
                 # 记录日志
                 logging.info(f"已更新miniQMT客户端路径: {client_path}")
-            
+
         except Exception as e:
             logging.error(f"显示设置对话框时出错: {str(e)}")
             self.show_error_dialog("设置错误", f"显示设置对话框时出错: {str(e)}")
-    
+            
     def update_delay_log_setting(self):
         """更新延迟显示日志设置"""
         try:
             # 从设置中重新读取延迟显示状态
-            old_setting = self.delay_log_display
+            old_setting = getattr(self, 'delay_log_display', True)
             self.delay_log_display = self.settings.value('delay_log_display', True, type=bool)
             
             # 记录设置变更
@@ -3943,7 +6889,15 @@ class KhQuantGUI(QMainWindow):
             logging.error(f"更新延迟显示设置时出错: {str(e)}")
     
     def initialize_update_manager(self):
-        """初始化更新管理器"""
+        """初始化更新管理器（自动下载 exe 仅 Windows 有意义；macOS/Linux 走 pipx/git pull）"""
+        try:
+            from kh_platform import AUTO_UPDATE_ENABLED
+        except ImportError:
+            AUTO_UPDATE_ENABLED = sys.platform == "win32"
+        if not AUTO_UPDATE_ENABLED:
+            self.update_manager = None
+            logging.info("当前平台不支持自动更新（请使用 pipx upgrade khquant 或 git pull）")
+            return
         self.update_manager = UpdateManager(self)
         self.update_manager.check_finished.connect(self.handle_update_check_finished)
         
@@ -3952,12 +6906,20 @@ class KhQuantGUI(QMainWindow):
         
     def set_update_config(self):
         """设置更新配置"""
+        if not getattr(self, 'update_manager', None):
+            return
         settings = QSettings('KHQuant', 'StockAnalyzer')
         self.update_manager.auto_check = settings.value('auto_check_update', True, type=bool)
         self.update_manager.update_channel = settings.value('update_channel', 'stable', type=str)
     
     def check_for_updates(self):
         """检查软件更新"""
+        if not getattr(self, 'update_manager', None):
+            QMessageBox.information(
+                self, "当前平台不支持自动更新",
+                "请使用 pipx upgrade khquant 或 git pull 手动升级。"
+            )
+            return
         try:
             logging.info("开始检查软件更新")
             # 确保发送当前版本号
@@ -3978,6 +6940,8 @@ class KhQuantGUI(QMainWindow):
     
     def delayed_update_check(self):
         """延迟执行更新检查"""
+        if not getattr(self, 'update_manager', None):
+            return
         try:
             self.check_for_updates()
         except Exception as e:
@@ -3985,6 +6949,14 @@ class KhQuantGUI(QMainWindow):
     
     def show_current_version(self):
         """显示当前版本信息"""
+        if not getattr(self, 'update_manager', None):
+            try:
+                from version import get_version_info as _vi
+                v = _vi().get('version', 'unknown')
+            except Exception:
+                v = 'unknown'
+            QMessageBox.information(self, "版本信息", f"看海量化回测平台 v{v}")
+            return
         # 直接使用UpdateManager的方法
         self.update_manager.show_current_version()
 
@@ -4016,17 +6988,13 @@ class KhQuantGUI(QMainWindow):
                     logging.error(f"使用导入方式打开CSV数据管理模块失败: {str(e)}", exc_info=True)
                     # 继续尝试方法二
             # 方法二：使用子进程运行GUI.py
-            # 确定GUI.py的路径 - 开发环境
             base_dir = os.path.dirname(os.path.abspath(__file__))
             gui_path = os.path.join(base_dir, 'GUI.py')
-
+            
             if os.path.exists(gui_path):
                 self.log_message(f"找到GUI.py文件，路径: {gui_path}", "INFO")
-
-                # 使用子进程启动GUI.py
                 import subprocess
-                python_executable = sys.executable
-                subprocess.Popen([python_executable, gui_path])
+                subprocess.Popen([sys.executable, gui_path])
                 self.log_message("CSV数据管理模块已在新进程中启动", "INFO")
             else:
                 self.log_message(f"未找到GUI.py文件: {gui_path}", "ERROR")
@@ -4038,6 +7006,100 @@ class KhQuantGUI(QMainWindow):
             logging.error(error_message, exc_info=True)
             QMessageBox.critical(self, "错误", f"打开CSV数据管理模块时出错:\n{str(e)}")
 
+    def open_duckdb_viewer(self):
+        """打开DuckDB数据管理界面"""
+        try:
+            # 记录日志
+            self.log_message("正在打开DuckDB数据管理界面...", "INFO")
+
+            # 从设置中读取DuckDB数据路径，并在受限环境下自动回退到可写目录
+            duckdb_data_path = self._ensure_duckdb_data_path()
+
+            if not duckdb_data_path:
+                # 如果没有设置路径，提示用户先设置
+                self.log_message("未设置DuckDB数据路径，请先在设置中配置", "WARNING")
+                QMessageBox.warning(
+                    self,
+                    "未设置DuckDB数据路径",
+                    "请先在【设置】中配置DuckDB数据路径。\n\n"
+                    "路径设置后，点击【DuckDB数据管理】按钮即可打开数据管理界面。"
+                )
+                # 打开设置对话框
+                self.show_settings()
+                return
+
+            # 检查路径是否存在
+            if not os.path.exists(duckdb_data_path):
+                self.log_message(f"DuckDB数据路径不存在: {duckdb_data_path}", "WARNING")
+                reply = QMessageBox.question(
+                    self,
+                    "路径不存在",
+                    f"DuckDB数据路径不存在:\n{duckdb_data_path}\n\n是否创建该目录？",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    try:
+                        os.makedirs(duckdb_data_path, exist_ok=True)
+                        self.log_message(f"已创建DuckDB数据目录: {duckdb_data_path}", "INFO")
+                    except Exception as e:
+                        self.log_message(f"创建目录失败: {str(e)}", "ERROR")
+                        QMessageBox.critical(self, "错误", f"创建目录失败:\n{str(e)}")
+                        return
+                else:
+                    return
+
+            # 检查是否已经创建了DuckDB Viewer窗口
+            if hasattr(self, 'duckdb_viewer_window') and self.duckdb_viewer_window:
+                # 如果窗口已存在，显示并激活它
+                if hasattr(self.duckdb_viewer_window, "apply_ui_scale"):
+                    self.duckdb_viewer_window.apply_ui_scale(get_ui_font_scale(self.settings))
+                self.duckdb_viewer_window.show()
+                self.duckdb_viewer_window.raise_()
+                self.duckdb_viewer_window.activateWindow()
+                self.log_message("DuckDB数据管理窗口已激活", "INFO")
+                return
+
+            # 导入DuckDB Viewer
+            try:
+                from duckdb_storage.viewer import DuckDBViewer
+                # 创建新的DuckDB Viewer窗口，并传入数据路径
+                self.duckdb_viewer_window = DuckDBViewer(data_root=duckdb_data_path)
+                if hasattr(self.duckdb_viewer_window, "apply_ui_scale"):
+                    self.duckdb_viewer_window.apply_ui_scale(get_ui_font_scale(self.settings))
+
+                # 连接窗口关闭信号，当窗口被关闭时清除引用
+                viewer_window = self.duckdb_viewer_window
+                self.duckdb_viewer_window.destroyed.connect(
+                    lambda _obj=None, target=viewer_window:
+                    _dispatch_duckdb_viewer_destroyed(self, target)
+                )
+
+                self.duckdb_viewer_window.show()  # 显示窗口
+                self.log_message(f"DuckDB数据管理界面已打开，数据路径: {duckdb_data_path}", "INFO")
+
+            except ImportError as e:
+                self.log_message(f"无法导入DuckDB Viewer模块: {str(e)}", "ERROR")
+                QMessageBox.critical(
+                    self,
+                    "模块导入错误",
+                    f"无法导入DuckDB Viewer模块:\n{str(e)}\n\n"
+                    "请确保 duckdb_storage 模块已正确安装。"
+                )
+            except Exception as e:
+                self.log_message(f"创建DuckDB Viewer失败: {str(e)}", "ERROR")
+                logging.error(f"创建DuckDB Viewer失败", exc_info=True)
+                QMessageBox.critical(
+                    self,
+                    "错误",
+                    f"打开DuckDB数据管理界面时出错:\n{str(e)}"
+                )
+
+        except Exception as e:
+            error_message = f"打开DuckDB数据管理界面时出错: {str(e)}"
+            self.log_message(error_message, "ERROR")
+            logging.error(error_message, exc_info=True)
+            QMessageBox.critical(self, "错误", f"打开DuckDB数据管理界面时出错:\n{str(e)}")
+
     def open_data_viewer(self):
         """打开数据查看器"""
         try:
@@ -4047,6 +7109,8 @@ class KhQuantGUI(QMainWindow):
             # 检查是否已经创建了数据查看器窗口
             if hasattr(self, 'data_viewer_window') and self.data_viewer_window:
                 # 如果窗口已存在，重新加载配置并最大化显示并激活它
+                if hasattr(self.data_viewer_window, "apply_ui_scale"):
+                    self.data_viewer_window.apply_ui_scale(get_ui_font_scale(self.settings))
                 self.data_viewer_window.reload_config_and_data()
                 self.data_viewer_window.showMaximized()
                 self.data_viewer_window.raise_()
@@ -4057,6 +7121,8 @@ class KhQuantGUI(QMainWindow):
             # 创建新的数据查看器窗口
             if GUIDataViewer is not None:
                 self.data_viewer_window = GUIDataViewer()
+                if hasattr(self.data_viewer_window, "apply_ui_scale"):
+                    self.data_viewer_window.apply_ui_scale(get_ui_font_scale(self.settings))
                 # 连接窗口关闭信号，当窗口被关闭时清除引用
                 self.data_viewer_window.destroyed.connect(lambda: setattr(self, 'data_viewer_window', None))
                 self.data_viewer_window.showMaximized()  # 最大化显示
@@ -4105,6 +7171,198 @@ class KhQuantGUI(QMainWindow):
             logging.error(error_message, exc_info=True)
             QMessageBox.critical(self, "错误", f"打开数据定时补充模块时出错:\n{str(e)}")
     
+    def _resolve_strategy_paths_for_editor(self):
+        """解析策略路径，供内嵌 / 系统 VSCode 共用。
+
+        Returns:
+            (workspace_path, file_to_open) 均为 str 或 None；用户取消或路径无效时返回 None。
+        """
+        strategy_file = self.strategy_path.text().strip()
+        workspace_path = None
+        file_to_open = None
+
+        if strategy_file:
+            resolved_strategy_file = self._resolve_strategy_file_path(strategy_file)
+            if os.path.exists(resolved_strategy_file):
+                workspace_path = os.path.dirname(resolved_strategy_file)
+                file_to_open = resolved_strategy_file
+                if resolved_strategy_file != strategy_file:
+                    self.log_message(f"策略文件已解析为: {resolved_strategy_file}", "INFO")
+                self.log_message(f"准备打开策略文件: {resolved_strategy_file}", "INFO")
+            else:
+                QMessageBox.warning(
+                    self,
+                    "策略文件不存在",
+                    f"找不到策略文件：\n{strategy_file}\n\n已尝试解析为：\n{resolved_strategy_file}\n\n请确认文件路径是否正确。"
+                )
+                return None
+        else:
+            reply = QMessageBox.question(
+                self,
+                "未设置策略文件",
+                "当前未设置策略文件，是否创建新策略？",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return None
+
+            default_dir = self.get_strategies_directory()
+            if not os.path.exists(default_dir):
+                os.makedirs(default_dir, exist_ok=True)
+
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "创建新策略文件",
+                os.path.join(default_dir, "新策略.py"),
+                "Python文件 (*.py)"
+            )
+            if not file_path:
+                return None
+            self._create_strategy_template(file_path)
+            self.strategy_path.setText(file_path)
+            workspace_path = os.path.dirname(file_path)
+            file_to_open = file_path
+            self.log_message(f"已创建并准备打开策略文件: {file_path}", "INFO")
+
+        return (workspace_path, file_to_open)
+
+    def open_embedded_editor(self):
+        """打开代码编辑器（Windows：内嵌 VSCode + 调试；其它平台：系统 VSCode 或 Monaco）"""
+        try:
+            # 无外嵌 VSCode 时，用系统安装的 code（macOS/Linux 等）
+            if not self.embedded_vscode_manager:
+                code_exe = find_vscode_executable()
+                if code_exe:
+                    resolved = self._resolve_strategy_paths_for_editor()
+                    if resolved is None:
+                        return
+                    workspace_path, file_to_open = resolved
+                    target = file_to_open or workspace_path
+                    if not target:
+                        return
+                    try:
+                        subprocess.Popen(
+                            [code_exe, target],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        self.log_message(f"已使用系统 VSCode 打开: {target}", "INFO")
+                        self.update_status("已在系统 VSCode 中打开")
+                    except Exception as e:
+                        QMessageBox.warning(self, "打开失败", f"无法启动系统 VSCode：{e}")
+                    return
+
+            # 自动启用调试模式（仅内嵌编辑器路径需要）
+            if not self.enable_debug_mode():
+                self.log_message("调试模式启用失败，编辑器将以普通模式打开", "WARNING")
+
+            if self.embedded_vscode_manager:
+                resolved = self._resolve_strategy_paths_for_editor()
+                if resolved is None:
+                    self.disable_debug_mode()
+                    return
+                workspace_path, file_to_open = resolved
+
+                # 获取调试端口
+                debug_port = 15678  # 默认端口
+                if self.debug_manager:
+                    debug_port = self.debug_manager.debug_port
+
+                # 启动内置VSCode编辑器，传递调试端口
+                if self.embedded_vscode_manager.start_embedded_vscode(workspace_path, debug_port):
+                    self.log_message("内置VSCode编辑器启动成功", "INFO")
+                    self.update_status("内置编辑器已启动")
+
+                    # 如果有文件需要打开，延迟打开文件
+                    if file_to_open:
+                        # 使用QTimer延迟打开文件，给VSCode一些启动时间
+                        QTimer.singleShot(2000, lambda: self._open_file_in_vscode(file_to_open))
+
+                    if self.debug_mode_enabled and self.debug_manager and self.debug_manager.is_debug_server_running:
+                        self.log_message("检测到调试服务器仍在运行，正在恢复调试连接...", "INFO")
+                        QTimer.singleShot(
+                            1500,
+                            lambda port=self.debug_manager.debug_port: self._prepare_vscode_debug_attach(
+                                port,
+                                initial_delay_ms=500
+                            )
+                        )
+                else:
+                    # 真正的启动失败，尝试使用Monaco编辑器
+                    self.log_message("内置VSCode编辑器启动失败，尝试使用Monaco编辑器", "WARNING")
+                    # 调试模式只属于成功启动的内嵌 VSCode。若启动失败后回退到
+                    # Monaco，必须立即恢复普通运行模式，否则下一次回测会启动
+                    # debugpy 并无限等待一个实际上不存在的调试客户端。
+                    self.disable_debug_mode()
+                    self._fallback_to_monaco_editor()
+
+            # 备选方案：使用Monaco编辑器
+            elif self.editor_module:
+                self.editor_module.open_editor()
+                self.log_message("Monaco编辑器启动成功", "INFO")
+                self.update_status("Monaco编辑器已启动")
+
+            else:
+                # 显示安装指南
+                self._show_editor_installation_guide()
+                # 禁用调试模式
+                self.disable_debug_mode()
+
+        except Exception as e:
+            error_message = f"打开内置编辑器时出错: {str(e)}"
+            self.log_message(error_message, "ERROR")
+            logging.error(error_message, exc_info=True)
+            QMessageBox.critical(self, "错误", f"打开内置编辑器时出错:\n{str(e)}")
+            # 出错时禁用调试模式
+            self.disable_debug_mode()
+
+    def _open_file_in_vscode(self, file_path: str):
+        """在VSCode中打开文件"""
+        try:
+            if self.embedded_vscode_manager and self.embedded_vscode_manager.is_running:
+                self.embedded_vscode_manager.open_file(file_path)
+                self.log_message(f"在VSCode中打开文件: {file_path}", "INFO")
+            else:
+                self.log_message("VSCode编辑器未运行，无法打开文件", "WARNING")
+        except Exception as e:
+            self.log_message(f"在VSCode中打开文件失败: {str(e)}", "ERROR")
+            logging.error(f"在VSCode中打开文件失败: {e}", exc_info=True)
+
+    def _fallback_to_monaco_editor(self):
+        """备选方案：使用Monaco编辑器"""
+        try:
+            if self.editor_module:
+                self.editor_module.open_editor()
+                self.log_message("已切换到Monaco编辑器", "INFO")
+                self.update_status("Monaco编辑器已启动")
+            else:
+                # Monaco编辑器也不可用，显示安装指南
+                self._show_editor_installation_guide()
+        except Exception as e:
+            # Monaco编辑器启动失败，也显示安装指南（避免重复弹窗）
+            self.log_message(f"Monaco编辑器启动失败: {str(e)}", "ERROR")
+            # 不再调用_show_editor_installation_guide()，避免重复弹窗
+
+    def _show_editor_installation_guide(self):
+        """显示编辑器安装指南"""
+        message = """
+未找到VSCode安装。
+
+请按以下步骤安装VSCode：
+
+1. 访问 https://code.visualstudio.com/
+2. 下载并安装VSCode
+3. 重启看海量化回测系统
+
+安装完成后，即可使用内置编辑器的所有功能，包括代码高亮、智能补全、断点调试等。
+        """
+
+        QMessageBox.information(
+            self,
+            "需要安装VSCode",
+            message
+        )
+
     def _create_strategy_template(self, file_path: str):
         """创建策略文件模板"""
         try:
@@ -4188,32 +7446,54 @@ def khPostMarket(context: Dict) -> List[Dict]:
             raise
 
     def get_strategies_directory(self):
-        """获取策略文件目录"""
-        # 获取用户数据目录
-        if os.name == 'nt':  # Windows
-            user_data_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'KhQuant')
-        else:  # Linux/Mac
-            user_data_dir = os.path.join(os.path.expanduser('~'), '.khquant')
+        """获取策略文件目录（新默认位置：~/Documents/KhQuant/strategies）"""
+        return self.get_user_strategies_dir()
 
-        # 策略文件目录
-        strategies_dir = os.path.join(user_data_dir, 'strategies')
-        return strategies_dir
+    # 内置编辑器事件处理方法
+    def _on_embedded_editor_started(self):
+        """内置编辑器启动事件"""
+        self.log_message("内置VSCode编辑器已启动", "INFO")
+        self.update_status("内置编辑器运行中")
 
+    def _on_embedded_editor_stopped(self):
+        """内置编辑器停止事件"""
+        self.log_message("内置VSCode编辑器已停止", "INFO")
+        self.update_status("内置编辑器已关闭")
+
+        # 自动禁用调试模式
+        self.disable_debug_mode()
+
+        # 如果调试服务器正在运行，停止它
+        if self.debug_manager and self.debug_manager.is_debug_server_running:
+            self.debug_manager.stop_debug_server()
+            self.log_message("调试会话已结束，调试服务器保持运行以便下次重连", "INFO")
+
+    def _on_embedded_editor_file_opened(self, file_path):
+        """内置编辑器文件打开事件"""
+        self.log_message(f"在内置编辑器中打开文件: {file_path}", "INFO")
+
+    def _on_embedded_editor_debug_started(self):
+        """内置编辑器调试开始事件"""
+        self.log_message("内置编辑器开始调试", "INFO")
+        self.update_status("调试会话已启动")
+    
     def open_code_editor(self):
         """打开代码编辑器"""
         try:
             if self.editor_module is not None:
                 # 获取当前选择的策略文件路径
                 strategy_file_path = self.config.get("strategy_file", "")
+                resolved_strategy_file = self._resolve_strategy_file_path(strategy_file_path)
                 
                 # 检查策略文件是否存在
-                if strategy_file_path and os.path.exists(strategy_file_path):
+                if strategy_file_path and os.path.exists(resolved_strategy_file):
                     # 如果策略文件存在，直接打开编辑器并加载文件
-                    self.editor_module.open_editor(strategy_file_path)
-                    self.log_message(f"代码编辑器已打开，加载策略文件: {strategy_file_path}", "INFO")
+                    self.editor_module.open_editor(resolved_strategy_file)
+                    self.log_message(f"代码编辑器已打开，加载策略文件: {resolved_strategy_file}", "INFO")
                 else:
                     # 如果没有设置策略文件或文件不存在，提示用户选择或创建
                     msg_box = QMessageBox(self)
+                    self.apply_dark_titlebar(msg_box)
                     msg_box.setWindowTitle("策略文件")
                     msg_box.setText("当前未设置策略文件或文件不存在。\n\n请选择操作:")
                     msg_box.addButton("选择现有文件", QMessageBox.YesRole)
@@ -4288,6 +7568,43 @@ def khHandlebar(context):
             self.log_message(error_message, "ERROR")
             logging.error(error_message, exc_info=True)
             QMessageBox.critical(self, "错误", f"打开代码编辑器时出错:\n{str(e)}")
+    
+    def open_history_manager(self):
+        """打开回测历史管理器"""
+        try:
+            # 记录日志
+            self.log_message("正在打开回测历史管理器...", "INFO")
+            
+            # 检查是否已经创建了回测历史管理器窗口
+            if hasattr(self, 'history_manager_window') and self.history_manager_window:
+                # 如果窗口已存在，最大化显示并激活它
+                self.history_manager_window.showMaximized()
+                self.history_manager_window.raise_()
+                self.history_manager_window.activateWindow()
+                # 自动刷新数据
+                self.history_manager_window.load_results()
+                self.log_message("回测历史管理器窗口已激活并刷新", "INFO")
+                return
+            
+            # 创建新的回测历史管理器窗口
+            if BacktestHistoryManager is not None:
+                # 构造函数内部已经调用load_results()，这里不再重复调用
+                # （之前重复调用导致所有结果目录被完整扫描两遍）
+                self.history_manager_window = BacktestHistoryManager(self)
+                # 连接窗口关闭信号，当窗口被关闭时清除引用
+                self.history_manager_window.destroyed.connect(lambda: setattr(self, 'history_manager_window', None))
+                self.history_manager_window.showMaximized()  # 最大化显示
+                self.log_message("回测历史管理器已成功打开并刷新", "INFO")
+            else:
+                error_message = "回测历史管理器模块未正确导入"
+                self.log_message(error_message, "ERROR")
+                QMessageBox.critical(self, "错误", error_message)
+                
+        except Exception as e:
+            error_message = f"打开回测历史管理器时出错: {str(e)}"
+            self.log_message(error_message, "ERROR")
+            logging.error(error_message, exc_info=True)
+            QMessageBox.critical(self, "错误", f"打开回测历史管理器时出错:\n{str(e)}")
 
     def paintEvent(self, event):
         """绘制窗口边框"""
@@ -4306,6 +7623,165 @@ def khHandlebar(context):
         painter.drawRect(self.rect().adjusted(2, 2, -2, -2))
         '''
 
+    def _resolve_cli_kh_path(self):
+        """返回 kh 启动器的绝对路径（源码与 macOS .app）。"""
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        if sys.platform == "darwin" and is_frozen_runtime():
+            executable = os.path.abspath(sys.executable)
+            app_bundle = os.path.dirname(os.path.dirname(os.path.dirname(executable)))
+            candidates = [
+                os.path.join(app_bundle, "Contents", "MacOS", "kh"),
+                os.path.join(app_bundle, "Contents", "Frameworks", "kh"),
+                os.path.join(base_dir, "kh"),
+            ]
+            for candidate in candidates:
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    return candidate
+            return candidates[0]
+        return os.path.join(base_dir, "kh")
+
+    def install_cli_tools(self):
+        """安装 macOS 下的全局命令行工具 kh（工具栏按钮触发，带提示弹窗）"""
+        if sys.platform != 'darwin':
+            return
+
+        kh_path = self._resolve_cli_kh_path()
+        if not os.path.isfile(kh_path) or not os.access(kh_path, os.X_OK):
+            QMessageBox.warning(self, "错误", f"找不到命令行工具: {kh_path}")
+            return
+
+        target_path = "/usr/local/bin/kh"
+        try:
+            # 检查是否已存在并且指向正确
+            if os.path.islink(target_path) and os.path.realpath(target_path) == os.path.realpath(kh_path):
+                self.settings.setValue('cli_auto_install_done', True)
+                QMessageBox.information(self, "提示", "命令行工具 'kh' 已经安装成功。")
+                return
+
+            # 执行提权操作创建软链接
+            script = f'do shell script "mkdir -p /usr/local/bin && ln -sf \\"{kh_path}\\" \\"{target_path}\\"" with administrator privileges'
+            result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
+
+            if result.returncode == 0:
+                self.settings.setValue('cli_auto_install_done', True)
+                QMessageBox.information(self, "成功", "命令行工具 'kh' 安装成功！\n现在您可以在终端中使用 'kh' 命令了。")
+            else:
+                QMessageBox.warning(self, "安装失败", f"授权失败或被取消:\n{result.stderr}")
+
+        except Exception as e:
+            QMessageBox.warning(self, "安装失败", f"发生错误:\n{str(e)}")
+
+    def auto_install_cli_tools(self):
+        """首次启动时自动安装命令行工具 kh（无需点击按钮）。
+
+        仅 macOS。已正确安装或此前已自动尝试过则跳过，避免每次启动都弹授权框。
+        写入 /usr/local/bin 需管理员权限，故首次会弹一次系统授权框。
+        """
+        if sys.platform != 'darwin':
+            return
+        try:
+            kh_path = self._resolve_cli_kh_path()
+            if not os.path.exists(kh_path):
+                return
+
+            target_path = "/usr/local/bin/kh"
+            # 已正确链接：记录标记并跳过
+            if os.path.islink(target_path) and os.path.realpath(target_path) == os.path.realpath(kh_path):
+                self.settings.setValue('cli_auto_install_done', True)
+                return
+
+            # 此前已自动尝试过（成功或被取消）则不再打扰；用户仍可用工具栏按钮手动安装
+            if self.settings.value('cli_auto_install_done', False, type=bool):
+                return
+
+            script = f'do shell script "mkdir -p /usr/local/bin && ln -sf \\"{kh_path}\\" \\"{target_path}\\"" with administrator privileges'
+            result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
+            # 无论结果如何都置标记，避免每次启动反复弹框
+            self.settings.setValue('cli_auto_install_done', True)
+            if result.returncode == 0:
+                logging.info("已自动安装命令行工具 kh 到 /usr/local/bin")
+            else:
+                logging.info(f"自动安装 kh 未完成（可能被取消）: {result.stderr.strip()}")
+        except Exception as e:
+            logging.warning(f"自动安装 kh 失败: {e}")
+
+    def open_web_workbench(self):
+        """启动或复用独立的网页回测服务。"""
+        if not WEB_WORKBENCH_AVAILABLE or launch_web_workbench is None:
+            QMessageBox.information(self, "网页回测", "当前发行版未包含网页回测模块。")
+            return
+        current_thread = getattr(self, "_web_launch_thread", None)
+        if current_thread is not None and current_thread.is_alive():
+            self.update_status("网页回测服务正在启动，请稍候")
+            return
+        if getattr(self, "_web_btn", None):
+            self._web_btn.setEnabled(False)
+        config_path = getattr(self, "current_config_file", None)
+        if not config_path or not os.path.isfile(config_path):
+            config_path = None
+
+        self.log_message("正在启动网页回测服务，请稍候…", "INFO")
+        self.update_status("正在启动网页回测服务，请稍候…")
+        notifier = WebWorkbenchLaunchNotifier(self)
+        notifier.result_signal.connect(self._on_web_workbench_started)
+        notifier.error_signal.connect(self._on_web_workbench_failed)
+
+        def launch_in_background():
+            try:
+                result = launch_web_workbench(config_path)
+                try:
+                    notifier.result_signal.emit(result)
+                except RuntimeError:
+                    pass
+            except Exception as exc:
+                try:
+                    notifier.error_signal.emit(str(exc))
+                except RuntimeError:
+                    pass
+            finally:
+                try:
+                    notifier.finished_signal.emit()
+                except RuntimeError:
+                    pass
+
+        worker = threading.Thread(
+            target=launch_in_background,
+            name="KhQuantWebLauncher",
+            daemon=True,
+        )
+        self._web_launch_thread = worker
+        self._web_launch_notifier = notifier
+        notifier.finished_signal.connect(
+            lambda: self._finish_web_launch_thread(worker, notifier)
+        )
+        worker.start()
+
+    def _on_web_workbench_started(self, result):
+        if result.status == "reused":
+            detail = f"并载入配置：{result.project_name}" if result.project_name else ""
+            message = f"已打开正在运行的网页回测工作台{detail}"
+        else:
+            message = "网页回测服务已启动并打开，关闭主界面后仍会继续运行"
+        self.log_message(message, "INFO")
+        self.update_status(message)
+        if getattr(self, "_web_btn", None):
+            self._web_btn.setEnabled(True)
+
+    def _on_web_workbench_failed(self, detail):
+        if getattr(self, "_web_btn", None):
+            self._web_btn.setEnabled(True)
+        error_msg = f"打开网页回测工作台失败：{detail}"
+        self.log_message(error_msg, "ERROR")
+        self.update_status("网页回测服务启动失败")
+        QMessageBox.critical(self, "网页回测", error_msg)
+
+    def _finish_web_launch_thread(self, worker, notifier):
+        if getattr(self, "_web_launch_thread", None) is worker:
+            self._web_launch_thread = None
+        if getattr(self, "_web_launch_notifier", None) is notifier:
+            self._web_launch_notifier = None
+        notifier.deleteLater()
+
     def open_help_tutorial(self):
         """打开在线教程页面"""
         try:
@@ -4323,33 +7799,86 @@ def khHandlebar(context):
             self.log_message(error_msg, "ERROR")
             QMessageBox.critical(self, "错误", error_msg)
 
+    def set_progress_label(self, label_text):
+        """设置进度条的标签文字
+        
+        Args:
+            label_text: 标签文字，如 "加载数据进度" 或 "回测进度"
+        """
+        self.progress_label_text = label_text
+        self._last_progress_ui_label = None
+    
     @pyqtSlot(int)
     def update_progress_bar(self, value):
         """更新进度条的值"""
         if self.progress_bar:
             # 确保值在0-100之间
             value = max(0, min(value, 100))
+
+            # 初始化/重置最近进度历史（用于滑动窗口平均速度）
+            # 当进度从0开始或发生回退时，认为是新阶段，重置历史
+            if not hasattr(self, "_recent_progress_history"):
+                from collections import deque
+                self._recent_progress_history = deque(maxlen=200)
+
+            now_ts = time.time()
+            label_text = getattr(self, 'progress_label_text', '回测进度')
+            last_ui_value = getattr(self, '_last_progress_ui_value', None)
+            last_ui_label = getattr(self, '_last_progress_ui_label', None)
+            last_ui_ts = getattr(self, '_last_progress_ui_update_ts', 0.0)
+            min_interval = getattr(self, '_progress_update_min_interval', 0.2)
+
+            force_update = (
+                last_ui_value is None
+                or value != last_ui_value
+                or label_text != last_ui_label
+            )
+            if not force_update and value == last_ui_value and now_ts - last_ui_ts < min_interval:
+                return
+
             self.progress_bar.setValue(value)
+            self._last_progress_ui_value = value
+            self._last_progress_ui_label = label_text
+            self._last_progress_ui_update_ts = now_ts
+
+            try:
+                last_value = self._recent_progress_history[-1][1] if self._recent_progress_history else None
+            except Exception:
+                # 极端情况下，如果历史损坏则重建
+                from collections import deque
+                self._recent_progress_history = deque(maxlen=200)
+                last_value = None
+
+            if last_value is None or value <= last_value:
+                # 新一轮进度（例如新任务或阶段），清空历史
+                self._recent_progress_history.clear()
+
+            # 记录当前进度点
+            self._recent_progress_history.append((now_ts, value))
+
             if hasattr(self, 'progress_text') and self.progress_text:
-                # 计算预计剩余时间
+                # 计算预计剩余时间（优先使用最近200条进度的平均速度）
                 remaining_time_text = ""
-                if value > 0 and hasattr(self, 'backtest_start_time'):
-                    import time
-                    elapsed_time = time.time() - self.backtest_start_time
-                    # 根据已完成百分比计算预计总时间
-                    estimated_total_time = elapsed_time / (value / 100.0)
-                    # 计算剩余时间
-                    remaining_time = estimated_total_time - elapsed_time
-                    
+                if value > 0:
+                    remaining_time = None
+                    # 用"全局平均速度"估剩余(已耗时 / 已完成比例 - 已耗时)。
+                    # 不用瞬时/近窗速度: 全A分钟线分段加载忽快忽慢(换段重载几分钟、段内飞快),
+                    # 瞬时速度会让"预计剩余"在 0 和很大之间乱跳、且段内偏低; 全局平均稳, 随进度单调收敛到真实值。
+                    if hasattr(self, 'backtest_start_time'):
+                        elapsed_time = now_ts - self.backtest_start_time
+                        if elapsed_time > 0:
+                            estimated_total_time = elapsed_time / (value / 100.0)
+                            remaining_time = max(0.0, estimated_total_time - elapsed_time)
+
                     # 格式化剩余时间
-                    if remaining_time > 0:
+                    if remaining_time is not None and remaining_time > 0:
                         hours = int(remaining_time // 3600)
                         minutes = int((remaining_time % 3600) // 60)
                         seconds = int(remaining_time % 60)
                         remaining_time_text = f" | 预计剩余: {hours:02d}:{minutes:02d}:{seconds:02d}"
-                
+
                 # 更新文本
-                self.progress_text.setText(f"回测进度: {value}%{remaining_time_text}")
+                self.progress_text.setText(f"{label_text}: {value}%{remaining_time_text}")
             
             # 确保进度条在回测模式下可见
             if self.get_run_mode() == "backtest" and not self.progress_container.isVisible():
@@ -4380,6 +7909,8 @@ def khHandlebar(context):
             file_path += '.kh'
             
         try:
+            strategy_file_for_save = self._strategy_file_value_for_config(file_path)
+
             # 构建配置字典
             config = {
                 "system": {
@@ -4387,10 +7918,10 @@ def khHandlebar(context):
                 },
                 "run_mode": self.get_run_mode(),
                 "account": {
-                    "account_id": self.settings.value('account_id', '8888888888'),
+                    "account_id": self.settings.value('account_id', ''),
                     "account_type": self.settings.value('account_type', 'STOCK')
                 },
-                "strategy_file": self.strategy_path.text().strip(),
+                "strategy_file": strategy_file_for_save,
                 # 添加实盘数据获取模式配置
                 "data_mode": self.get_realtime_data_mode(),
                 "backtest": {
@@ -4411,7 +7942,8 @@ def khHandlebar(context):
                         "custom_times": self.get_custom_time_points(),
                         "start_time": self.start_time_edit.time().toString("HH:mm:ss"),
                         "end_time": self.end_time_edit.time().toString("HH:mm:ss"),
-                        "interval": self.interval_spin.value()
+                        "interval": self.interval_spin.value(),
+                        "daily_trigger_cap": self.daily_trigger_cap_spin.value()
                     }
                 },
                 "data": {
@@ -4432,6 +7964,8 @@ def khHandlebar(context):
                     "loss_limit": 0.1
                 }
             }
+
+            config = self._prepare_config_for_save(config)
             
             # 保存为JSON文件
             with open(file_path, 'w', encoding='utf-8') as f:
@@ -4451,7 +7985,7 @@ def khHandlebar(context):
             self.log_message(f"配置已保存到: {file_path}", "INFO")
             
             # 检测文件是否在危险位置
-            strategy_file_path = self.strategy_path.text().strip()
+            strategy_file_path = self._resolve_strategy_file_path(strategy_file_for_save, config_path=file_path)
             self.show_internal_dir_warning(file_path, strategy_file_path)
             
             # 显示成功消息
@@ -4459,6 +7993,19 @@ def khHandlebar(context):
             
         except Exception as e:
             QMessageBox.critical(self, "保存失败", f"保存配置文件时出错: {str(e)}")
+
+    def _prepare_config_for_save(self, config):
+        """Preserve explicit strategy overrides and drop runtime-only fields."""
+        old_config = getattr(self, "config", {}) or {}
+        prepared = preserve_strategy_runtime_blocks(config, old_config)
+        old_backtest = old_config.get("backtest", {}) if isinstance(old_config, dict) else {}
+        new_backtest = prepared.get("backtest", {})
+        if isinstance(old_backtest, dict) and isinstance(new_backtest, dict):
+            new_backtest["trade_cost"] = _merge_trade_cost_config(
+                old_backtest.get("trade_cost"),
+                new_backtest.get("trade_cost"),
+            )
+        return prepared
 
     def save_config(self):
         """保存配置
@@ -4481,6 +8028,8 @@ def khHandlebar(context):
                 return
                 
             try:
+                strategy_file_for_save = self._strategy_file_value_for_config(self.current_config_file)
+
                 # 构建配置字典
                 config = {
                     "system": {
@@ -4488,10 +8037,10 @@ def khHandlebar(context):
                     },
                     "run_mode": self.get_run_mode(),
                     "account": {
-                        "account_id": self.settings.value('account_id', '8888888888'),
+                        "account_id": self.settings.value('account_id', ''),
                         "account_type": self.settings.value('account_type', 'STOCK')
                     },
-                    "strategy_file": self.strategy_path.text().strip(),
+                    "strategy_file": strategy_file_for_save,
                     # 添加实盘数据获取模式配置
                     "data_mode": self.get_realtime_data_mode(),
                     "backtest": {
@@ -4512,7 +8061,8 @@ def khHandlebar(context):
                             "custom_times": self.get_custom_time_points(),
                             "start_time": self.start_time_edit.time().toString("HH:mm:ss"),
                             "end_time": self.end_time_edit.time().toString("HH:mm:ss"),
-                            "interval": self.interval_spin.value()
+                            "interval": self.interval_spin.value(),
+                            "daily_trigger_cap": self.daily_trigger_cap_spin.value()
                         }
                     },
                     "data": {
@@ -4533,6 +8083,8 @@ def khHandlebar(context):
                         "loss_limit": 0.1
                     }
                 }
+
+                config = self._prepare_config_for_save(config)
                 
                 # 保存到当前配置文件
                 with open(self.current_config_file, 'w', encoding='utf-8') as f:
@@ -4545,7 +8097,10 @@ def khHandlebar(context):
                 self.log_message(f"配置已保存到: {self.current_config_file}", "INFO")
                 
                 # 检测文件是否在危险位置
-                strategy_file_path = self.strategy_path.text().strip()
+                strategy_file_path = self._resolve_strategy_file_path(
+                    strategy_file_for_save,
+                    config_path=self.current_config_file,
+                )
                 self.show_internal_dir_warning(self.current_config_file, strategy_file_path)
                 
                 # 显示成功消息
@@ -4706,37 +8261,16 @@ def khHandlebar(context):
 
     def check_file_in_internal_dir(self, file_path):
         """检测文件是否保存在软件安装目录的_internal文件夹内
-
+        
         Args:
             file_path: 要检测的文件路径
-
+            
         Returns:
             bool: 如果文件在_internal目录内返回True，否则返回False
         """
         if not file_path:
             return False
-
-        # 只在打包环境下检测
-        if not getattr(sys, 'frozen', False):
-            return False
-
-        try:
-            # 获取打包环境的_internal目录
-            if hasattr(sys, '_MEIPASS'):
-                internal_dir = sys._MEIPASS
-            else:
-                # 如果没有_MEIPASS，使用可执行文件所在目录的_internal子目录
-                exe_dir = os.path.dirname(sys.executable)
-                internal_dir = os.path.join(exe_dir, '_internal')
-
-            # 标准化路径进行比较
-            file_path_normalized = os.path.normpath(os.path.abspath(file_path)).lower()
-            internal_dir_normalized = os.path.normpath(os.path.abspath(internal_dir)).lower()
-
-            # 检查文件是否在_internal目录下
-            return file_path_normalized.startswith(internal_dir_normalized)
-        except Exception:
-            return False
+        return False
 
     def show_internal_dir_warning(self, config_file_path, strategy_file_path):
         """显示文件保存在_internal目录的警告对话框
@@ -4775,6 +8309,7 @@ def khHandlebar(context):
             warning_text += "• 或任何您熟悉的其他文件夹"
             
             msg_box = QMessageBox(self)
+            self.apply_dark_titlebar(msg_box)
             msg_box.setWindowTitle("🚨 文件位置安全警告")
             msg_box.setIcon(QMessageBox.Warning)
             msg_box.setText("检测到重要文件存在丢失风险！")
@@ -4808,32 +8343,54 @@ def khHandlebar(context):
             msg_box.exec_()
 
     def get_user_strategies_dir(self):
-        """获取用户策略文件目录路径"""
-        # 获取用户数据目录
-        if os.name == 'nt':  # Windows
-            user_data_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'KhQuant')
-        else:  # Linux/Mac
-            user_data_dir = os.path.join(os.path.expanduser('~'), '.khquant')
-        
-        # 策略文件目录
-        strategies_dir = os.path.join(user_data_dir, 'strategies')
-        
-        # 确保目录存在
-        os.makedirs(strategies_dir, exist_ok=True)
-        
-        return strategies_dir
+        r"""获取用户策略文件目录路径（新默认位置：~/Documents/KhQuant/strategies）
 
-    def init_user_strategies(self):
-        """初始化用户策略目录，复制默认策略文件"""
+        说明：旧版本默认写在 %LOCALAPPDATA%\KhQuant\strategies，长期大量读写可能
+        触发 Windows 组件损坏和杀毒拦截问题，现改为 Documents 下独立目录。
+        """
+        if os.name == 'nt':  # Windows
+            candidates = [
+                os.path.join(os.path.expanduser('~'), 'Documents', 'KhQuant', 'strategies'),
+            ]
+        else:  # Linux/Mac
+            candidates = [
+                os.path.join(os.path.expanduser('~'), 'KhQuant', 'strategies'),
+            ]
+
+        # 受限环境下优先回退到项目内目录，避免因为无权写用户目录而启动失败
+        candidates.extend([
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'user_data', 'strategies'),
+            os.path.join('/tmp', 'KhQuant', 'strategies'),
+        ])
+
+        for strategies_dir in candidates:
+            try:
+                os.makedirs(strategies_dir, exist_ok=True)
+                return strategies_dir
+            except OSError:
+                continue
+
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'strategies')
+
+    def get_legacy_strategies_dir(self):
+        """获取旧版策略目录路径（仅用于检测与迁移，不再作为默认写入位置）"""
+        if os.name == 'nt':
+            user_data_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'KhQuant')
+        else:
+            user_data_dir = os.path.join(os.path.expanduser('~'), '.khquant')
+        return os.path.join(user_data_dir, 'strategies')
+
+    def init_user_strategies(self, check_legacy=True):
+        """初始化用户策略目录，复制默认策略文件，并按需检测旧目录提示迁移
+
+        Args:
+            check_legacy: 是否同步触发旧目录迁移弹窗。启动期间（splash 仍在显示时）
+                应传 False，避免弹窗被启动画面遮挡造成"卡死"假象；启动完成后由
+                主入口通过 QTimer 单独调用 ``check_and_migrate_legacy_strategies``。
+        """
         user_strategies_dir = self.get_user_strategies_dir()
 
-        # 获取程序内置的默认策略文件路径
-        if getattr(sys, 'frozen', False):
-            # 打包环境 - 使用_internal目录
-            default_strategies_dir = os.path.join(sys._MEIPASS, 'strategies')
-        else:
-            # 开发环境 - 使用项目目录
-            default_strategies_dir = os.path.join(os.path.dirname(__file__), 'strategies')
+        default_strategies_dir = os.path.join(os.path.dirname(__file__), 'strategies')
 
         # 如果用户策略目录为空，复制默认策略文件
         if os.path.exists(default_strategies_dir):
@@ -4851,7 +8408,113 @@ def khHandlebar(context):
                         except Exception as e:
                             self.log_message(f"复制策略文件失败 {file_name}: {str(e)}", "WARNING")
 
+        # 每次会话只检查一次旧目录迁移
+        if check_legacy and not getattr(self, '_legacy_migration_checked', False):
+            self._legacy_migration_checked = True
+            try:
+                self.check_and_migrate_legacy_strategies()
+            except Exception as e:
+                logging.warning(f"检测旧策略目录失败: {e}")
+
         return user_strategies_dir
+
+    def check_and_migrate_legacy_strategies(self):
+        """检测旧版 AppData\\Local\\KhQuant\\strategies 目录并提示一键迁移"""
+        legacy_dir = self.get_legacy_strategies_dir()
+        if not os.path.isdir(legacy_dir):
+            return
+
+        try:
+            legacy_files = [
+                f for f in os.listdir(legacy_dir)
+                if f.endswith(('.py', '.kh')) and os.path.isfile(os.path.join(legacy_dir, f))
+            ]
+        except Exception:
+            return
+
+        if not legacy_files:
+            return
+
+        # 用户之前已选择"不再提醒"
+        if self.settings.value('strategies_migration_dismissed', False, type=bool):
+            return
+
+        new_dir = self.get_user_strategies_dir()
+
+        msg_box = QMessageBox(self)
+        self.apply_dark_titlebar(msg_box)
+        msg_box.setWindowTitle("策略目录迁移提示")
+        msg_box.setIcon(QMessageBox.Question)
+        msg_box.setText(
+            f"检测到旧策略目录中有 {len(legacy_files)} 个文件：\n{legacy_dir}\n\n"
+            f"长期将策略写入 C 盘 AppData 目录可能引发 Windows 组件损坏、"
+            f"杀毒拦截等问题（曾有用户出现 QMT 无法加载，需用 DISM 修复）。\n\n"
+            f"建议迁移到新的默认位置：\n{new_dir}\n\n是否现在一键迁移？"
+        )
+        migrate_btn = msg_box.addButton("一键迁移", QMessageBox.AcceptRole)
+        later_btn = msg_box.addButton("稍后提醒", QMessageBox.RejectRole)
+        never_btn = msg_box.addButton("不再提醒", QMessageBox.DestructiveRole)
+        msg_box.setDefaultButton(migrate_btn)
+        msg_box.exec_()
+
+        clicked = msg_box.clickedButton()
+        if clicked is migrate_btn:
+            self._migrate_legacy_strategies(legacy_dir, new_dir, legacy_files)
+        elif clicked is never_btn:
+            self.settings.setValue('strategies_migration_dismissed', True)
+
+    def _migrate_legacy_strategies(self, legacy_dir, new_dir, files):
+        """将旧目录下的策略文件复制到新目录"""
+        import shutil
+        os.makedirs(new_dir, exist_ok=True)
+        migrated, renamed, failed = [], [], []
+
+        for name in files:
+            src = os.path.join(legacy_dir, name)
+            dst = os.path.join(new_dir, name)
+            try:
+                if os.path.exists(dst):
+                    # 同名文件已存在，自动加后缀避免覆盖
+                    base, ext = os.path.splitext(name)
+                    idx = 1
+                    while True:
+                        candidate = os.path.join(new_dir, f"{base}_legacy{idx}{ext}")
+                        if not os.path.exists(candidate):
+                            dst = candidate
+                            break
+                        idx += 1
+                    shutil.copy2(src, dst)
+                    renamed.append((name, os.path.basename(dst)))
+                else:
+                    shutil.copy2(src, dst)
+                    migrated.append(name)
+            except Exception as e:
+                self.log_message(f"迁移失败 {name}: {e}", "WARNING")
+                failed.append(name)
+
+        summary_lines = [f"已迁移到：\n{new_dir}", ""]
+        summary_lines.append(f"成功: {len(migrated)}")
+        if renamed:
+            summary_lines.append(f"重命名: {len(renamed)}（目标目录存在同名文件）")
+        if failed:
+            summary_lines.append(f"失败: {len(failed)}")
+        summary_lines.append("")
+        summary_lines.append("旧目录文件已保留，确认无误后可手动删除：")
+        summary_lines.append(legacy_dir)
+
+        msg = QMessageBox(self)
+        self.apply_dark_titlebar(msg)
+        msg.setWindowTitle("迁移完成")
+        msg.setIcon(QMessageBox.Information)
+        msg.setText("\n".join(summary_lines))
+        msg.exec_()
+
+        # 迁移过后不再提醒
+        self.settings.setValue('strategies_migration_dismissed', True)
+        self.log_message(
+            f"策略迁移完成: 成功{len(migrated)}, 重命名{len(renamed)}, 失败{len(failed)}",
+            "INFO"
+        )
 
 class CustomSplashScreen(QSplashScreen):
     """自定义启动画面"""
@@ -4947,27 +8610,45 @@ class NoWheelComboBox(QComboBox):
         # 忽略滚轮事件，不调用父类的wheelEvent
         event.ignore()
 
+# 系统可用字体集合的模块级缓存：避免每次创建日期/时间控件都重新扫描
+# 同时使用 families() 而非 hasFamily()，兼容老版本 PyQt5（hasFamily 是 Qt 5.13+ 才加的）
+_AVAILABLE_FONT_FAMILIES = None
+
+def _get_available_font_families():
+    global _AVAILABLE_FONT_FAMILIES
+    if _AVAILABLE_FONT_FAMILIES is None:
+        try:
+            from PyQt5.QtGui import QFontDatabase
+            _AVAILABLE_FONT_FAMILIES = set(QFontDatabase().families())
+        except Exception:
+            _AVAILABLE_FONT_FAMILIES = set()
+    return _AVAILABLE_FONT_FAMILIES
+
+def _apply_chinese_font(widget):
+    """为 widget 设置一个可用的中文字体；找不到则保持系统默认"""
+    try:
+        from PyQt5.QtGui import QFont
+        available = _get_available_font_families()
+        preferred_family = get_preferred_ui_font_family()
+        fallback_families = (
+            [preferred_family] if preferred_family else []
+        ) + ["PingFang SC", "Hiragino Sans GB", "Helvetica Neue",
+             "Microsoft YaHei", "SimHei", "SimSun", "Arial Unicode MS"]
+        for family in fallback_families:
+            if family and family in available:
+                font = QFont(family, 9)
+                font.setStyleHint(QFont.SansSerif)
+                widget.setFont(font)
+                return
+    except Exception as e:
+        print(f"设置中文字体时出错: {str(e)}")
+
 # 自定义QDateEdit类，禁用滚轮事件并修复中文显示
 class NoWheelDateEdit(QDateEdit):
     """禁用滚轮事件的QDateEdit，修复中文显示问题"""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setup_font()
-        
-    def setup_font(self):
-        """设置字体，解决中文显示问题"""
-        try:
-            from PyQt5.QtGui import QFont, QFontDatabase
-            # 尝试设置支持中文的字体
-            font_families = ["Microsoft YaHei", "SimHei", "SimSun", "Arial Unicode MS"]
-            for family in font_families:
-                if QFontDatabase().hasFamily(family):
-                    font = QFont(family, 9)
-                    font.setStyleHint(QFont.SansSerif)
-                    self.setFont(font)
-                    break
-        except Exception as e:
-            print(f"设置DateEdit字体时出错: {str(e)}")
+        _apply_chinese_font(self)
     
     def wheelEvent(self, event):
         # 忽略滚轮事件，不调用父类的wheelEvent
@@ -4978,22 +8659,7 @@ class NoWheelTimeEdit(QTimeEdit):
     """禁用滚轮事件的QTimeEdit，修复中文显示问题"""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setup_font()
-        
-    def setup_font(self):
-        """设置字体，解决中文显示问题"""
-        try:
-            from PyQt5.QtGui import QFont, QFontDatabase
-            # 尝试设置支持中文的字体
-            font_families = ["Microsoft YaHei", "SimHei", "SimSun", "Arial Unicode MS"]
-            for family in font_families:
-                if QFontDatabase().hasFamily(family):
-                    font = QFont(family, 9)
-                    font.setStyleHint(QFont.SansSerif)
-                    self.setFont(font)
-                    break
-        except Exception as e:
-            print(f"设置TimeEdit字体时出错: {str(e)}")
+        _apply_chinese_font(self)
     
     def wheelEvent(self, event):
         # 忽略滚轮事件，不调用父类的wheelEvent
@@ -5022,7 +8688,7 @@ class DisclaimerDialog(QDialog):
                     byref(c_int(2)),
                     sizeof(c_int)
                 )
-                caption_color = DWORD(0x2b2b2b)
+                caption_color = DWORD(0x333333)
                 windll.dwmapi.DwmSetWindowAttribute(
                     int(self.winId()),
                     DWMWA_CAPTION_COLOR,
@@ -5240,33 +8906,107 @@ class DisclaimerDialog(QDialog):
         """用户拒绝免责声明，退出程序"""
         super().reject()
 
+def _apply_dark_titlebar_win(widget):
+    """对单个顶层窗口应用深色标题栏（仅 Windows）。"""
+    if sys.platform != 'win32':
+        return
+    try:
+        from ctypes import windll, c_int, byref, sizeof
+        from ctypes.wintypes import DWORD
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        DWMWA_CAPTION_COLOR = 35
+        hwnd = int(widget.winId())
+        windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            byref(c_int(2)), sizeof(c_int))
+        caption_color = DWORD(0x333333)
+        windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_CAPTION_COLOR,
+            byref(caption_color), sizeof(caption_color))
+    except Exception:
+        pass
+
+
+class _DarkTitleBarFilter(QObject):
+    """应用级事件过滤器：所有顶层 QDialog 首次显示时自动套深色标题栏。
+
+    一处生效，覆盖 QMessageBox / QInputDialog / QProgressDialog 等
+    静态便捷弹窗，以及同进程内打开的其他 QDialog 窗口，
+    避免白色标题栏与深色主题不搭。
+    """
+    _PROP = "_dark_titlebar_applied"
+
+    def eventFilter(self, obj, event):
+        try:
+            if (event.type() == QEvent.Show
+                    and isinstance(obj, QDialog)
+                    and obj.isWindow()
+                    and not obj.property(self._PROP)):
+                obj.setProperty(self._PROP, True)
+                _apply_dark_titlebar_win(obj)
+        except Exception:
+            pass
+        return False
+
+
 def main():
     try:
+        if "--scheduled-sync" in sys.argv[1:]:
+            from GUIScheduledDataSync import main as scheduled_sync_main
+            return scheduled_sync_main(instance_lock=_scheduled_instance_lock)
+
+        force_primary_screen_dpi()
         app = QApplication(sys.argv)
+
+        def activate_macos_frontmost():
+            """尽力将 macOS 应用切到前台，避免 Dock 启动后进程存在但窗口不激活。"""
+            if sys.platform != 'darwin':
+                return
+
+            try:
+                from AppKit import NSApplication, NSApplicationActivationPolicyRegular
+
+                ns_app = NSApplication.sharedApplication()
+                ns_app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+                ns_app.activateIgnoringOtherApps_(True)
+                logging.info("已通过 AppKit 请求 macOS 将应用切到前台")
+                return
+            except Exception:
+                # AppKit 不可用（未安装 pyobjc）属正常情况，静默回退到 AppleScript
+                pass
+
+            try:
+                # 源码运行：使用 PID 激活
+                import os
+                pid = os.getpid()
+                subprocess.Popen(
+                    [
+                        "/usr/bin/osascript",
+                        "-e",
+                        f'tell application "System Events" to set frontmost of the first process whose unix id is {pid} to true'
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                logging.info("已通过 AppleScript (PID) 请求 macOS 将应用切到前台")
+            except Exception as exc:
+                logging.warning(f"AppleScript 前台激活失败: {exc}")
+
+        # 全局深色标题栏：所有弹窗/对话框统一风格（必须保留引用防止被回收）
+        app._dark_titlebar_filter = _DarkTitleBarFilter(app)
+        app.installEventFilter(app._dark_titlebar_filter)
         
+        # 未获焦点的下拉框/日期框不再吃滚轮，避免滚动页面时静默改掉参数
+        install_wheel_guard(app)
+
         # 设置字体和编码，解决时间选择器乱码问题
         try:
-            # 设置应用程序的默认字体
-            from PyQt5.QtGui import QFont, QFontDatabase
-            
-            # 添加系统字体
-            font_families = ["Microsoft YaHei", "SimHei", "SimSun", "Arial Unicode MS", "DejaVu Sans"]
-            default_font = None
-            
-            for family in font_families:
-                if QFontDatabase().hasFamily(family):
-                    default_font = QFont(family, 9)
-                    break
-            
+            scale = get_ui_font_scale()
+            default_font = apply_app_font(scale)
             if default_font:
-                app.setFont(default_font)
-                print(f"已设置应用字体: {default_font.family()}")
+                print(f"已设置应用字体: {default_font.family()} {default_font.pointSize()}pt (scale={scale})")
             else:
-                # 使用系统默认字体
-                default_font = QFont()
-                default_font.setPointSize(9)
-                app.setFont(default_font)
-                print("使用系统默认字体")
+                print("设置应用字体失败，使用系统默认字体")
             
             # 设置Qt的本地化
             from PyQt5.QtCore import QLocale, QTranslator
@@ -5314,15 +9054,9 @@ def main():
         app.setApplicationName("KhQuant")
         app.setOrganizationName("KhQuant")
         
-        # 获取图标路径函数
         def get_app_icon_path(icon_name):
-            if getattr(sys, 'frozen', False):
-                # 打包环境 - 使用_internal目录
-                return os.path.join(sys._MEIPASS, 'icons', icon_name)
-            else:
-                # 开发环境 - 使用项目目录
-                return os.path.join(os.path.dirname(__file__), 'icons', icon_name)
-
+            return os.path.join(os.path.dirname(__file__), 'icons', icon_name)
+        
         # 设置应用程序图标
         icon_file = get_app_icon_path('stock_icon.ico')
         if os.path.exists(icon_file):
@@ -5338,14 +9072,8 @@ def main():
                 logging.info(f"成功加载应用图标(PNG): {icon_file_png}")
             else:
                 logging.warning(f"图标文件不存在: {icon_file} 和 {icon_file_png}")
-
-        # 获取图标目录路径（用于启动画面）
-        if getattr(sys, 'frozen', False):
-            # 打包环境 - 使用_internal目录
-            icon_path = os.path.join(sys._MEIPASS, 'icons')
-        else:
-            # 开发环境 - 使用项目目录
-            icon_path = os.path.join(os.path.dirname(__file__), 'icons')
+        
+        icon_path = os.path.join(os.path.dirname(__file__), 'icons')
             
         logging.info(f"图标目录路径: {icon_path}")
             
@@ -5391,20 +9119,63 @@ def main():
             # 使用短延时确保启动画面完全关闭后再显示主窗口
             def show_main_window():
                 try:
-                    # 显示免责声明弹窗
-                    disclaimer_dialog = DisclaimerDialog()
-                    result = disclaimer_dialog.exec_()
-                    
-                    if result == QDialog.Rejected:
-                        # 用户拒绝免责声明，退出程序
-                        QApplication.quit()
-                        return
-                    
-                    # 显示主窗口在主屏幕居中
-                    window.center_window()  # 先居中
-                    window.show()  # 然后显示
+                    logging.info("主窗口已显示，开始执行show事件")
+                    window.center_window()
+                    logging.info(f"主窗口居中完成，几何信息: {window.frameGeometry().getRect()}")
+                    window.show()
+                    logging.info(f"window.show() 调用完成，isVisible={window.isVisible()}")
+                    window.showNormal()
                     window.raise_()
                     window.activateWindow()
+                    app.processEvents()
+                    logging.info(f"主窗口激活完成，isVisible={window.isVisible()}, isActive={window.isActiveWindow()}")
+                    activate_macos_frontmost()
+                    QTimer.singleShot(150, activate_macos_frontmost)
+
+                    def _run_legacy_migration_check():
+                        try:
+                            if not getattr(window, '_legacy_migration_checked', False):
+                                window._legacy_migration_checked = True
+                                window.check_and_migrate_legacy_strategies()
+                        except Exception as exc:
+                            logging.warning(f"检测旧策略目录失败: {exc}")
+
+                    def _show_disclaimer_and_continue():
+                        logging.info("主窗口已显示，准备展示免责声明弹窗")
+                        disclaimer_dialog = DisclaimerDialog(window)
+                        disclaimer_dialog.setWindowModality(Qt.ApplicationModal)
+                        disclaimer_dialog.center_on_screen()
+                        disclaimer_dialog.raise_()
+                        disclaimer_dialog.activateWindow()
+                        result = disclaimer_dialog.exec_()
+                        
+                        if result == QDialog.Rejected:
+                            logging.info("用户拒绝免责声明，程序退出")
+                            QApplication.quit()
+                            return
+                        
+                        window.raise_()
+                        window.activateWindow()
+                        activate_macos_frontmost()
+                        
+                        QTimer.singleShot(500, _run_legacy_migration_check)
+
+                    # 免责声明弹窗展示规则：
+                    # 1. 源码模式下直接跳过，便于开发调试与后台启动；
+                    # 2. 自动化 GUI 测试（KHQUANT_GUI_TEST_SKIP_DISCLAIMER=1）始终跳过；
+                    # 3. 仅在打包安装模式（is_frozen_runtime()）下才弹出免责声明供用户阅读确认。
+                    if not is_frozen_runtime():
+                        logging.info("源码运行模式：跳过免责声明弹窗，直接进入主界面")
+                        QTimer.singleShot(500, _run_legacy_migration_check)
+                    elif os.environ.get("KHQUANT_GUI_TEST_SKIP_DISCLAIMER") == "1":
+                        logging.info("自动化测试模式：跳过免责声明弹窗")
+                        QTimer.singleShot(500, _run_legacy_migration_check)
+                    else:
+                        # 稍微延后执行免责声明，确保主窗口有足够的时间完成首屏绘制和前台激活
+                        # 在macOS下，由于系统安全隔离和沙盒机制，QDialog的模态属性可能导致整个应用卡死
+                        # 因此，在macOS下我们使用非模态对话框，或者干脆不在启动时弹窗，改为首次点击某个功能时再弹
+                        QTimer.singleShot(600, _show_disclaimer_and_continue)
+
                 except Exception as e:
                     logging.error(f"显示主窗口时出错: {str(e)}", exc_info=True)
                     QMessageBox.critical(None, "错误", f"显示主窗口时出错: {str(e)}")
@@ -5443,7 +9214,10 @@ def main():
             QTimer.singleShot(2000, window.delayed_update_check)
             
             # 运行事件循环
-            return app.exec_()
+            exit_code = app.exec_()
+            # 单实例锁必须覆盖整个进程生命周期。这里不提前释放，交由操作系统
+            # 在进程真正退出时关闭句柄，避免 Qt/日志仍在收尾时新实例抢先启动。
+            return exit_code
             
         except Exception as e:
             logging.error(f"初始化过程中出错: {str(e)}", exc_info=True)
@@ -5462,15 +9236,22 @@ def main():
 
 
 if __name__ == "__main__":
-    # 多进程保护必须最先执行
-    import multiprocessing
-    multiprocessing.freeze_support()  # Windows多进程支持
+    # 平台守卫：Linux 当前未启用 GUI（Windows / macOS + PyQt5 可用）
+    try:
+        from kh_platform import GUI_ENABLED, PLATFORM_NAME
+    except ImportError:
+        import importlib.util
+        _has_qt = importlib.util.find_spec("PyQt5") is not None
+        GUI_ENABLED = sys.platform in ("win32", "darwin") and _has_qt
+        PLATFORM_NAME = sys.platform
+    if not GUI_ENABLED:
+        print(f"当前平台 ({PLATFORM_NAME}) 未启用 GUI（目前支持 Windows / macOS），请使用 CLI：kh --help")
+        sys.exit(2)
 
-    # 设置多进程的启动方法
+    import multiprocessing
     try:
         multiprocessing.set_start_method('spawn', force=True)
     except RuntimeError:
-        # 如果启动方法已经设置过，则跳过
         pass
 
     sys.exit(main())

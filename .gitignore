@@ -1,269 +1,62 @@
-# KhQuant 看海量化交易系统 - Git忽略文件
+# 看海量化回测平台（开源版）Git 忽略规则
 
-# ===== Python 相关 =====
-# 字节码文件
+# ===== Python =====
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-
-# 分发/打包
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# PyInstaller
-*.manifest
-*.spec
-
-# 单元测试
-htmlcov/
-.tox/
-.coverage
-.coverage.*
-.cache
 .pytest_cache/
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-.python-version
-
-# celery beat
-celerybeat-schedule
-
-# SageMath parsed files
-*.sage.py
-
-# 虚拟环境
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-khquant_env/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
 .mypy_cache/
-.dmypy.json
-dmypy.json
+*.egg-info/
+.venv/
+venv/
+env/
 
-# ===== 量化交易系统特定 =====
-# 配置文件（可能包含敏感信息）
-configs/*.kh
-configs/temp_*.kh
-configs/temp_running_config.kh
-*.config
-config.json
-settings.ini
+# ===== 打包产物 =====
+build/
+dist/
+Output/
+*.zip
+*.7z
 
-# 日志文件
+# ===== 运行时产生的文件 =====
 logs/
 *.log
-app.log
-debug.log
-error.log
-trade.log
-
-# 数据文件
-data/stock_list/
-data/cache/
-data/download/
-data/*.csv
-data/*.xlsx
-data/*.db
-data/*.sqlite
-data/*.sqlite3
-
-# 回测结果
 backtest_results/
-results/
-reports/
-
-# 交易记录（敏感）
-trades/
-positions/
-portfolio/
-account_info/
-
-# 临时文件
 temp/
 tmp/
-*.tmp
-*.temp
-.temp/
+configs/temp_*.kh
+configs/_tmp_*.kh
+strategies/_tmp_*.kh
 
-# 缓存文件
-cache/
-.cache/
-*.cache
-
-# ===== IDE 和编辑器 =====
-# VSCode
-.vscode/
-*.code-workspace
-
-# PyCharm
-.idea/
-*.iml
-*.ipr
-*.iws
-
-# Sublime Text
-*.sublime-project
-*.sublime-workspace
-
-# Vim
-*.swp
-*.swo
-*~
-
-# Emacs
-*~
-\#*\#
-/.emacs.desktop
-/.emacs.desktop.lock
-*.elc
-auto-save-list
-tramp
-
-# ===== 系统文件 =====
-# Windows
-Thumbs.db
-ehthumbs.db
-Desktop.ini
-$RECYCLE.BIN/
-*.cab
-*.msi
-*.msm
-*.msp
-*.lnk
-
-# macOS
-.DS_Store
-.AppleDouble
-.LSOverride
-Icon
-._*
-.DocumentRevisions-V100
-.fseventsd
-.Spotlight-V100
-.TemporaryItems
-.Trashes
-.VolumeIcon.icns
-.com.apple.timemachine.donotpresent
-.AppleDB
-.AppleDesktop
-Network Trash Folder
-Temporary Items
-.apdisk
-
-# Linux
-*~
-
-# ===== 量化交易平台特定 =====
-# QMT/XtQuant 相关
-userdata_mini/
+# ===== 行情数据库与缓存（数据由用户自己下载，不入库） =====
+*.db
 *.db-journal
+*.db.wal
+*.duckdb
+*.parquet
+data/cache/
+data/download/
 
-# VNPy 相关（已卸载，但预防）
-.vntrader/
-vnpy_*/
+# ===== 编辑器与系统文件 =====
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*~
+Thumbs.db
+Desktop.ini
+desktop.ini
+.DS_Store
 
-# 其他交易平台
-tqsdk/
-akshare/
-
-# ===== 安全敏感信息 =====
-# API密钥和令牌
+# ===== 凭据（绝不提交） =====
+.env
+.env.*
 *.key
 *.pem
 *.p12
 *.pfx
-api_keys.txt
 secrets.json
-.secrets
-.env.local
-.env.production
+api_keys.txt
 
-# 账户信息
-account.json
-user_info.json
-*.account
-
-# 激活和许可证文件
-license.txt
-activation.key
-machine_code.txt
-
-# ===== 其他 =====
-# 备份文件
-*.bak
-*.backup
-backup/
-
-# 压缩文件
-*.zip
-*.rar
-*.7z
-*.tar.gz
-*.tar.bz2
-
-# 大文件（超过100MB的数据文件）
-*.parquet
-*.h5
-*.hdf5
-
-# 本地测试文件
-test_*.py
-*_test.py
-playground/
-sandbox/
-
-# 文档生成
-docs/_build/
-doc/_build/ 
-__pycache__/
-app.log
-__pycache__
-installer copy.iss
-installer.iss
-build_inno.bat
-__pycache__/GUIplotLoadData.cpython-311.pyc
-Output
-app.log
+# 旧版本运行时生成的股票列表快照
+data/stock_list/stock_list_*.csv

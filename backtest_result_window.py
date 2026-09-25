@@ -6,10 +6,11 @@ import matplotlib
 matplotlib.use('Qt5Agg')
 
 # 其他导入
-from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                           QLabel, QTabWidget, QTableWidget, QTableWidgetItem,
-                          QGroupBox, QSplitter, QGridLayout, QHeaderView, QSizePolicy)
-from PyQt5.QtCore import Qt, QSettings
+                          QGroupBox, QSplitter, QGridLayout, QHeaderView, QSizePolicy,
+                          QPushButton, QMessageBox)
+from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal, QTimer, QRect, QEvent
 from PyQt5.QtGui import QPalette, QColor, QIcon
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -22,29 +23,266 @@ from datetime import datetime, timedelta
 import numpy as np
 import sys
 import time
-from khQTTools import KhQuTools
-from xtquant import xtdata
+from khQTTools import KhQuTools, determine_pool_type
+from stock_analysis_window import StockAnalysisWindow
+from khUiScale import get_ui_font_scale, force_primary_screen_dpi
+from qt_settings_bridge import KhQtSettings
 
 # 设置matplotlib的字体和其他参数
-plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
+plt.rcParams['font.sans-serif'] = ['PingFang SC', 'Heiti SC', 'STHeiti', 'Arial Unicode MS', 'Microsoft YaHei', 'SimHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 plt.rcParams['font.family'] = 'sans-serif'
 
 # 设置matplotlib深色主题
 plt.style.use('dark_background')
 
+
+def resolve_benchmark_base_price(benchmark_df, daily_stats_df=None):
+    """基于已加载的benchmark数据计算基准初始价，不在GUI线程请求外部数据源。"""
+    try:
+        if benchmark_df is None or len(benchmark_df) == 0 or 'close' not in benchmark_df.columns:
+            return None
+
+        df = benchmark_df.copy()
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date')
+
+        base_price = None
+        if (
+            daily_stats_df is not None and len(daily_stats_df) > 0
+            and 'date' in daily_stats_df.columns and 'date' in df.columns
+        ):
+            backtest_start = pd.to_datetime(daily_stats_df['date']).min()
+            pre_bench = df[df['date'] < backtest_start]
+            if len(pre_bench) > 0:
+                base_price = float(pre_bench['close'].iloc[-1])
+            else:
+                bt_bench = df[df['date'] >= backtest_start]
+                if len(bt_bench) > 0:
+                    base_price = float(bt_bench['close'].iloc[0])
+
+        if base_price is None:
+            base_price = float(df['close'].iloc[0])
+
+        if not np.isfinite(base_price) or base_price == 0:
+            return None
+        return base_price
+    except Exception as e:
+        print(f"计算基准初始价时出错: {str(e)}")
+        return None
+
+
+def read_backtest_result_data(backtest_dir):
+    """读取并预处理回测结果文件，供后台线程调用。"""
+    backtest_dir = os.path.abspath(backtest_dir)
+
+    if not os.path.exists(backtest_dir):
+        raise FileNotFoundError(f"回测结果目录不存在: {backtest_dir}")
+
+    config_path = os.path.join(backtest_dir, "config.csv")
+    trades_path = os.path.join(backtest_dir, "trades.csv")
+    daily_stats_path = os.path.join(backtest_dir, "daily_stats.csv")
+    benchmark_path = os.path.join(backtest_dir, "benchmark.csv")
+
+    print(f"尝试加载配置文件: {config_path}")
+    print(f"文件是否存在: {os.path.exists(config_path)}")
+
+    try:
+        print("目录内容:")
+        for file in os.listdir(backtest_dir):
+            print(f"- {file}")
+    except Exception as e:
+        print(f"列出回测目录内容失败: {e}")
+
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"配置文件不存在: {config_path}")
+
+    config_df = pd.read_csv(config_path, encoding='utf-8-sig')
+
+    if not os.path.exists(trades_path):
+        print(f"警告: 交易记录文件不存在: {trades_path}")
+        trades_df = pd.DataFrame(columns=['datetime', 'code', 'action', 'price', 'volume', 'amount', 'commission'])
+    else:
+        trades_df = pd.read_csv(trades_path, encoding='utf-8-sig')
+
+    price_decimals = 2
+    if len(trades_df) > 0 and 'code' in trades_df.columns:
+        stock_codes = trades_df['code'].unique().tolist()
+        _, price_decimals = determine_pool_type(stock_codes)
+        print(f"根据股票池类型设置价格精度: {price_decimals}位小数")
+
+    if not os.path.exists(daily_stats_path):
+        print(f"警告: 每日统计文件不存在: {daily_stats_path}")
+        daily_stats_df = pd.DataFrame(columns=['date', 'total_asset', 'cash', 'market_value', 'daily_return'])
+    else:
+        daily_stats_df = pd.read_csv(daily_stats_path, encoding='utf-8-sig')
+        if 'daily_return' not in daily_stats_df.columns and 'total_asset' in daily_stats_df.columns:
+            print("daily_stats.csv中没有daily_return列，正在计算...")
+            daily_stats_df['date'] = pd.to_datetime(daily_stats_df['date'])
+            daily_stats_df = daily_stats_df.sort_values('date')
+            daily_stats_df['daily_return'] = daily_stats_df['total_asset'].pct_change()
+            if len(daily_stats_df) > 0:
+                daily_stats_df.loc[daily_stats_df.index[0], 'daily_return'] = 0
+            print(f"已计算daily_return列，共{len(daily_stats_df)}条数据")
+
+    if not os.path.exists(benchmark_path):
+        print(f"警告: 基准数据文件不存在: {benchmark_path}")
+        if len(daily_stats_df) > 0 and 'date' in daily_stats_df.columns:
+            daily_stats_df['date'] = pd.to_datetime(daily_stats_df['date'])
+            dates = daily_stats_df['date']
+            benchmark_df = pd.DataFrame({'date': dates, 'close': np.ones(len(dates))})
+            print("创建了替代基准数据")
+        else:
+            benchmark_df = pd.DataFrame(columns=['date', 'close'])
+            print("创建了空的基准数据DataFrame")
+    else:
+        try:
+            benchmark_df = pd.read_csv(benchmark_path, encoding='utf-8-sig')
+            if len(benchmark_df) == 0 or 'close' not in benchmark_df.columns or 'date' not in benchmark_df.columns:
+                print("基准数据文件为空或缺少必要列")
+                if len(daily_stats_df) > 0 and 'date' in daily_stats_df.columns:
+                    daily_stats_df['date'] = pd.to_datetime(daily_stats_df['date'])
+                    dates = daily_stats_df['date']
+                    benchmark_df = pd.DataFrame({'date': dates, 'close': np.ones(len(dates))})
+                    print("创建了替代基准数据")
+                else:
+                    benchmark_df = pd.DataFrame(columns=['date', 'close'])
+                    print("创建了空的基准数据Frame")
+        except Exception as e:
+            print(f"读取基准数据文件时出错: {str(e)}")
+            if len(daily_stats_df) > 0 and 'date' in daily_stats_df.columns:
+                daily_stats_df['date'] = pd.to_datetime(daily_stats_df['date'])
+                dates = daily_stats_df['date']
+                benchmark_df = pd.DataFrame({'date': dates, 'close': np.ones(len(dates))})
+                print("创建了替代基准数据")
+            else:
+                benchmark_df = pd.DataFrame(columns=['date', 'close'])
+                print("创建了空的基准数据DataFrame")
+
+    required_columns = {
+        'daily_stats': ['date', 'total_asset', 'cash', 'market_value', 'daily_return'],
+        'benchmark': ['date', 'close'],
+        'trades': ['datetime', 'code', 'action', 'price', 'volume', 'amount', 'commission']
+    }
+
+    if 'time' in trades_df.columns:
+        trades_df = trades_df.rename(columns={'time': 'datetime'})
+    if 'type' in trades_df.columns:
+        trades_df = trades_df.rename(columns={'type': 'action'})
+
+    print(f"交易数据列名: {trades_df.columns.tolist()}")
+
+    for df_name, columns in required_columns.items():
+        df = {'daily_stats': daily_stats_df, 'benchmark': benchmark_df, 'trades': trades_df}[df_name]
+        missing_columns = [col for col in columns if col not in df.columns]
+        if missing_columns:
+            print(f"警告: {df_name} 缺少必要的列: {missing_columns}，尝试调整")
+            if df_name == 'trades':
+                if 'datetime' not in df.columns and 'time' in df.columns:
+                    print("  将'time'列重命名为'datetime'")
+                    df = df.rename(columns={'time': 'datetime'})
+                if 'action' not in df.columns and 'direction' in df.columns:
+                    print("  将'direction'列重命名为'action'")
+                    df = df.rename(columns={'direction': 'action'})
+                if 'action' not in df.columns and 'type' in df.columns:
+                    print("  将'type'列重命名为'action'")
+                    df = df.rename(columns={'type': 'action'})
+                missing_columns = [col for col in columns if col not in df.columns]
+                if missing_columns:
+                    print(f"  调整后仍缺少列: {missing_columns}")
+                    if set(missing_columns) == {'commission'} and 'amount' in df.columns:
+                        print("  添加默认的'commission'列")
+                        df['commission'] = 0.0
+                        missing_columns = []
+                trades_df = df
+
+            if missing_columns:
+                raise ValueError(f"{df_name} 缺少必要的列: {missing_columns}")
+
+    trades_raw_df = trades_df.copy()
+    daily_stats_original_df = daily_stats_df.copy()
+    trades_display_df = trades_df.rename(columns={'datetime': 'time', 'action': 'direction'})
+
+    print(f"重命名后的交易数据列名: {trades_display_df.columns.tolist()}")
+
+    try:
+        direction_map = {'buy': '买入', 'sell': '卖出'}
+        trades_display_df['direction'] = trades_display_df['direction'].map(
+            lambda x: direction_map.get(str(x).lower(), x)
+        )
+        print("买卖动作映射完成")
+    except Exception as e:
+        print(f"买卖动作映射出错: {str(e)}")
+        print(f"direction列值: {trades_display_df['direction'].unique().tolist() if 'direction' in trades_display_df.columns else 'direction列不存在'}")
+
+    config_row = config_df.iloc[0]
+    benchmark_code = config_row.get('benchmark', '000300.SH') if 'benchmark' in config_row.index else '000300.SH'
+    print(f"使用基准合约代码: {benchmark_code}")
+
+    # 在后台线程预热交易日缓存：update_basic_info在GUI线程计算年化收益率时
+    # 会调用get_trade_days_count，若缓存未覆盖该区间会触发baostock/xtquant
+    # 网络请求，把界面卡住。这里提前在本线程完成（失败也只是退回原逻辑）。
+    try:
+        if len(daily_stats_df) > 0 and 'date' in daily_stats_df.columns:
+            from khQTTools import get_trade_days_set
+            _first = pd.to_datetime(daily_stats_df['date'].iloc[0]).strftime('%Y%m%d')
+            _last = pd.to_datetime(daily_stats_df['date'].iloc[-1]).strftime('%Y%m%d')
+            get_trade_days_set(_first, _last)
+    except Exception as e:
+        print(f"预热交易日缓存失败（不影响加载）: {e}")
+
+    return {
+        'config_df': config_df,
+        'config_row': config_row,
+        'trades_raw_df': trades_raw_df,
+        'trades_display_df': trades_display_df,
+        'daily_stats_df': daily_stats_df,
+        'daily_stats_original_df': daily_stats_original_df,
+        'benchmark_df': benchmark_df,
+        'benchmark_base_price': resolve_benchmark_base_price(benchmark_df, daily_stats_df),
+        'benchmark_code': benchmark_code,
+        'price_decimals': price_decimals,
+    }
+
+
+class BacktestResultLoadThread(QThread):
+    loaded = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, backtest_dir, parent=None):
+        super().__init__(parent)
+        self.backtest_dir = backtest_dir
+
+    def run(self):
+        try:
+            self.loaded.emit(read_backtest_result_data(self.backtest_dir))
+        except Exception as e:
+            import traceback
+            self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
+
+
 class BacktestResultWindow(QMainWindow):
     def __init__(self, backtest_dir):
         super().__init__()
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.backtest_dir = backtest_dir
-        
+        self.stock_analysis_window = None
+        self._closing_after_load = False
+
         # 检测屏幕分辨率并设置字体缩放比例
         self.font_scale = self.detect_screen_resolution()
-        
-        # 从设置读取无风险收益率
-        settings = QSettings('KHQuant', 'StockAnalyzer')
+
+        # 从设置读取无风险收益率和数据源配置
+        settings = KhQtSettings('KHQuant', 'StockAnalyzer')
         self.risk_free_rate = float(settings.value('risk_free_rate', '0.03'))
         print(f"使用无风险收益率: {self.risk_free_rate}")
+
+        # 结果窗口只展示回测目录中的文件，不初始化外部行情数据源，避免打开窗口时阻塞 UI。
+        self.benchmark_base_price = None
+
+        # 价格精度设置，默认2位小数（股票），ETF为3位
+        self.price_decimals = 2
         
         # 设置窗口标题栏颜色（仅适用于Windows）
         if sys.platform == 'win32':
@@ -64,7 +302,7 @@ class BacktestResultWindow(QMainWindow):
                 )
                 
                 # 设置标题栏颜色
-                caption_color = c_int(0x2b2b2b)  # 使用与主界面相同的颜色
+                caption_color = c_int(0x333333)  # 使用与主界面相同的颜色
                 windll.dwmapi.DwmSetWindowAttribute(
                     int(self.winId()),
                     DWMWA_CAPTION_COLOR,
@@ -80,11 +318,123 @@ class BacktestResultWindow(QMainWindow):
         # 加载窗口图标
         self.load_icon()
         
+        # 首次显示时是否已约束到主屏
+        self._constrained_to_primary = False
+        self._normal_restore_geometry = None
+        self._restore_geometry_guard_active = False
+
         # 初始化UI和加载数据
         self.init_ui()
-        self.load_data()
         self.apply_dark_theme()
-        
+        self._load_thread = None
+        self._set_loading_state(True)
+        QTimer.singleShot(0, self.start_async_load)
+
+    def _get_primary_restore_geometry(self, available_geometry):
+        """计算报告窗口从最大化还原后的普通窗口尺寸。"""
+        try:
+            margin_x = max(40, int(available_geometry.width() * 0.04))
+            margin_top = max(70, int(available_geometry.height() * 0.07))
+            margin_bottom = max(50, int(available_geometry.height() * 0.05))
+            usable_width = max(420, available_geometry.width() - margin_x * 2)
+            usable_height = max(360, available_geometry.height() - margin_top - margin_bottom)
+
+            target_width = min(max(int(available_geometry.width() * 0.82), 900), usable_width)
+            target_height = min(max(int(available_geometry.height() * 0.78), 620), usable_height)
+
+            x = available_geometry.x() + margin_x + (usable_width - target_width) // 2
+            y = available_geometry.y() + margin_top + (usable_height - target_height) // 2
+            return QRect(x, y, target_width, target_height)
+        except Exception:
+            return QRect(80, 80, 1200, 800)
+
+    def _apply_safe_normal_geometry(self):
+        """最大化还原后强制回到主屏可用区，避免标题栏跑出屏幕。"""
+        if self._restore_geometry_guard_active:
+            return
+        if self.isMaximized() or self.isMinimized() or (self.windowState() & Qt.WindowFullScreen):
+            return
+
+        self._restore_geometry_guard_active = True
+        try:
+            from PyQt5.QtWidgets import QApplication
+            screen = QApplication.primaryScreen()
+            if screen is None:
+                return
+
+            avail = screen.availableGeometry()
+            target = self._normal_restore_geometry
+            if (
+                target is None
+                or target.width() >= avail.width()
+                or target.height() >= avail.height()
+                or not avail.adjusted(0, 0, -1, -1).contains(target.topLeft())
+            ):
+                target = self._get_primary_restore_geometry(avail)
+                self._normal_restore_geometry = target
+
+            self.setGeometry(target)
+
+            # setGeometry 作用在客户区，Windows 的标题栏边框可能仍会让 frame 略微越界；
+            # 这里按 frame 再校正一次，确保标题栏留在可见区域。
+            frame = self.frameGeometry()
+            new_pos = self.pos()
+            min_top = avail.top() + 8
+            if frame.top() < min_top:
+                new_pos.setY(new_pos.y() + (min_top - frame.top()))
+            if frame.left() < avail.left() + 8:
+                new_pos.setX(new_pos.x() + (avail.left() + 8 - frame.left()))
+            if frame.right() > avail.right() - 8:
+                new_pos.setX(new_pos.x() - (frame.right() - (avail.right() - 8)))
+            if frame.bottom() > avail.bottom() - 8:
+                new_pos.setY(new_pos.y() - (frame.bottom() - (avail.bottom() - 8)))
+            self.move(new_pos)
+        finally:
+            self._restore_geometry_guard_active = False
+
+    def _constrain_to_primary_screen(self):
+        """在主屏上最大化显示报告窗口。
+
+        先把窗口移动到主屏，再最大化，避免多显示器下报告窗口
+        横跨主屏和副屏，或在副屏最大化。
+        """
+        try:
+            from PyQt5.QtWidgets import QApplication
+            screen = QApplication.primaryScreen()
+            if screen is None:
+                self.showMaximized()
+                return
+            avail = screen.availableGeometry()
+
+            # 先设置一个安全的普通窗口尺寸，再最大化。这样用户点击系统
+            # “还原”按钮时会回到可用区内的普通尺寸，而不是仍然占满屏幕。
+            self._normal_restore_geometry = self._get_primary_restore_geometry(avail)
+            self.setGeometry(self._normal_restore_geometry)
+            self.showMaximized()
+        except Exception as e:
+            print(f"在主屏最大化报告窗口失败: {str(e)}")
+            try:
+                self.showMaximized()
+            except Exception:
+                pass
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._constrained_to_primary:
+            self._constrained_to_primary = True
+            self._constrain_to_primary_screen()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            old_state = event.oldState() if hasattr(event, "oldState") else Qt.WindowNoState
+            now_state = self.windowState()
+            restored_from_maximized = bool(old_state & Qt.WindowMaximized) and not bool(now_state & Qt.WindowMaximized)
+            restored_from_fullscreen = bool(old_state & Qt.WindowFullScreen) and not bool(now_state & Qt.WindowFullScreen)
+            if restored_from_maximized or restored_from_fullscreen:
+                QTimer.singleShot(0, self._apply_safe_normal_geometry)
+                QTimer.singleShot(80, self._apply_safe_normal_geometry)
+
     def load_icon(self):
         """加载窗口图标"""
         try:
@@ -103,20 +453,7 @@ class BacktestResultWindow(QMainWindow):
     
     def detect_screen_resolution(self):
         """检测屏幕分辨率并返回字体缩放比例"""
-        from PyQt5.QtWidgets import QApplication
-        screen = QApplication.desktop().screenGeometry()
-        width = screen.width()
-        height = screen.height()
-        
-        # 根据屏幕宽度确定字体缩放比例
-        if width >= 3840:  # 4K及以上分辨率
-            return 1.8
-        elif width >= 2560:  # 2K分辨率
-            return 1.4
-        elif width >= 1920:  # 1080P分辨率
-            return 1.0
-        else:  # 低分辨率
-            return 0.8
+        return get_ui_font_scale()
 
     def get_scaled_stylesheet(self):
         """获取根据分辨率缩放的样式表"""
@@ -226,6 +563,83 @@ class BacktestResultWindow(QMainWindow):
         """应用深色主题样式"""
         # 使用缩放后的样式表
         self.setStyleSheet(self.get_scaled_stylesheet())
+
+    def apply_ui_scale(self, scale=None):
+        """应用界面字号倍率到当前窗口"""
+        if scale is None:
+            scale = get_ui_font_scale()
+        self.font_scale = scale
+        self.apply_dark_theme()
+        self.update()
+
+    def apply_dark_titlebar(self, widget):
+        if sys.platform != 'win32':
+            return
+        try:
+            from ctypes import windll, c_int, byref, sizeof
+            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+            DWMWA_CAPTION_COLOR = 35
+            windll.dwmapi.DwmSetWindowAttribute(
+                int(widget.winId()),
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                byref(c_int(2)),
+                sizeof(c_int)
+            )
+            caption_color = c_int(0x333333)
+            windll.dwmapi.DwmSetWindowAttribute(
+                int(widget.winId()),
+                DWMWA_CAPTION_COLOR,
+                byref(caption_color),
+                sizeof(caption_color)
+            )
+        except Exception:
+            pass
+
+    def open_results_folder(self):
+        try:
+            backtest_dir = os.path.abspath(self.backtest_dir)
+            if not os.path.exists(backtest_dir):
+                msg_box = QMessageBox(self)
+                msg_box.setIcon(QMessageBox.Warning)
+                msg_box.setWindowTitle("提示")
+                msg_box.setText(f"回测结果目录不存在:\n{backtest_dir}")
+                self.apply_dark_titlebar(msg_box)
+                msg_box.exec_()
+                return
+
+            if sys.platform == 'win32':
+                os.startfile(backtest_dir)
+            elif sys.platform == 'darwin':
+                import subprocess
+                subprocess.Popen(['open', backtest_dir])
+            else:
+                import subprocess
+                subprocess.Popen(['xdg-open', backtest_dir])
+
+            file_descriptions = [
+                ("config.csv", "回测配置（策略名称、回测区间、初始资金、基准等）"),
+                ("trades.csv", "交易明细（每笔成交记录）"),
+                ("daily_stats.csv", "每日统计（净值、收益、回撤等）"),
+                ("benchmark.csv", "基准指数数据（用于对比）"),
+                ("summary.csv", "回测汇总指标（用于快速概览）")
+            ]
+            lines = []
+            for filename, desc in file_descriptions:
+                status = "存在" if os.path.exists(os.path.join(backtest_dir, filename)) else "缺失"
+                lines.append(f"{filename}：{desc}（{status}）")
+            info_box = QMessageBox(self)
+            info_box.setIcon(QMessageBox.Information)
+            info_box.setWindowTitle("回测结果文件说明")
+            info_box.setText("\n".join(lines))
+            self.apply_dark_titlebar(info_box)
+            info_box.exec_()
+        except Exception as e:
+            error_box = QMessageBox(self)
+            error_box.setIcon(QMessageBox.Critical)
+            error_box.setWindowTitle("错误")
+            error_box.setText(f"打开回测结果文件夹失败:\n{str(e)}")
+            self.apply_dark_titlebar(error_box)
+            error_box.exec_()
         
     def init_ui(self):
         # 根据分辨率自适应窗口大小
@@ -242,6 +656,53 @@ class BacktestResultWindow(QMainWindow):
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_widget.setLayout(main_layout)
         
+        toolbar_layout = QHBoxLayout()
+        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_layout.addStretch()
+        self.export_results_btn = QPushButton("导出回测结果")
+        
+        # macOS 使用深灰色样式，Windows 使用蓝色样式
+        if sys.platform == 'darwin':
+            self.export_results_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: #505050;
+                    color: #e8e8e8;
+                    border: none;
+                    border-radius: {int(6 * self.font_scale)}px;
+                    padding: {int(6 * self.font_scale)}px {int(14 * self.font_scale)}px;
+                    font-size: {int(14 * self.font_scale)}px;
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{
+                    background-color: #606060;
+                }}
+                QPushButton:pressed {{
+                    background-color: #404040;
+                }}
+            """)
+        else:
+            self.export_results_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: #0078d7;
+                    color: #ffffff;
+                    border: none;
+                    border-radius: {int(6 * self.font_scale)}px;
+                    padding: {int(6 * self.font_scale)}px {int(14 * self.font_scale)}px;
+                    font-size: {int(14 * self.font_scale)}px;
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{
+                    background-color: #1a86d9;
+                }}
+                QPushButton:pressed {{
+                    background-color: #0063b1;
+                }}
+            """)
+        self.export_results_btn.setMinimumHeight(int(30 * self.font_scale))
+        self.export_results_btn.clicked.connect(self.open_results_folder)
+        toolbar_layout.addWidget(self.export_results_btn)
+        main_layout.addLayout(toolbar_layout)
+
         # 创建上下分割器
         splitter = QSplitter(Qt.Vertical)
         splitter.setHandleWidth(2)  # 设置分割条宽度
@@ -275,76 +736,85 @@ class BacktestResultWindow(QMainWindow):
         info_layout.setContentsMargins(int(8 * self.font_scale), int(6 * self.font_scale), 
                                       int(8 * self.font_scale), int(6 * self.font_scale))
         self.info_labels = {}
-        info_items = ["策略名称", "回测区间", "初始资金", "最终资金", 
+        info_items = ["策略名称", "回测区间", "初始资金", "最终资金",
                      "总收益率", "年化收益率", "基准收益率", "基准年化收益率", "最大回撤", "夏普比率",
                      "索提诺比率", "阿尔法", "贝塔",
                      "胜率", "盈亏比", "日均交易次数", "最大连续盈利",
                      "最大连续亏损", "最大单笔盈利", "最大单笔亏损", "年化波动率"]
-        
-        # 创建两列布局显示指标
-        col1_items = info_items[:len(info_items)//2]
-        col2_items = info_items[len(info_items)//2:]
-        
+
+        label_style = f"""
+            font-weight: bold;
+            font-size: {int(14 * self.font_scale)}px;
+            color: #a0a0a0;
+            background-color: transparent;
+        """
+        value_style = f"""
+            color: #e8e8e8;
+            font-size: {int(14 * self.font_scale)}px;
+            font-family: 'Consolas', 'Microsoft YaHei', monospace;
+            background-color: transparent;
+        """
+
+        # 策略名称单独占首行并横跨两列指标的宽度，长名称自动换行，避免被截断
+        name_label = QLabel("策略名称:")
+        name_label.setStyleSheet(label_style)
+        name_label.setMinimumWidth(int(100 * self.font_scale))
+        name_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        name_value = QLabel("--")
+        name_value.setStyleSheet(value_style)
+        name_value.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        name_value.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        name_value.setWordWrap(True)
+        info_layout.addWidget(name_label, 0, 0, Qt.AlignRight)
+        info_layout.addWidget(name_value, 0, 1, 1, 4)
+        self.info_labels["策略名称"] = name_value
+
+        # 其余指标按两列布局显示（从第1行开始）
+        rest_items = info_items[1:]
+        col1_items = rest_items[:(len(rest_items) + 1) // 2]
+        col2_items = rest_items[(len(rest_items) + 1) // 2:]
+
         # 调整标签和值的宽度以确保足够的显示空间
         for i, item in enumerate(col1_items):
             label = QLabel(f"{item}:")
-            label.setStyleSheet(f"""
-                font-weight: bold; 
-                font-size: {int(14 * self.font_scale)}px;
-                color: #a0a0a0;
-                background-color: transparent;
-            """)
+            label.setStyleSheet(label_style)
             label.setMinimumWidth(int(100 * self.font_scale))  # 标签固定最小宽度
             label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)  # 标签宽度固定，高度自适应
-            
+
             value = QLabel("--")
-            value.setStyleSheet(f"""
-                color: #e8e8e8; 
-                font-size: {int(14 * self.font_scale)}px;
-                font-family: 'Consolas', 'Microsoft YaHei', monospace;
-                background-color: transparent;
-            """)
+            value.setStyleSheet(value_style)
             value.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)  # 数值宽度自适应内容
             value.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             value.setWordWrap(False)  # 禁用自动换行
-            
-            info_layout.addWidget(label, i, 0, Qt.AlignRight)
-            info_layout.addWidget(value, i, 1, Qt.AlignLeft)
+
+            info_layout.addWidget(label, i + 1, 0, Qt.AlignRight)
+            info_layout.addWidget(value, i + 1, 1, Qt.AlignLeft)
             self.info_labels[item] = value
-        
+
         # 确保两列之间有足够的间距
         info_layout.setColumnMinimumWidth(2, int(20 * self.font_scale))  # 增加列间距
-        
+
         for i, item in enumerate(col2_items):
             label = QLabel(f"{item}:")
-            label.setStyleSheet(f"""
-                font-weight: bold;
-                font-size: {int(14 * self.font_scale)}px;
-                color: #a0a0a0;
-                background-color: transparent;
-            """)
+            label.setStyleSheet(label_style)
             label.setMinimumWidth(int(100 * self.font_scale))  # 标签固定最小宽度
             label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)  # 标签宽度固定，高度自适应
-            
+
             value = QLabel("--")
-            value.setStyleSheet(f"""
-                color: #e8e8e8; 
-                font-size: {int(14 * self.font_scale)}px;
-                font-family: 'Consolas', 'Microsoft YaHei', monospace;
-                background-color: transparent;
-            """)
+            value.setStyleSheet(value_style)
             value.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)  # 数值宽度自适应内容
             value.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             value.setWordWrap(False)  # 禁用自动换行
-            
-            info_layout.addWidget(label, i, 3, Qt.AlignRight)
-            info_layout.addWidget(value, i, 4, Qt.AlignLeft)
+
+            info_layout.addWidget(label, i + 1, 3, Qt.AlignRight)
+            info_layout.addWidget(value, i + 1, 4, Qt.AlignLeft)
             self.info_labels[item] = value
-        
+
         info_group.setLayout(info_layout)
         # 设置基本信息面板的大小策略，限制其宽度
+        # 宽度需容纳两组"标签+数值"：之前的400px会把数值列挤压到约70px导致内容被截断
         info_group.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
-        info_group.setMaximumWidth(int(400 * self.font_scale))  # 限制最大宽度
+        info_group.setMaximumWidth(int(470 * self.font_scale))  # 限制最大宽度
         top_layout.addWidget(info_group, 0)  # 伸展因子为0，不拉伸
         
         # 收益曲线图表
@@ -383,7 +853,8 @@ class BacktestResultWindow(QMainWindow):
         
         # 设置图表组件的大小策略，让其占据更多空间
         chart_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        chart_group.setMinimumSize(int(600 * self.font_scale), int(400 * self.font_scale))
+        layout_scale = min(self.font_scale, 1.25)
+        chart_group.setMinimumSize(int(480 * layout_scale), int(240 * layout_scale))
         
         top_layout.addWidget(chart_group, 1)  # 伸展因子为1，占据剩余空间
         
@@ -450,9 +921,9 @@ class BacktestResultWindow(QMainWindow):
                 background-color: #383838;
             }}
         """)
-        self.trades_table.setColumnCount(7)
+        self.trades_table.setColumnCount(10)
         self.trades_table.setHorizontalHeaderLabels(
-            ["交易时间", "证券代码", "交易方向", "成交价格", "成交数量", "成交金额", "手续费"]
+            ["交易时间", "证券代码", "交易方向", "成交价格", "成交数量", "成交金额", "手续费", "持仓资金", "可用资金", "总资产"]
         )
         self.trades_table.setAlternatingRowColors(True)
         self.trades_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -563,15 +1034,85 @@ class BacktestResultWindow(QMainWindow):
         
         performance_widget.setLayout(performance_layout)
         tab_widget.addTab(performance_widget, "绩效分析")
-        
+
+        # 添加个股分析"假标签"（点击时打开窗口而不是切换页面）
+        self.stock_analysis_tab_index = tab_widget.addTab(QWidget(), "📊 个股分析")
+        self.last_valid_tab_index = 2  # 绩效分析的索引
+
+        # 为个股分析标签设置不同的样式
+        if sys.platform == 'darwin':
+            tab_widget.tabBar().setStyleSheet(f"""
+                QTabBar::tab {{
+                    background-color: #404040;
+                    color: #e8e8e8;
+                    padding: {int(8 * self.font_scale)}px {int(16 * self.font_scale)}px;
+                    margin-right: 2px;
+                    border-top-left-radius: 4px;
+                    border-top-right-radius: 4px;
+                    font-size: {int(14 * self.font_scale)}px;
+                }}
+                QTabBar::tab:selected {{
+                    background-color: #333333;
+                    border-bottom: 2px solid #505050;
+                }}
+                QTabBar::tab:hover {{
+                    background-color: #505050;
+                }}
+                QTabBar::tab:last {{
+                    background-color: #505050;
+                    color: #e8e8e8;
+                    font-weight: bold;
+                    border: 1px solid #606060;
+                    border-bottom: none;
+                }}
+                QTabBar::tab:last:hover {{
+                    background-color: #606060;
+                }}
+            """)
+        else:
+            tab_widget.tabBar().setStyleSheet(f"""
+                QTabBar::tab {{
+                    background-color: #404040;
+                    color: #e8e8e8;
+                    padding: {int(8 * self.font_scale)}px {int(16 * self.font_scale)}px;
+                    margin-right: 2px;
+                    border-top-left-radius: 4px;
+                    border-top-right-radius: 4px;
+                    font-size: {int(14 * self.font_scale)}px;
+                }}
+                QTabBar::tab:selected {{
+                    background-color: #333333;
+                    border-bottom: 2px solid #007acc;
+                }}
+                QTabBar::tab:hover {{
+                    background-color: #505050;
+                }}
+                QTabBar::tab:last {{
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 #4a6fa5, stop:1 #3d5a80);
+                    color: #ffffff;
+                    font-weight: bold;
+                    border: 1px solid #5a7fb5;
+                    border-bottom: none;
+                }}
+                QTabBar::tab:last:hover {{
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                        stop:0 #5a8fc5, stop:1 #4d7aa0);
+                }}
+            """)
+
+        # 连接标签切换信号
+        tab_widget.currentChanged.connect(self._on_tab_changed)
+        self.tab_widget = tab_widget  # 保存引用
+
         splitter.addWidget(tab_widget)
         
         # 设置分割器的初始大小比例
         splitter.setSizes([750, 250])  # 增加上部分比例，减少底部Tab区域占比
         
         # 设置最小高度
-        top_widget.setMinimumHeight(550)  # 增加图表区域高度
-        tab_widget.setMinimumHeight(300)  # 适当减小tab页最小高度
+        top_widget.setMinimumHeight(int(300 * layout_scale))
+        tab_widget.setMinimumHeight(int(180 * layout_scale))
         
         main_layout.addWidget(splitter)
         
@@ -588,13 +1129,13 @@ class BacktestResultWindow(QMainWindow):
         self.ax_pnl = fig.add_subplot(gs[5, 0], sharex=self.ax)  # 第6行用于盈亏分析图
         self.ax_trades = fig.add_subplot(gs[6, 0], sharex=self.ax)  # 第7行用于成交记录图
         
-        # 根据字体缩放计算图表字体大小，适中调整
-        title_fontsize = int(16 * self.font_scale)  # 适中的标题字体
-        label_fontsize = int(13 * self.font_scale)  # 适中的标签字体
-        tick_fontsize = int(11 * self.font_scale)   # 适中的刻度字体
-        
+        # 根据字体缩放计算图表字体大小（与update_chart保持一致）
+        title_fontsize = int(14 * self.font_scale)  # 适中的标题字体
+        label_fontsize = int(11 * self.font_scale)  # 适中的标签字体
+        tick_fontsize = int(10 * self.font_scale)   # 适中的刻度字体
+
         # 设置上方子图（收益曲线）
-        self.ax.set_title("策略收益与基准对比", color='#e8e8e8', pad=int(20 * self.font_scale), 
+        self.ax.set_title("策略收益与基准对比", color='#e8e8e8', pad=int(10 * self.font_scale),
                          fontsize=title_fontsize, fontweight='bold')
         self.ax.set_facecolor('#2d2d2d')
         self.ax.set_ylabel("净值", color='#a0a0a0', fontsize=label_fontsize)
@@ -635,9 +1176,9 @@ class BacktestResultWindow(QMainWindow):
         # 特别设置：反转回撤图的y轴（使回撤为负值显示在下方）
         self.ax_drawdown.invert_yaxis()
         
-        # 调整图表边距，为字体留出适当空间避免遮挡
-        fig.subplots_adjust(left=0.10, right=0.96, top=0.92, bottom=0.12, hspace=0.18)  # 适当增加边距以容纳较大字体
-        
+        # 调整图表边距，为字体留出适当空间避免遮挡（按画布像素尺寸动态计算）
+        self._apply_chart_margins(fig)
+
         # 初始化图表元素为None，避免悬停事件中的错误
         self.v_line_ax = None
         self.v_line_drawdown = None
@@ -651,17 +1192,284 @@ class BacktestResultWindow(QMainWindow):
         
         return canvas
     
+    @staticmethod
+    def _format_amount_tick(value, pos=None):
+        """金额类Y轴刻度缩写：超过万/亿用中文单位，避免"-12000"这类长数字
+        把轴标题挤出画布左边界。"""
+        av = abs(value)
+        if av >= 1e8:
+            return f"{value / 1e8:g}亿"
+        if av >= 1e4:
+            return f"{value / 1e4:g}万"
+        return f"{value:g}"
+
+    def _apply_chart_margins(self, fig=None):
+        """按画布实际像素尺寸动态计算边距，保证标题、Y轴刻度和底部日期标签完整显示。
+
+        之前使用硬编码比例（top=0.92/0.95），在高分屏字体放大后标题所需的
+        像素高度超过预留比例，导致主图标题被裁掉。
+        """
+        try:
+            if fig is None:
+                fig = self.chart_view.figure
+            size = fig.get_size_inches()
+            w_px = size[0] * fig.dpi
+            h_px = size[1] * fig.dpi
+            if w_px <= 1 or h_px <= 1:
+                return
+            # 顶部：主图标题字号 + 标题pad + 余量
+            top_px = (14 + 10) * self.font_scale + 14
+            # 底部：旋转45°的日期刻度标签（"2025-01-01"旋转后垂直跨度约60px*缩放，
+            # 再加刻度间距和余量；留太紧会裁掉最深处的首字符）
+            bottom_px = 78 * self.font_scale
+            # 左侧：Y轴刻度数字 + 轴标题（刻度已用"万/亿"缩写控制宽度）
+            left_px = 72 * self.font_scale
+            top = 1.0 - min(0.20, top_px / h_px)
+            bottom = min(0.28, bottom_px / h_px)
+            left = min(0.18, left_px / w_px)
+            fig.subplots_adjust(left=left, right=0.97, top=top, bottom=bottom, hspace=0.25)
+        except Exception as e:
+            print(f"调整图表边距时出错: {str(e)}")
+
     def on_chart_resize(self, event):
         """处理图表画布大小变化事件，重新调整布局"""
         try:
             if hasattr(self, 'chart_view') and self.chart_view:
                 # 重新调整布局以确保标题、坐标轴和标注完整显示
-                self.chart_view.figure.subplots_adjust(left=0.10, right=0.96, top=0.92, bottom=0.12, hspace=0.18)
+                self._apply_chart_margins()
                 # 重绘图表
                 self.chart_view.draw_idle()
         except Exception as e:
             print(f"调整图表布局时出错: {str(e)}")
-        
+
+    def _on_tab_changed(self, index):
+        """处理标签页切换事件"""
+        if index == self.stock_analysis_tab_index:
+            # 点击个股分析标签时，打开窗口并切回上一个有效标签
+            self.tab_widget.blockSignals(True)  # 阻止信号避免递归
+            self.tab_widget.setCurrentIndex(self.last_valid_tab_index)
+            self.tab_widget.blockSignals(False)
+            self.open_stock_analysis()
+        else:
+            # 记录当前有效标签索引
+            self.last_valid_tab_index = index
+
+    def open_stock_analysis(self):
+        """打开个股分析窗口"""
+        try:
+            # 获取交易数据和每日统计数据
+            trades_df = getattr(self, 'trades_df', None)
+            daily_stats_df = getattr(self, 'daily_stats_df', None)
+
+            if trades_df is None or trades_df.empty:
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "提示", "没有交易记录，无法进行个股分析")
+                return
+
+            existing = getattr(self, 'stock_analysis_window', None)
+            if existing is not None:
+                try:
+                    if existing.isVisible():
+                        existing.showMaximized()
+                        existing.raise_()
+                        existing.activateWindow()
+                        return
+                except RuntimeError:
+                    self.stock_analysis_window = None
+
+            # 创建并显示个股分析窗口
+            self.stock_analysis_window = StockAnalysisWindow(
+                self.backtest_dir,
+                trades_df,
+                daily_stats_df,
+                parent=self
+            )
+            window = self.stock_analysis_window
+            window.destroyed.connect(
+                lambda _obj=None, target=window: self._forget_stock_analysis_window(target)
+            )
+            self.stock_analysis_window.show()
+        except Exception as e:
+            print(f"打开个股分析窗口失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    def _forget_stock_analysis_window(self, window):
+        if getattr(self, 'stock_analysis_window', None) is window:
+            self.stock_analysis_window = None
+
+    def closeEvent(self, event):
+        """关闭后销毁所有图表和大表数据，防止主界面长期持有重型结果对象。"""
+        thread = getattr(self, '_load_thread', None)
+        if thread is not None and thread.isRunning():
+            if not self._closing_after_load:
+                self._closing_after_load = True
+                self.hide()
+                thread.requestInterruption()
+                thread.finished.connect(self.close)
+            event.ignore()
+            return
+
+        child = getattr(self, 'stock_analysis_window', None)
+        if child is not None:
+            try:
+                child.close()
+            except RuntimeError:
+                pass
+            self.stock_analysis_window = None
+
+        for canvas_name in (
+            'chart_view', 'returns_dist_canvas', 'monthly_returns_canvas',
+            'rolling_metrics_canvas',
+        ):
+            canvas = getattr(self, canvas_name, None)
+            if canvas is not None:
+                try:
+                    canvas.close()
+                except Exception:
+                    pass
+
+        figures = []
+        chart_view = getattr(self, 'chart_view', None)
+        if chart_view is not None:
+            figures.append(getattr(chart_view, 'figure', None))
+        for figure_name in (
+            'returns_dist_figure', 'monthly_returns_figure', 'rolling_metrics_figure',
+        ):
+            figures.append(getattr(self, figure_name, None))
+        for figure in figures:
+            if figure is None:
+                continue
+            try:
+                figure.clear()
+                plt.close(figure)
+            except Exception:
+                pass
+
+        for table_name in ('trades_table', 'daily_stats_table'):
+            table = getattr(self, table_name, None)
+            if table is not None:
+                table.clearContents()
+                table.setRowCount(0)
+
+        for data_name in ('trades_df', 'daily_stats_df', 'benchmark_df'):
+            if hasattr(self, data_name):
+                setattr(self, data_name, None)
+        event.accept()
+
+    def _set_loading_state(self, loading):
+        """切换结果窗口加载状态。"""
+        try:
+            self.export_results_btn.setEnabled(not loading)
+            for label in getattr(self, 'info_labels', {}).values():
+                label.setText("加载中..." if loading else "--")
+            if loading:
+                self.trades_table.setRowCount(1)
+                self.trades_table.setColumnCount(1)
+                self.trades_table.setHorizontalHeaderLabels(["状态"])
+                self.trades_table.setItem(0, 0, QTableWidgetItem("正在加载交易记录..."))
+                self.daily_stats_table.setRowCount(1)
+                self.daily_stats_table.setColumnCount(1)
+                self.daily_stats_table.setHorizontalHeaderLabels(["状态"])
+                self.daily_stats_table.setItem(0, 0, QTableWidgetItem("正在加载每日统计..."))
+        except Exception as e:
+            print(f"设置加载状态时出错: {str(e)}")
+
+    def start_async_load(self):
+        """异步加载回测数据，避免构造结果窗口时阻塞GUI线程。"""
+        try:
+            if self._load_thread is not None and self._load_thread.isRunning():
+                return
+
+            self._load_thread = BacktestResultLoadThread(self.backtest_dir, self)
+            self._load_thread.loaded.connect(self._on_async_data_loaded)
+            self._load_thread.error.connect(self._on_async_data_error)
+            self._load_thread.finished.connect(self._on_async_load_finished)
+            self._load_thread.start()
+        except Exception as e:
+            self._on_async_data_error(str(e))
+
+    def _on_async_load_finished(self):
+        """异步加载线程结束后的引用清理。"""
+        try:
+            if self._load_thread is not None:
+                self._load_thread.deleteLater()
+                self._load_thread = None
+        except Exception as e:
+            print(f"清理结果加载线程时出错: {str(e)}")
+
+    def _on_async_data_error(self, error_text):
+        """异步加载失败处理。"""
+        print(f"加载回测数据时出错: {error_text}")
+        print(f"当前工作目录: {os.getcwd()}")
+        self._set_loading_state(False)
+        for label in getattr(self, 'info_labels', {}).values():
+            label.setText("--")
+        self.trades_table.setRowCount(1)
+        self.trades_table.setColumnCount(1)
+        self.trades_table.setHorizontalHeaderLabels(["错误"])
+        self.trades_table.setItem(0, 0, QTableWidgetItem("加载回测数据失败"))
+        self.daily_stats_table.setRowCount(1)
+        self.daily_stats_table.setColumnCount(1)
+        self.daily_stats_table.setHorizontalHeaderLabels(["错误"])
+        self.daily_stats_table.setItem(0, 0, QTableWidgetItem("加载回测数据失败"))
+
+    def _on_async_data_loaded(self, data):
+        """在GUI线程应用后台加载得到的回测数据。"""
+        try:
+            self._set_loading_state(False)
+            self._apply_loaded_data(data)
+            self.export_results_btn.setEnabled(True)
+        except Exception as e:
+            import traceback
+            self._on_async_data_error(f"{str(e)}\n{traceback.format_exc()}")
+
+    def _apply_loaded_data(self, data):
+        """将已读取的数据更新到结果窗口（分步进度条提示，避免渲染期界面假死无反馈）。"""
+        from PyQt5.QtWidgets import QProgressDialog, QApplication
+
+        self.price_decimals = data['price_decimals']
+        self.trades_df = data['trades_raw_df']
+        self._chart_trades_df = data['trades_raw_df'].copy()
+        self.daily_stats_df = data['daily_stats_original_df']
+        self.benchmark_code = data['benchmark_code']
+        self.benchmark_base_price = data.get('benchmark_base_price')
+        self.benchmark_df = data['benchmark_df']
+
+        config_row = data['config_row']
+        daily_stats_df = data['daily_stats_df']
+        benchmark_df = data['benchmark_df']
+        trades_display_df = data['trades_display_df']
+
+        # 渲染期给用户一个“正在生成结果…”的等待条（分步推进），
+        # 配合交易表封顶/固定列宽，避免大数据量下界面长时间无反馈的“假死”。
+        trade_cnt = len(trades_display_df) if trades_display_df is not None else 0
+        steps = [
+            ("正在生成基本信息…", lambda: self.update_basic_info(config_row, daily_stats_df, benchmark_df)),
+            ("正在绘制收益曲线…", lambda: self.update_chart(daily_stats_df, benchmark_df)),
+            (f"正在填充交易记录（共 {trade_cnt:,} 笔）…", lambda: self.update_trades_table(trades_display_df)),
+            ("正在填充每日统计…", lambda: self.update_daily_stats_table(daily_stats_df)),
+            ("正在绘制绩效分析图…", lambda: self.update_performance_charts(daily_stats_df, benchmark_df)),
+        ]
+        progress = QProgressDialog("正在生成回测结果，请稍候…", None, 0, len(steps), self)
+        progress.setWindowTitle("生成回测结果")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setCancelButton(None)            # 不可取消，避免中途打断渲染
+        progress.setMinimumDuration(0)            # 立即显示
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        QApplication.processEvents()
+        try:
+            for idx, (label, fn) in enumerate(steps):
+                progress.setLabelText(label)
+                QApplication.processEvents()      # 先把提示文字刷出来再做重活
+                fn()
+                progress.setValue(idx + 1)
+                QApplication.processEvents()
+        finally:
+            progress.close()
+
     def load_data(self):
         """加载回测数据"""
         try:
@@ -675,8 +1483,6 @@ class BacktestResultWindow(QMainWindow):
             # 构建配置文件路径
             config_path = os.path.join(backtest_dir, "config.csv")
 
-            time.sleep(1)
-            
             # 打印调试信息
             print(f"尝试加载配置文件: {config_path}") 
             print(f"文件是否存在: {os.path.exists(config_path)}")
@@ -703,6 +1509,12 @@ class BacktestResultWindow(QMainWindow):
                 trades_df = pd.DataFrame(columns=['datetime', 'code', 'action', 'price', 'volume', 'amount', 'commission'])
             else:
                 trades_df = pd.read_csv(trades_path, encoding='utf-8-sig')
+            
+            # 从交易记录中获取股票代码，判断价格精度
+            if len(trades_df) > 0 and 'code' in trades_df.columns:
+                stock_codes = trades_df['code'].unique().tolist()
+                _, self.price_decimals = determine_pool_type(stock_codes)
+                print(f"根据股票池类型设置价格精度: {self.price_decimals}位小数")
             
             if not os.path.exists(daily_stats_path):
                 print(f"警告: 每日统计文件不存在: {daily_stats_path}")
@@ -823,7 +1635,11 @@ class BacktestResultWindow(QMainWindow):
                             
                     if missing_columns:
                         raise ValueError(f"{df_name} 缺少必要的列: {missing_columns}")
-            
+
+            # 保存原始数据供个股分析使用（在重命名列之前）
+            self.trades_df = trades_df.copy()
+            self.daily_stats_df = daily_stats_df.copy()
+
             # 重命名 trades_df 的列以匹配期望的列名
             trades_df = trades_df.rename(columns={
                 'datetime': 'time',
@@ -845,9 +1661,16 @@ class BacktestResultWindow(QMainWindow):
                 print(f"买卖动作映射出错: {str(e)}")
                 print(f"direction列值: {trades_df['direction'].unique().tolist() if 'direction' in trades_df.columns else 'direction列不存在'}")
             
+            # 保存基准代码供后续使用（从config.csv读取，默认沪深300）
+            config_row = config_df.iloc[0]
+            self.benchmark_code = config_row.get('benchmark', '000300.SH') if 'benchmark' in config_row.index else '000300.SH'
+            print(f"使用基准合约代码: {self.benchmark_code}")
+            self.benchmark_base_price = resolve_benchmark_base_price(benchmark_df, daily_stats_df)
+            self.benchmark_df = benchmark_df
+
             # 更新基本信息
-            self.update_basic_info(config_df.iloc[0], daily_stats_df)
-            
+            self.update_basic_info(config_df.iloc[0], daily_stats_df, benchmark_df)
+
             # 更新图表
             self.update_chart(daily_stats_df, benchmark_df)
             
@@ -884,26 +1707,34 @@ class BacktestResultWindow(QMainWindow):
             background-color: transparent;
         """)
 
-    def update_basic_info(self, config, daily_stats_df):
+    def update_basic_info(self, config, daily_stats_df, benchmark_df=None):
         """更新基本信息面板"""
         try:
             # 获取策略名称
-            strategy_name = os.path.splitext(os.path.basename(config['strategy_file']))[0]
+            strategy_file = config.get('strategy_file', '') if hasattr(config, 'get') else config['strategy_file']
+            if pd.isna(strategy_file) or not str(strategy_file).strip():
+                strategy_name = os.path.basename(os.path.dirname(os.path.abspath(self.backtest_dir))) or "unknown"
+            else:
+                strategy_name = os.path.splitext(os.path.basename(str(strategy_file)))[0]
             self.info_labels["策略名称"].setText(strategy_name)
-            
+            self.info_labels["策略名称"].setToolTip(strategy_name)
+
             # 设置回测区间
             start_time = pd.to_datetime(config['start_time']).strftime('%Y-%m-%d')
             end_time = pd.to_datetime(config['end_time']).strftime('%Y-%m-%d')
-            
+
             # 检查是否有每日统计数据
             if len(daily_stats_df) > 0:
                 # 从实际数据中获取起止日期
                 actual_start = pd.to_datetime(daily_stats_df['date'].iloc[0]).strftime('%Y-%m-%d')
                 actual_end = pd.to_datetime(daily_stats_df['date'].iloc[-1]).strftime('%Y-%m-%d')
-                self.info_labels["回测区间"].setText(f"{actual_start} 至\n{actual_end}")
+                range_start, range_end = actual_start, actual_end
             else:
                 # 使用配置中的日期
-                self.info_labels["回测区间"].setText(f"{start_time} 至\n{end_time}")
+                range_start, range_end = start_time, end_time
+            # 用"~"分隔并换行显示，"至"字在窄列下容易被裁掉
+            self.info_labels["回测区间"].setText(f"{range_start} ~\n{range_end}")
+            self.info_labels["回测区间"].setToolTip(f"{range_start} 至 {range_end}")
             
             # 设置初始资金
             init_capital = float(config['init_capital'])
@@ -980,53 +1811,57 @@ class BacktestResultWindow(QMainWindow):
                     self.set_value_color(self.info_labels["索提诺比率"], "0.00", 0)
                 
                 # 计算阿尔法和贝塔
-                # 需要基准收益率数据
-                # 这里假设已经有了基准数据，否则需要加载
                 try:
-                    benchmark_path = os.path.join(self.backtest_dir, "benchmark.csv")
-                    if os.path.exists(benchmark_path):
-                        benchmark_df = pd.read_csv(benchmark_path, encoding='utf-8-sig')
-                        if len(benchmark_df) > 0 and 'date' in benchmark_df.columns and 'close' in benchmark_df.columns:
-                            # 计算基准收益率
-                            benchmark_df['date'] = pd.to_datetime(benchmark_df['date'])
-                            benchmark_df = benchmark_df.sort_values('date')
-                            benchmark_df['return'] = benchmark_df['close'].pct_change()
-                            
-                            # 计算基准总收益率
-                            benchmark_return = self.calculate_benchmark_return(benchmark_df)
-                            
-                            # 添加基准收益率信息
+                    local_benchmark_df = benchmark_df
+                    if local_benchmark_df is None:
+                        local_benchmark_df = getattr(self, 'benchmark_df', None)
+                    if local_benchmark_df is None:
+                        benchmark_path = os.path.join(self.backtest_dir, "benchmark.csv")
+                        if os.path.exists(benchmark_path):
+                            local_benchmark_df = pd.read_csv(benchmark_path, encoding='utf-8-sig')
+
+                    if local_benchmark_df is not None:
+                        local_benchmark_df = local_benchmark_df.copy()
+                        if len(local_benchmark_df) > 0 and 'date' in local_benchmark_df.columns and 'close' in local_benchmark_df.columns:
+                            local_benchmark_df['date'] = pd.to_datetime(local_benchmark_df['date'])
+                            local_benchmark_df = local_benchmark_df.sort_values('date')
+
+                            # 拆分 benchmark.csv：前几行是回测前数据，后面是回测期间数据
+                            daily_stats_df['date'] = pd.to_datetime(daily_stats_df['date'])
+                            backtest_start = daily_stats_df['date'].min()
+                            bt_bench = local_benchmark_df[local_benchmark_df['date'] >= backtest_start].copy()
+
+                            base_price = getattr(self, 'benchmark_base_price', None)
+                            if base_price is None:
+                                base_price = resolve_benchmark_base_price(local_benchmark_df, daily_stats_df)
+
+                            end_price = float(bt_bench['close'].iloc[-1]) if len(bt_bench) > 0 else base_price
+                            benchmark_return = ((end_price - base_price) / base_price) * 100 if base_price > 0 else 0
+
                             if "基准收益率" in self.info_labels:
                                 self.set_value_color(self.info_labels["基准收益率"], f"{benchmark_return:+.2f}%", benchmark_return)
-                            else:
-                                # 如果标签不存在，则在这里添加
-                                print("注意: 基准收益率标签不存在，请确保界面布局已包含该标签")
-                            
-                            # 计算基准年化收益率
-                            if days > 0:  # 确保有效的交易日数量
+
+                            annualized_benchmark_return = 0
+                            if days > 0:
                                 annualized_benchmark_return = self.calculate_annualized_benchmark_return(benchmark_return, days)
-                                
-                                # 添加基准年化收益率信息
                                 if "基准年化收益率" in self.info_labels:
                                     self.set_value_color(self.info_labels["基准年化收益率"], f"{annualized_benchmark_return:+.2f}%", annualized_benchmark_return)
-                                else:
-                                    # 如果标签不存在，则在这里添加
-                                    print("注意: 基准年化收益率标签不存在，请确保界面布局已包含该标签")
-                            
-                            # 确保日期对齐
-                            daily_stats_df['date'] = pd.to_datetime(daily_stats_df['date'])
+
+                            # 用回测期间的数据计算日收益率（含第一天相对base的收益率）
+                            bt_bench_ret = bt_bench['close'].pct_change()
+                            if len(bt_bench_ret) > 0 and base_price > 0:
+                                bt_bench_ret.iloc[0] = (float(bt_bench['close'].iloc[0]) - base_price) / base_price
+                            bt_bench = bt_bench.copy()
+                            bt_bench['return'] = bt_bench_ret.values
                             merged_df = pd.merge(daily_stats_df[['date', 'daily_return']], 
-                                               benchmark_df[['date', 'return']], 
+                                               bt_bench[['date', 'return']], 
                                                on='date', how='inner')
                             
-                            if len(merged_df) > 10:  # 确保有足够的数据点
-                                # 计算贝塔值
+                            if len(merged_df) > 10:
                                 _, beta = self.calculate_alpha_beta(merged_df['daily_return'], merged_df['return'])
                                 self.info_labels["贝塔"].setText(f"{beta:+.4f}")
                                 
-                                # 使用年化收益率直接计算Alpha
                                 if days > 0 and init_capital > 0:
-                                    # 使用新方法计算Alpha
                                     alpha = self.calculate_alpha(annual_return, annualized_benchmark_return, beta)
                                     self.set_value_color(self.info_labels["阿尔法"], f"{alpha:+.4f}", alpha)
                                 else:
@@ -1055,8 +1890,15 @@ class BacktestResultWindow(QMainWindow):
                 # 尝试加载交易记录，计算交易相关指标
                 try:
                     trades_path = os.path.join(self.backtest_dir, "trades.csv")
-                    if os.path.exists(trades_path):
+                    loaded_trades_df = getattr(self, 'trades_df', None)
+                    if loaded_trades_df is not None:
+                        trades_df = loaded_trades_df.copy()
+                    elif os.path.exists(trades_path):
                         trades_df = pd.read_csv(trades_path, encoding='utf-8-sig')
+                    else:
+                        trades_df = None
+
+                    if trades_df is not None:
                         
                         # 输出调试信息
                         print(f"update_basic_info中的交易数据列名: {trades_df.columns.tolist()}")
@@ -1105,7 +1947,7 @@ class BacktestResultWindow(QMainWindow):
                             # 计算胜率和盈亏比
                             win_rate, profit_ratio = self.calculate_win_rate_and_profit_ratio(trades_df)
                             self.info_labels["胜率"].setText(f"{win_rate:.2%}")
-                            self.info_labels["盈亏比"].setText(f"{profit_ratio:.2f}")
+                            self.info_labels["盈亏比"].setText("∞" if profit_ratio == float('inf') else f"{profit_ratio:.2f}")
                             
                             # 计算交易相关指标
                             daily_trades, max_win_streak, max_loss_streak, max_profit, max_loss = self.calculate_trading_metrics(trades_df, daily_stats_df)
@@ -1289,7 +2131,7 @@ class BacktestResultWindow(QMainWindow):
         """更新收益曲线图表、回撤分析图、盈亏分析图和成交记录图"""
         try:
             # 定义字体大小（与create_chart中保持一致）
-            title_fontsize = int(13 * self.font_scale)
+            title_fontsize = int(14 * self.font_scale)
             label_fontsize = int(11 * self.font_scale)
             tick_fontsize = int(10 * self.font_scale)
             
@@ -1306,7 +2148,7 @@ class BacktestResultWindow(QMainWindow):
             self.ax_trades.set_facecolor('#2d2d2d')  # 成交记录图背景色
             
             # 重新设置标题和轴标签字体
-            self.ax.set_title("策略收益与基准对比", color='#e8e8e8', pad=int(20 * self.font_scale), 
+            self.ax.set_title("策略收益与基准对比", color='#e8e8e8', pad=int(10 * self.font_scale),
                              fontsize=title_fontsize, fontweight='bold')
             self.ax.set_ylabel("净值", color='#a0a0a0', fontsize=label_fontsize)
             self.ax_drawdown.set_ylabel("回撤率 (%)", color='#a0a0a0', fontsize=label_fontsize)
@@ -1320,7 +2162,22 @@ class BacktestResultWindow(QMainWindow):
                 ax.grid(True, linestyle='--', alpha=0.1, color='#808080')
                 for spine in ax.spines.values():
                     spine.set_color('#404040')
-            
+
+            # clear()会重置刻度可见性：重新隐藏上方三个子图的X轴日期标签，
+            # 只在最下方的成交记录子图显示日期，避免子图之间文字重叠
+            self.ax.tick_params(axis='x', labelbottom=False)
+            self.ax_drawdown.tick_params(axis='x', labelbottom=False)
+            self.ax_pnl.tick_params(axis='x', labelbottom=False)
+
+            # 三个小子图高度有限，限制Y轴刻度数量，避免刻度文字拥挤、与相邻子图重叠
+            for ax in [self.ax_drawdown, self.ax_pnl, self.ax_trades]:
+                ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=4))
+
+            # 盈亏/成交量子图的刻度用"万/亿"缩写，避免长数字把轴标题挤出画布
+            amount_formatter = ticker.FuncFormatter(self._format_amount_tick)
+            self.ax_pnl.yaxis.set_major_formatter(amount_formatter)
+            self.ax_trades.yaxis.set_major_formatter(amount_formatter)
+
             # 反转回撤图的y轴
             self.ax_drawdown.invert_yaxis()
             
@@ -1371,65 +2228,15 @@ class BacktestResultWindow(QMainWindow):
             if len(benchmark_df) > 0 and 'close' in benchmark_df.columns:
                 try:
                     # 计算基准净值序列
-                    benchmark_initial = benchmark_df['close'].iloc[0]
-                    if benchmark_initial == 0:
+                    benchmark_initial = getattr(self, 'benchmark_base_price', None)
+                    if benchmark_initial is None:
+                        benchmark_initial = resolve_benchmark_base_price(benchmark_df, daily_stats_df)
+                    if benchmark_initial is None:
+                        benchmark_initial = float(benchmark_df['close'].iloc[0])
+                    if not np.isfinite(benchmark_initial) or benchmark_initial == 0:
                         print("警告：基准初始值为0，使用1作为替代值")
                         benchmark_initial = 1.0
-                    
-                    # 尝试获取策略起始日期前一个交易日的基准收盘价
-                    try:
-                        # 导入xtdata
-                        from xtquant import xtdata
-                        
-                        # 获取策略起始日期
-                        first_date = daily_stats_df['date'].min()
-                        
-                        # 打印基准数据信息
-                        print(f"基准数据信息: 行数={len(benchmark_df)}, 日期范围={benchmark_df['date'].min()} 到 {benchmark_df['date'].max()}")
-                        
-                        # 将日期转换为YYYYMMDD格式
-                        first_date_str = first_date.strftime('%Y%m%d')
-                        
-                        # 计算前一个交易日的日期（往前推5天，确保能获取到前一个交易日）
-                        from datetime import datetime, timedelta
-                        prev_date = (first_date - timedelta(days=5)).strftime('%Y%m%d')
-                        
-                        # 获取沪深300指数（000300.SH）在这段时间的数据
-                        extra_data = xtdata.get_market_data(
-                            field_list=['close'],
-                            stock_list=['000300.SH'],
-                            period='1d',
-                            start_time=prev_date,
-                            end_time=first_date_str
-                        )
-                        
-                        # 检查是否成功获取到数据
-                        if extra_data and 'close' in extra_data:
-                            extra_close = extra_data['close']
-                            
-                            # 根据实际数据结构检查，索引应该是股票代码，列是日期
-                            if isinstance(extra_close, pd.DataFrame) and '000300.SH' in extra_close.index and len(extra_close.columns) > 1:
-                                # 获取日期列表并排序
-                                date_columns = sorted(extra_close.columns)
-                                
-                                # 获取倒数第二个日期的收盘价（前一交易日）
-                                prev_close = extra_close.loc['000300.SH', date_columns[-2]]
-                                
-                                # 记录日志
-                                print(f"成功获取到前一交易日沪深300指数收盘价: {prev_close}, 日期: {date_columns[-2]}")
-                                
-                                # 使用前一交易日的收盘价作为基准初始值
-                                benchmark_initial = prev_close
-                                print(f"使用前一交易日收盘价 {benchmark_initial} 作为基准初始值")
-                            else:
-                                print(f"获取前一交易日数据失败，数据格式可能异常: 索引={extra_close.index}, 列={extra_close.columns}")
-                                print(f"使用首日价格 {benchmark_initial} 作为基准初始值")
-                        else:
-                            print(f"获取前一交易日数据失败，extra_data格式: {extra_data}")
-                            print(f"使用首日价格 {benchmark_initial} 作为基准初始值")
-                    except Exception as e:
-                        print(f"尝试获取前一交易日数据时出错: {str(e)}")
-                        print(f"使用首日价格 {benchmark_initial} 作为基准初始值")
+                    print(f"使用本地回测结果中的基准初始值 {benchmark_initial} 计算基准净值")
                     
                     # 用基准初始值计算基准净值序列
                     benchmark_values = benchmark_df['close'] / benchmark_initial
@@ -1507,38 +2314,41 @@ class BacktestResultWindow(QMainWindow):
             max_dd = drawdown.max()
             max_dd_pos = drawdown.values.argmax()
             max_dd_date = dates[max_dd_pos]
-            
+
+            # 给回撤子图底部留出余量，避免最大回撤点贴着子图边缘
+            dd_span = max(max_dd, 0.1)
+            self.ax_drawdown.set_ylim(dd_span * 1.25, -dd_span * 0.06)
+
             self.ax_drawdown.scatter(max_dd_date, max_dd, color='white', s=50, zorder=5)
-            
-            # 智能定位标注，避免超出边界
+
             # 计算最大回撤点在时间轴上的相对位置
             date_range = dates.max() - dates.min()
             relative_pos = (max_dd_date - dates.min()) / date_range if date_range.total_seconds() > 0 else 0.5
-            
-            # 根据相对位置调整标注偏移
-            if relative_pos < 0.3:  # 靠近左边
-                text_offset_x = 15
+
+            # 标注文本固定锚在子图内部的下角（与回撤点相反的一侧），
+            # 用axes fraction坐标保证无论回撤点在哪里，文字都完整显示在子图内，
+            # 不会像之前向下偏移那样画出子图边界、压到下方的盈亏图上
+            if relative_pos > 0.5:
+                text_pos = (0.02, 0.10)
                 ha = 'left'
-            elif relative_pos > 0.7:  # 靠近右边
-                text_offset_x = -15
+            else:
+                text_pos = (0.98, 0.10)
                 ha = 'right'
-            else:  # 居中
-                text_offset_x = 10
-                ha = 'left'
-            
-            # 根据回撤值的大小调整垂直偏移
-            text_offset_y = -35 if max_dd > 15 else -25
-            
+
             annotation_fontsize = int(10 * self.font_scale)  # 适中的标注字体
-            self.ax_drawdown.annotate(f"最大回撤: {max_dd:.2f}%", 
-                                    xy=(max_dd_date, max_dd), 
-                                    xytext=(text_offset_x, text_offset_y),
-                                    textcoords="offset points",
+            self.ax_drawdown.annotate(f"最大回撤: {max_dd:.2f}%",
+                                    xy=(mdates.date2num(max_dd_date), max_dd),
+                                    xycoords='data',
+                                    xytext=text_pos,
+                                    textcoords='axes fraction',
                                     bbox=dict(boxstyle='round,pad=0.5', fc='#333333', ec='#404040', alpha=0.9),
                                     color='#e8e8e8',
                                     fontsize=annotation_fontsize,
                                     ha=ha,
-                                    arrowprops=dict(arrowstyle='->', color='#a0a0a0', connectionstyle='arc3,rad=0.2'))
+                                    va='bottom',
+                                    zorder=6,
+                                    # 近似直线的箭头：大弧度在长距离下会向下弯出子图边界
+                                    arrowprops=dict(arrowstyle='->', color='#a0a0a0', connectionstyle='arc3,rad=0.05'))
             
             # 添加回撤图例
             legend_fontsize = int(10 * self.font_scale)  # 适中的图例字体
@@ -1573,14 +2383,10 @@ class BacktestResultWindow(QMainWindow):
             self.ax_pnl.legend(loc='upper right', facecolor='#333333', edgecolor='#404040', framealpha=0.9, fancybox=True, shadow=True, fontsize=pnl_legend_fontsize)
             
             # =================== 绘制成交记录图 ===================
-            # 获取交易记录文件
-            trades_path = os.path.join(self.backtest_dir, "trades.csv")
-            trades_df = pd.DataFrame()
-            
-            if os.path.exists(trades_path):
+            trades_df = getattr(self, '_chart_trades_df', pd.DataFrame()).copy()
+
+            if len(trades_df) > 0:
                 try:
-                    trades_df = pd.read_csv(trades_path, encoding='utf-8-sig')
-                    
                     # 检查并重命名列
                     if 'time' in trades_df.columns:
                         trades_df['datetime'] = trades_df['time']
@@ -1668,10 +2474,9 @@ class BacktestResultWindow(QMainWindow):
                 # 旋转日期标签并设置字体大小
                 plt.setp(ax.get_xticklabels(), rotation=45, ha='right', fontsize=tick_fontsize)
             
-            # 调整布局以确保标题和坐标轴完整显示
-            # 使用 subplots_adjust 而不是 tight_layout 以确保与初始设置一致
-            self.ax.figure.subplots_adjust(left=0.10, right=0.96, top=0.92, bottom=0.12, hspace=0.18)
-            
+            # 调整布局以确保标题和坐标轴完整显示（与create_chart/resize事件保持一致）
+            self._apply_chart_margins()
+
             # 重绘图表
             self.chart_view.draw()
             
@@ -1863,6 +2668,14 @@ class BacktestResultWindow(QMainWindow):
             
             # 设置标注文本位置
             x_offset = -120 if x_rel_pos > 0.7 else 15  # 如果在右侧，标注向左偏移
+
+            # 根据数据点的纵向位置决定悬浮框显示在点的上方还是下方，避免超出图表边界
+            y_min, y_max = self.ax.get_ylim()
+            y_rel_pos = (strategy_value - y_min) / (y_max - y_min) if y_max > y_min else 0.5
+            if y_rel_pos > 0.5:
+                y_offset, v_align = -15, 'top'     # 点在上半部，悬浮框放点下方
+            else:
+                y_offset, v_align = 15, 'bottom'   # 点在下半部，悬浮框放点上方
             
             # 创建或更新标注文本
             formatted_date = date.strftime("%Y-%m-%d")
@@ -1906,13 +2719,13 @@ class BacktestResultWindow(QMainWindow):
             self.hover_annotation = self.ax.annotate(
                 hover_text,
                 xy=(x_date, strategy_value),
-                xytext=(x_offset, 30),
+                xytext=(x_offset, y_offset),
                 textcoords="offset points",
                 bbox=dict(boxstyle='round,pad=0.5', fc='#333333', ec='#404040', alpha=0.9),
                 fontsize=hover_fontsize,
                 color='#e8e8e8',
                 ha='left' if x_rel_pos <= 0.7 else 'right',
-                va='top'
+                va=v_align
             )
             
             # 重绘图表
@@ -1923,60 +2736,81 @@ class BacktestResultWindow(QMainWindow):
             import traceback
             print(traceback.format_exc())
 
+    # 交易表最多渲染的行数：超过则只显示前 N 行（完整数据仍在 trades.csv），
+    # 避免几十万笔交易逐行 setItem 把主线程冻死。
+    MAX_TRADE_DISPLAY_ROWS = 10000
+
     def update_trades_table(self, trades_df):
-        """更新交易记录表格"""
+        """更新交易记录表格（大数据量下封顶显示 + 固定列宽，避免主线程渲染上万行卡死）"""
+        from PyQt5.QtWidgets import QApplication
         try:
-            # 如果有交易记录，更新交易表格
-            if len(trades_df) > 0:
-                self.trades_table.setRowCount(len(trades_df))
-                
-                # 设置列宽度比例
-                header = self.trades_table.horizontalHeader()
-                header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # 交易时间
-                header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # 证券代码
-                header.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # 交易方向
-                header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # 成交价格
-                header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # 成交数量
-                header.setSectionResizeMode(5, QHeaderView.Stretch)          # 成交金额
-                header.setSectionResizeMode(6, QHeaderView.ResizeToContents)  # 手续费
-                
-                for i, row in trades_df.iterrows():
-                    # 交易时间
+            table = self.trades_table
+            table.setUpdatesEnabled(False)
+            table.setSortingEnabled(False)
+            total = len(trades_df)
+            if total > 0:
+                cap = self.MAX_TRADE_DISPLAY_ROWS
+                display_df = trades_df.iloc[:cap] if total > cap else trades_df
+                n = len(display_df)
+                # 封顶时在表头注明，提示完整数据位置
+                first_header = "交易时间" if total <= cap else f"交易时间（仅显示前 {cap:,}/共 {total:,} 笔，完整见 trades.csv）"
+                headers = [first_header, "证券代码", "交易方向", "成交价格", "成交数量", "成交金额", "手续费", "持仓资金", "可用资金", "总资产"]
+                table.clearContents()
+                table.setColumnCount(len(headers))
+                table.setHorizontalHeaderLabels(headers)
+                table.setRowCount(n)
+
+                header = table.horizontalHeader()
+                if n > 1000:
+                    # 大表：固定列宽。ResizeToContents 会扫描全表算列宽，行数大时近似 O(N^2)，是卡顿主因。
+                    header.setSectionResizeMode(QHeaderView.Interactive)
+                    default_widths = [160, 90, 80, 90, 90, 130, 80, 130, 130, 130]
+                    for col, w in enumerate(default_widths):
+                        table.setColumnWidth(col, int(w * self.font_scale))
+                    header.setSectionResizeMode(5, QHeaderView.Stretch)
+                else:
+                    # 小表：保留自适应列宽
+                    header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+                    header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+                    header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+                    header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+                    header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+                    header.setSectionResizeMode(5, QHeaderView.Stretch)
+                    header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+                    header.setSectionResizeMode(7, QHeaderView.Stretch)
+                    header.setSectionResizeMode(8, QHeaderView.Stretch)
+                    header.setSectionResizeMode(9, QHeaderView.Stretch)
+
+                buy_color = QColor('#ff4444')   # 买入红色
+                sell_color = QColor('#007acc')  # 卖出蓝色
+                # 用位置索引(.iloc)迭代，避免 iterrows 的原始索引非 0 起导致 setItem 行号错位
+                for r in range(n):
+                    row = display_df.iloc[r]
                     time_item = QTableWidgetItem(str(row['time']))
                     time_item.setTextAlignment(Qt.AlignCenter)
-                    self.trades_table.setItem(i, 0, time_item)
-                    
-                    # 证券代码
+                    table.setItem(r, 0, time_item)
+
                     code_item = QTableWidgetItem(str(row['code']))
                     code_item.setTextAlignment(Qt.AlignCenter)
-                    self.trades_table.setItem(i, 1, code_item)
-                    
-                    # 交易方向
+                    table.setItem(r, 1, code_item)
+
                     direction_item = QTableWidgetItem(str(row['direction']))
                     direction_item.setTextAlignment(Qt.AlignCenter)
-                    # 设置买入/卖出不同颜色
-                    if row['direction'] == '买入':
-                        direction_item.setForeground(QColor('#ff4444'))  # 买入红色
-                    else:
-                        direction_item.setForeground(QColor('#007acc'))  # 卖出蓝色
-                    self.trades_table.setItem(i, 2, direction_item)
-                    
-                    # 成交价格
-                    price_item = QTableWidgetItem(f"{row['price']:.2f}")
+                    direction_item.setForeground(buy_color if row['direction'] == '买入' else sell_color)
+                    table.setItem(r, 2, direction_item)
+
+                    price_item = QTableWidgetItem(f"{row['price']:.{self.price_decimals}f}")
                     price_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                    self.trades_table.setItem(i, 3, price_item)
-                    
-                    # 成交数量
+                    table.setItem(r, 3, price_item)
+
                     volume_item = QTableWidgetItem(str(row['volume']))
                     volume_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                    self.trades_table.setItem(i, 4, volume_item)
-                    
-                    # 成交金额
+                    table.setItem(r, 4, volume_item)
+
                     amount_item = QTableWidgetItem(f"{row['amount']:,.2f}")
                     amount_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                    self.trades_table.setItem(i, 5, amount_item)
-                    
-                    # 手续费
+                    table.setItem(r, 5, amount_item)
+
                     total_fee = row['commission']
                     if 'stamp_tax' in row:
                         total_fee += row['stamp_tax']
@@ -1986,16 +2820,41 @@ class BacktestResultWindow(QMainWindow):
                         total_fee += row['flow_fee']
                     commission_item = QTableWidgetItem(f"{total_fee:.2f}")
                     commission_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                    self.trades_table.setItem(i, 6, commission_item)
+                    table.setItem(r, 6, commission_item)
+
+                    market_value = row.get('market_value', 0.0) if pd.notna(row.get('market_value')) else 0.0
+                    market_value_item = QTableWidgetItem(f"{float(market_value):,.2f}")
+                    market_value_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    table.setItem(r, 7, market_value_item)
+
+                    cash = row.get('cash', 0.0) if pd.notna(row.get('cash')) else 0.0
+                    cash_item = QTableWidgetItem(f"{float(cash):,.2f}")
+                    cash_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    table.setItem(r, 8, cash_item)
+
+                    total_asset = row.get('total_asset', 0.0) if pd.notna(row.get('total_asset')) else 0.0
+                    total_asset_item = QTableWidgetItem(f"{float(total_asset):,.2f}")
+                    total_asset_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    table.setItem(r, 9, total_asset_item)
+
+                    # 每 1024 行让出一次事件循环，保持界面响应（封顶后通常 < 10 次）
+                    if (r & 0x3FF) == 0x3FF:
+                        QApplication.processEvents()
             else:
                 # 清空交易表格并显示提示信息
-                self.trades_table.setRowCount(1)
-                self.trades_table.setColumnCount(1)
-                self.trades_table.setHorizontalHeaderLabels(["提示"])
-                self.trades_table.setItem(0, 0, QTableWidgetItem("回测期间没有产生交易"))
-                self.trades_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-            
+                table.clearContents()
+                table.setRowCount(1)
+                table.setColumnCount(1)
+                table.setHorizontalHeaderLabels(["提示"])
+                table.setItem(0, 0, QTableWidgetItem("回测期间没有产生交易"))
+                table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            table.setUpdatesEnabled(True)
+
         except Exception as e:
+            try:
+                self.trades_table.setUpdatesEnabled(True)
+            except Exception:
+                pass
             print(f"更新交易记录表格时出错: {str(e)}")
             import traceback
             print(traceback.format_exc())
@@ -2003,12 +2862,18 @@ class BacktestResultWindow(QMainWindow):
     def update_daily_stats_table(self, daily_stats_df):
         """更新每日统计表格"""
         try:
+            table = self.daily_stats_table
+            table.setUpdatesEnabled(False)
             # 如果有每日统计数据，更新每日统计表格和图表
             if len(daily_stats_df) > 0:
-                self.daily_stats_table.setRowCount(len(daily_stats_df))
+                headers = ["日期", "总资产", "持仓市值", "可用资金", "日收益率"]
+                table.clearContents()
+                table.setColumnCount(len(headers))
+                table.setHorizontalHeaderLabels(headers)
+                table.setRowCount(len(daily_stats_df))
                 
                 # 设置列宽度比例
-                header = self.daily_stats_table.horizontalHeader()
+                header = table.horizontalHeader()
                 header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # 日期
                 header.setSectionResizeMode(1, QHeaderView.Stretch)          # 总资产
                 header.setSectionResizeMode(2, QHeaderView.Stretch)          # 持仓市值
@@ -2019,22 +2884,22 @@ class BacktestResultWindow(QMainWindow):
                     # 日期
                     date_item = QTableWidgetItem(str(row['date']))
                     date_item.setTextAlignment(Qt.AlignCenter)
-                    self.daily_stats_table.setItem(i, 0, date_item)
+                    table.setItem(i, 0, date_item)
                     
                     # 总资产
                     total_asset_item = QTableWidgetItem(f"{row['total_asset']:,.2f}")
                     total_asset_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                    self.daily_stats_table.setItem(i, 1, total_asset_item)
+                    table.setItem(i, 1, total_asset_item)
                     
                     # 持仓市值
                     market_value_item = QTableWidgetItem(f"{row['market_value']:,.2f}")
                     market_value_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                    self.daily_stats_table.setItem(i, 2, market_value_item)
+                    table.setItem(i, 2, market_value_item)
                     
                     # 可用资金
                     cash_item = QTableWidgetItem(f"{row['cash']:,.2f}")
                     cash_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                    self.daily_stats_table.setItem(i, 3, cash_item)
+                    table.setItem(i, 3, cash_item)
                     
                     # 日收益率
                     if 'daily_return' in row:
@@ -2050,22 +2915,28 @@ class BacktestResultWindow(QMainWindow):
                         else:
                             daily_return_item.setForeground(QColor('#e8e8e8'))  # 白色
                             
-                        self.daily_stats_table.setItem(i, 4, daily_return_item)
+                        table.setItem(i, 4, daily_return_item)
                     else:
-                        self.daily_stats_table.setItem(i, 4, QTableWidgetItem("--"))
+                        table.setItem(i, 4, QTableWidgetItem("--"))
             else:
                 # 清空每日统计表格并显示提示信息
-                self.daily_stats_table.setRowCount(1)
-                self.daily_stats_table.setColumnCount(1)
-                self.daily_stats_table.setHorizontalHeaderLabels(["提示"])
-                self.daily_stats_table.setItem(0, 0, QTableWidgetItem("回测期间没有产生每日统计数据"))
-                self.daily_stats_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+                table.clearContents()
+                table.setRowCount(1)
+                table.setColumnCount(1)
+                table.setHorizontalHeaderLabels(["提示"])
+                table.setItem(0, 0, QTableWidgetItem("回测期间没有产生每日统计数据"))
+                table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
                 # 清空图表
                 self.ax.clear()
                 self.ax.set_title("没有交易数据", color='#e8e8e8')
-                self.canvas.draw()
+                self.chart_view.draw()
+            table.setUpdatesEnabled(True)
             
         except Exception as e:
+            try:
+                self.daily_stats_table.setUpdatesEnabled(True)
+            except Exception:
+                pass
             print(f"更新每日统计表格时出错: {str(e)}")
             import traceback
             print(traceback.format_exc())
@@ -2145,153 +3016,24 @@ class BacktestResultWindow(QMainWindow):
             # 计算年化收益率 Ra
             annual_return = (pow(1 + total_return, 250/n) - 1)
             
-            # 获取沪深300指数收益率作为基准
+            # 获取基准日收益率（用于下行风险比较）
             benchmark_returns = None
             try:
-                # 获取基准指数数据 - 先尝试从benchmark.csv读取
                 benchmark_file = os.path.join(self.backtest_dir, "benchmark.csv")
                 if os.path.exists(benchmark_file):
                     benchmark_df = pd.read_csv(benchmark_file)
                     if len(benchmark_df) > 0 and 'date' in benchmark_df.columns and 'close' in benchmark_df.columns:
-                        # 获取日期和收盘价
                         benchmark_df['date'] = pd.to_datetime(benchmark_df['date'])
-                        
-                        # 尝试通过xtdata获取额外的一天数据
-                        try:
-                            # 导入xtdata
-                            from xtquant import xtdata
-                            
-                            # 获取benchmark_df中第一天的日期
-                            first_date = benchmark_df['date'].min()
-                            
-                            # 打印benchmark_df的基本信息
-                            print(f"基准数据信息: 行数={len(benchmark_df)}, 日期范围={benchmark_df['date'].min()} 到 {benchmark_df['date'].max()}")
-                            
-                            # 将日期转换为YYYYMMDD格式
-                            first_date_str = first_date.strftime('%Y%m%d')
-                            
-                            # 计算前一个交易日的日期（往前推5天，确保能获取到前一个交易日）
-                            from datetime import datetime, timedelta
-                            prev_date = (first_date - timedelta(days=5)).strftime('%Y%m%d')
-                            
-                            # 获取沪深300指数（000300.SH）在这段时间的数据
-                            extra_data = xtdata.get_market_data(
-                                field_list=['close'],
-                                stock_list=['000300.SH'],
-                                period='1d',
-                                start_time=prev_date,
-                                end_time=first_date_str
-                            )
-                            
-                            # 检查是否成功获取到数据
-                            if extra_data and 'close' in extra_data:
-                                extra_close = extra_data['close']
-                                
-                                # 根据实际数据结构检查，索引应该是股票代码，列是日期
-                                if isinstance(extra_close, pd.DataFrame) and '000300.SH' in extra_close.index and len(extra_close.columns) > 1:
-                                    # 获取日期列表并排序
-                                    date_columns = sorted(extra_close.columns)
-                                    
-                                    # 获取倒数第二个日期的收盘价（前一交易日）
-                                    prev_close = extra_close.loc['000300.SH', date_columns[-2]]
-                                    
-                                    # 记录日志
-                                    print(f"成功获取到前一交易日沪深300指数收盘价: {prev_close}, 日期: {date_columns[-2]}")
-                                    
-                                    # 将benchmark_df的价格转换为收益率序列
-                                    benchmark_prices = benchmark_df['close'].values
-                                    print(f"基准价格数据长度: {len(benchmark_prices)}, 前5个值: {benchmark_prices[:5] if len(benchmark_prices) >= 5 else benchmark_prices}")
-                                    
-                                    # 计算第一天的收益率
-                                    first_day_return = (benchmark_prices[0] - prev_close) / prev_close
-                                    print(f"第一天收益率: {first_day_return:.4%}, 前日价格: {prev_close}, 首日价格: {benchmark_prices[0]}")
-                                    
-                                    # 检查价格数据长度
-                                    if len(benchmark_prices) <= 1:
-                                        print(f"警告: 基准价格数据长度不足 ({len(benchmark_prices)}), 无法计算后续收益率")
-                                        # 创建适当长度的收益率序列
-                                        benchmark_returns = pd.Series([first_day_return] * len(returns))
-                                    else:
-                                        # 计算其余日期的收益率 (逐日计算确保准确性)
-                                        rest_returns = []
-                                        for i in range(1, len(benchmark_prices)):
-                                            day_return = (benchmark_prices[i] - benchmark_prices[i-1]) / benchmark_prices[i-1]
-                                            rest_returns.append(day_return)
-                                        
-                                        rest_returns_series = pd.Series(rest_returns)
-                                        print(f"其余日期收益率长度: {len(rest_returns_series)}, 前几个值: {rest_returns_series.head().tolist()}")
-                                        
-                                        # 组合所有收益率 - 使用pd.concat代替已弃用的append方法
-                                        benchmark_returns = pd.concat([pd.Series([first_day_return]), rest_returns_series]).reset_index(drop=True)
-                                        print(f"合并后收益率长度: {len(benchmark_returns)}, 前几个值: {benchmark_returns.head().tolist()}")
-                                    
-                                    # 确保基准收益率长度与策略收益率匹配
-                                    if len(benchmark_returns) > len(returns):
-                                        # 如果基准收益率多于策略收益率，取最后的部分
-                                        benchmark_returns = benchmark_returns[-len(returns):]
-                                        print(f"基准收益率过长, 截取后长度: {len(benchmark_returns)}")
-                                    elif len(benchmark_returns) < len(returns):
-                                        # 如果基准收益率少于策略收益率，需要填充
-                                        padding_needed = len(returns) - len(benchmark_returns)
-                                        # 使用第一个有效收益率填充
-                                        if len(benchmark_returns) > 0:
-                                            first_valid_return = benchmark_returns.iloc[0]
-                                            padding = pd.Series([first_valid_return] * padding_needed)
-                                        else:
-                                            # 没有任何有效收益率时使用默认值
-                                            padding = pd.Series([0.0003] * padding_needed)  # 默认日收益率0.03%
-                                        
-                                        benchmark_returns = pd.concat([padding, benchmark_returns]).reset_index(drop=True)
-                                        print(f"基准收益率不足, 填充后长度: {len(benchmark_returns)}, 填充值: {padding.iloc[0]:.4%}")
-                                else:
-                                    # 获取额外数据失败，使用np.diff计算（第一天收益率可能不准确）
-                                    print(f"获取前一交易日数据失败，数据格式可能异常: 索引={extra_close.index}, 列={extra_close.columns}")
-                                    benchmark_prices = benchmark_df['close'].values
-                                    benchmark_returns = pd.Series(np.diff(benchmark_prices) / benchmark_prices[:-1])
-                            else:
-                                # 获取额外数据失败，使用np.diff计算（第一天收益率可能不准确）
-                                print(f"获取前一交易日数据失败，extra_data格式: {extra_data}")
-                                benchmark_prices = benchmark_df['close'].values
-                                benchmark_returns = pd.Series(np.diff(benchmark_prices) / benchmark_prices[:-1])
-                        except Exception as e:
-                            print(f"尝试获取额外历史数据时出错: {str(e)}")
-                            # 使用标准方法计算收益率
-                            benchmark_prices = benchmark_df['close'].values
-                            benchmark_returns = pd.Series(np.diff(benchmark_prices) / benchmark_prices[:-1])
-                        
-                        # 确保基准收益率长度与策略收益率匹配
-                        if len(benchmark_returns) > len(returns):
-                            # 如果基准收益率多于策略收益率，取最后的部分
-                            benchmark_returns = benchmark_returns[-len(returns):]
-                        elif len(benchmark_returns) < len(returns):
-                            # 如果基准收益率少于策略收益率，需要填充
-                            padding_needed = len(returns) - len(benchmark_returns)
-                            # 使用第一个有效收益率填充
-                            if len(benchmark_returns) > 0:
-                                first_valid_return = benchmark_returns.iloc[0]
-                                padding = pd.Series([first_valid_return] * padding_needed)
-                            else:
-                                # 没有任何有效收益率时使用默认值
-                                padding = pd.Series([0.0003] * padding_needed)  # 默认日收益率0.03%
-                            
-                            benchmark_returns = pd.concat([padding, benchmark_returns]).reset_index(drop=True)
-                            print(f"基准收益率数据长度不足，已使用{padding.iloc[0]:.4%}填充前{len(padding)}个数据点")
-                    else:
-                        # 使用标准方法计算收益率
-                        benchmark_prices = benchmark_df['close'].values
-                        benchmark_returns = pd.Series(np.diff(benchmark_prices) / benchmark_prices[:-1])
+                        benchmark_df = benchmark_df.sort_values('date')
+                        # benchmark.csv 可能包含回测前的数据，直接用全部 close 做 pct_change
+                        # 取最后 n 条作为回测期间的日收益率（含第一天相对前一日的收益）
+                        all_returns = benchmark_df['close'].pct_change().dropna()
+                        benchmark_returns = all_returns.iloc[-n:].reset_index(drop=True) if len(all_returns) >= n else all_returns.reset_index(drop=True)
             except Exception as e:
                 print(f"获取基准收益率时出错: {str(e)}")
-                import traceback
-                print(traceback.format_exc())
-                # 使用默认的基准收益率
-                benchmark_returns = pd.Series([0.0003] * len(returns))  # 默认日收益率0.03%
-                print("无法获取沪深300指数收益率，使用默认日收益率0.03%作为替代")
-            
-            # 确保一定有基准收益率数据
+
             if benchmark_returns is None or len(benchmark_returns) != len(returns):
-                benchmark_returns = pd.Series([0.0003] * len(returns))  # 默认日收益率0.03%
-                print("基准收益率数据处理有误，使用默认日收益率0.03%作为替代")
+                benchmark_returns = pd.Series([0.0] * len(returns))
             
             # 计算下行波动率 (Downside Risk)
             # 计算下行风险: √[(250/n) * Σ[(Rp(i) - Rm(i))² * f(i)]]
@@ -2358,12 +3100,9 @@ class BacktestResultWindow(QMainWindow):
             if len(strategy_returns) < 10:
                 return 0.0, 0.0
             
-            # 计算协方差和方差
-            covariance = np.cov(strategy_returns, benchmark_returns)[0, 1]
-            benchmark_variance = np.var(benchmark_returns)
-            
-            # 计算贝塔
-            beta = covariance / benchmark_variance if benchmark_variance != 0 else 0.0
+            # 计算协方差矩阵和贝塔
+            cov_matrix = np.cov(strategy_returns, benchmark_returns)
+            beta = cov_matrix[0, 1] / cov_matrix[1, 1] if cov_matrix[1, 1] > 0 else 0.0
             
 
             alpha = 0
@@ -2407,33 +3146,33 @@ class BacktestResultWindow(QMainWindow):
                 return False
             
             # 按股票代码分组处理交易
-            unique_codes = trades_df['code'].unique()
-            
-            for code in unique_codes:
-                code_trades = trades_df[trades_df['code'] == code].copy()
+            # 用一次 groupby 取代“对每个代码做一次全表布尔筛选”，复杂度从 O(代码数×N) 降到 O(N)；
+            # 再用列数组 zip 迭代替代 iterrows，去掉逐行 Series 构造开销。
+            for code, code_trades in trades_df.groupby('code', sort=False):
                 code_trades = code_trades.sort_values('time')  # 按时间排序
-                
+
                 # 初始化股票持仓
                 position = 0
                 cost_basis = 0
-                
+
                 # 遍历该股票的所有交易
-                for i, trade in code_trades.iterrows():
+                for direction, volume, price in zip(
+                        code_trades['direction'].values,
+                        code_trades['volume'].values,
+                        code_trades['price'].values):
                     try:
-                        direction = trade['direction']
-                        
                         if is_buy(direction):
                             # 更新持仓成本
-                            new_position = position + trade['volume']
-                            new_cost = cost_basis * position + trade['price'] * trade['volume']
+                            new_position = position + volume
+                            new_cost = cost_basis * position + price * volume
                             if new_position > 0:
                                 cost_basis = new_cost / new_position
                             position = new_position
                         elif is_sell(direction) and position > 0:
                             # 计算本次卖出的盈亏
-                            sell_volume = min(position, trade['volume'])
-                            profit_loss = (trade['price'] - cost_basis) * sell_volume
-                            
+                            sell_volume = min(position, volume)
+                            profit_loss = (price - cost_basis) * sell_volume
+
                             # 更新统计数据
                             total_trades += 1
                             if profit_loss > 0:
@@ -2441,19 +3180,18 @@ class BacktestResultWindow(QMainWindow):
                                 total_profit += profit_loss
                             else:
                                 total_loss -= profit_loss  # 转换为正数
-                            
+
                             # 更新持仓
                             position -= sell_volume
-                    except Exception as e:
-                        print(f"处理交易记录时出错: {str(e)}，交易数据: {trade}")
+                    except Exception:
                         continue
             
             # 计算胜率
             win_rate = winning_trades / total_trades if total_trades > 0 else 0.0
             
-            # 计算盈亏比 - 使用总盈利金额除以总亏损金额
-            profit_ratio = total_profit / total_loss if total_loss > 0 else 0.0
-            
+            # 计算盈亏比 - 使用总盈利金额除以总亏损金额; 全盈利(0亏损)时为∞ (修缺陷#1)
+            profit_ratio = total_profit / total_loss if total_loss > 0 else (float('inf') if total_profit > 0 else 0.0)
+
             return win_rate, profit_ratio
             
         except Exception as e:
@@ -2485,18 +3223,19 @@ class BacktestResultWindow(QMainWindow):
             for ret in daily_returns:
                 if pd.isna(ret):
                     continue
-                
-                if ret > 0 and (current_sign is None or current_sign > 0):
+
+                # 与 cli/report.py:307-324 同一口径: 翻转从1重计并即时更新max; 平(ret==0)中断
+                if ret > 0:
+                    current_streak = current_streak + 1 if current_sign == 1 else 1
                     current_sign = 1
-                    current_streak += 1
                     max_win_streak = max(max_win_streak, current_streak)
-                elif ret < 0 and (current_sign is None or current_sign < 0):
+                elif ret < 0:
+                    current_streak = current_streak + 1 if current_sign == -1 else 1
                     current_sign = -1
-                    current_streak += 1
                     max_loss_streak = max(max_loss_streak, current_streak)
-                else:
-                    current_streak = 1
-                    current_sign = 1 if ret > 0 else -1
+                else:  # 平: 既非盈也非亏, 中断streak
+                    current_streak = 0
+                    current_sign = None
             
             # 初始化最大盈亏变量
             max_profit = 0.0
@@ -2518,43 +3257,41 @@ class BacktestResultWindow(QMainWindow):
                 return False
             
             # 按股票代码分组计算最大单笔盈亏
-            unique_codes = trades_df['code'].unique()
-            
-            for code in unique_codes:
-                code_trades = trades_df[trades_df['code'] == code].copy()
+            # 同样用 groupby + zip 取代 per-code 全表筛选 + iterrows，O(代码数×N) → O(N)。
+            for code, code_trades in trades_df.groupby('code', sort=False):
                 code_trades = code_trades.sort_values('time')  # 按时间排序
-                
+
                 # 初始化股票持仓
                 position = 0
                 cost_basis = 0
-                
+
                 # 遍历该股票的所有交易
-                for i, trade in code_trades.iterrows():
+                for direction, volume, price in zip(
+                        code_trades['direction'].values,
+                        code_trades['volume'].values,
+                        code_trades['price'].values):
                     try:
-                        direction = trade['direction']
-                        
                         if is_buy(direction):
                             # 更新持仓成本
-                            new_position = position + trade['volume']
-                            new_cost = cost_basis * position + trade['price'] * trade['volume']
+                            new_position = position + volume
+                            new_cost = cost_basis * position + price * volume
                             if new_position > 0:
                                 cost_basis = new_cost / new_position
                             position = new_position
                         elif is_sell(direction) and position > 0:
                             # 计算本次卖出的盈亏
-                            sell_volume = min(position, trade['volume'])
-                            profit_loss = (trade['price'] - cost_basis) * sell_volume
-                            
+                            sell_volume = min(position, volume)
+                            profit_loss = (price - cost_basis) * sell_volume
+
                             # 更新最大盈亏
                             if profit_loss > 0:
                                 max_profit = max(max_profit, profit_loss)
                             else:
                                 max_loss = min(max_loss, profit_loss)
-                            
+
                             # 更新持仓
                             position -= sell_volume
-                    except Exception as e:
-                        print(f"处理交易记录时出错: {str(e)}，交易数据: {trade}")
+                    except Exception:
                         continue
             
             # 返回绝对值的最大亏损（为正数）
@@ -2653,9 +3390,9 @@ class BacktestResultWindow(QMainWindow):
             # 创建子图
             ax = self.returns_dist_figure.add_subplot(111)
             
-            # 设置样式
-            ax.set_facecolor('#2d2d2d')
-            self.returns_dist_figure.patch.set_facecolor('#2d2d2d')
+            # 设置样式 - 使用透明背景以匹配深色主题
+            ax.set_facecolor('none')
+            self.returns_dist_figure.patch.set_facecolor('none')
             
             # 设置标题和标签
             # ax.set_title("收益率分布", fontsize=12, fontweight='bold', color='#e8e8e8', pad=10)
@@ -2730,9 +3467,9 @@ class BacktestResultWindow(QMainWindow):
             # 创建子图
             ax = self.monthly_returns_figure.add_subplot(111)
             
-            # 设置样式
-            ax.set_facecolor('#2d2d2d')
-            self.monthly_returns_figure.patch.set_facecolor('#2d2d2d')
+            # 设置样式 - 使用透明背景以匹配深色主题
+            ax.set_facecolor('none')
+            self.monthly_returns_figure.patch.set_facecolor('none')
             
             # 确保日期格式正确
             daily_stats_df['date'] = pd.to_datetime(daily_stats_df['date'])
@@ -2998,94 +3735,19 @@ class BacktestResultWindow(QMainWindow):
             print(traceback.format_exc())
 
     def calculate_benchmark_return(self, benchmark_df):
-        """计算基准收益率
-        
-        基准收益率的计算公式：
-        Benchmark Returns = ((Mend - Mstart) / Mstart) * 100%
-        
-        其中：
-        Mstart为回测开始时基准价值（使用起始日期前一个交易日的收盘价）
-        Mend为回测结束时基准价值
-        """
+        """计算基准收益率（兼容旧调用，只使用已加载的本地基准数据）。"""
         try:
-            if benchmark_df is None or len(benchmark_df) < 2:
+            if benchmark_df is None or len(benchmark_df) < 2 or 'close' not in benchmark_df.columns:
                 return 0.0
-                
-            # 确保数据是按日期排序的
-            if 'date' in benchmark_df.columns:
-                benchmark_df = benchmark_df.sort_values('date')
-                
-            # 获取起始日期和结束日期
-            if 'close' in benchmark_df.columns:
-                # 结束价格使用最后一天的收盘价
-                end_price = benchmark_df['close'].iloc[-1]
-                
-                # 起始价格应该是回测期间第一个日期的前一个交易日的收盘价
-                # 尝试通过xtdata获取前一个交易日的数据
-                try:
-                    # 导入xtdata
-                    from xtquant import xtdata
-                    
-                    # 获取benchmark_df中第一天的日期
-                    first_date = pd.to_datetime(benchmark_df['date'].iloc[0])
-                    
-                    # 打印benchmark_df的基本信息
-                    print(f"基准数据信息: 行数={len(benchmark_df)}, 日期范围={benchmark_df['date'].min()} 到 {benchmark_df['date'].max()}")
-                    
-                    # 将日期转换为YYYYMMDD格式
-                    first_date_str = first_date.strftime('%Y%m%d')
-                    
-                    # 计算前一个交易日的日期（往前推5天，确保能获取到前一个交易日）
-                    from datetime import datetime, timedelta
-                    prev_date = (first_date - timedelta(days=5)).strftime('%Y%m%d')
-                    
-                    # 获取沪深300指数（000300.SH）在这段时间的数据
-                    extra_data = xtdata.get_market_data(
-                        field_list=['close'],
-                        stock_list=['000300.SH'],
-                        period='1d',
-                        start_time=prev_date,
-                        end_time=first_date_str
-                    )
-                    
-                    # 检查是否成功获取到数据
-                    if extra_data and 'close' in extra_data:
-                        extra_close = extra_data['close']
-                        
-                        # 根据实际数据结构检查，索引应该是股票代码，列是日期
-                        if isinstance(extra_close, pd.DataFrame) and '000300.SH' in extra_close.index and len(extra_close.columns) > 1:
-                            # 获取日期列表并排序
-                            date_columns = sorted(extra_close.columns)
-                            
-                            # 获取倒数第二个日期的收盘价（前一交易日）
-                            start_price = extra_close.loc['000300.SH', date_columns[-2]]
-                            
-                            # 记录日志
-                            print(f"成功获取到前一交易日沪深300指数收盘价: {start_price}, 日期: {date_columns[-2]}")
-                        else:
-                            # 获取额外数据失败，使用首日价格
-                            start_price = benchmark_df['close'].iloc[0]
-                            print(f"获取前一交易日数据失败，数据格式可能异常: 索引={extra_close.index if isinstance(extra_close, pd.DataFrame) else '非DataFrame'}, 使用首日价格: {start_price}")
-                    else:
-                        # 获取额外数据失败，使用首日价格
-                        start_price = benchmark_df['close'].iloc[0]
-                        print(f"获取前一交易日数据失败，extra_data格式: {extra_data}, 使用首日价格: {start_price}")
-                except Exception as e:
-                    # 发生异常时，使用首日价格
-                    start_price = benchmark_df['close'].iloc[0]
-                    print(f"尝试获取前一交易日数据时出错: {str(e)}, 使用首日价格: {start_price}")
-                
-                # 计算收益率
-                if start_price > 0:
-                    benchmark_return = ((end_price - start_price) / start_price) * 100
-                    return benchmark_return
-                    
-            return 0.0
-            
+            benchmark_df = benchmark_df.sort_values('date') if 'date' in benchmark_df.columns else benchmark_df
+            end_price = float(benchmark_df['close'].iloc[-1])
+            daily_stats_df = getattr(self, 'daily_stats_df', None)
+            start_price = resolve_benchmark_base_price(benchmark_df, daily_stats_df)
+            if start_price is None:
+                start_price = float(benchmark_df['close'].iloc[0])
+            return ((end_price - start_price) / start_price) * 100 if start_price > 0 else 0.0
         except Exception as e:
             print(f"计算基准收益率时出错: {str(e)}")
-            import traceback
-            print(traceback.format_exc())
             return 0.0
 
     def calculate_annualized_benchmark_return(self, benchmark_return, days_count):
@@ -3165,7 +3827,9 @@ class BacktestResultWindow(QMainWindow):
 if __name__ == "__main__":
     import sys
     from PyQt5.QtWidgets import QApplication
-    
+
+    # 多显示器环境下，统一以主屏幕缩放比例渲染（必须在 QApplication 之前）
+    force_primary_screen_dpi()
     app = QApplication(sys.argv)
     
     # 默认使用当前路径下的backtest_results/ths_20240403_20241101文件夹

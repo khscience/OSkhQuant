@@ -233,7 +233,30 @@ class UpdateProgressDialog(QDialog):
         self.setWindowTitle("软件更新")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.setFixedSize(400, 150)
-        
+
+        # 设置窗口标题栏颜色（仅适用于Windows）
+        if sys.platform == 'win32':
+            try:
+                from ctypes import windll, c_int, byref, sizeof
+                from ctypes.wintypes import DWORD
+                DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                DWMWA_CAPTION_COLOR = 35
+                windll.dwmapi.DwmSetWindowAttribute(
+                    int(self.winId()),
+                    DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    byref(c_int(2)),
+                    sizeof(c_int)
+                )
+                caption_color = DWORD(0x2b2b2b)
+                windll.dwmapi.DwmSetWindowAttribute(
+                    int(self.winId()),
+                    DWMWA_CAPTION_COLOR,
+                    byref(caption_color),
+                    sizeof(caption_color)
+                )
+            except Exception:
+                pass
+
         # 创建布局
         layout = QVBoxLayout()
         
@@ -299,11 +322,11 @@ class UpdateManager(QObject):
                 "version": "1.0.0",
                 "build_date": "2024-02-20",
                 "channel": "stable",
-                "app_name": "看海量化回测平台"
+                "app_name": "看海量化回测平台"  
             }
         
         # 系列二更新基路径
-        self.update_url = "https://khsci.com/khQuant/update"
+        self.update_url = "https://khsci.com/khQuant/update2"
         self.update_thread = None
         self.download_thread = None
 
@@ -359,51 +382,54 @@ class UpdateManager(QObject):
 
     def check_for_updates(self, current_version):
         """
-        检查更新
+        检查更新（在后台线程中执行网络请求，避免阻塞UI）
         :param current_version: 当前版本号
         """
-        try:
-            logging.info("开始检查软件更新")
-            response = requests.post(
-                'https://khsci.com/khQuant/wp-admin/admin-ajax.php',
-                data={
-                    'action': 'kh_check_update',
-                    'version': current_version,
-                    'channel': self.update_channel
-                },
-                timeout=5
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                logging.debug(f"服务器响应: {data}")  # 添加日志
-                
-                if data.get('success'):
-                    # 系列二端点返回 { success: true, data: {...} }
-                    version_info = data.get('data', {})
-                    logging.debug(f"获取到版本信息: {version_info}")  # 添加日志
-                    
-                    # 检查是否有新版本
-                    if self.compare_versions(version_info.get('version', ''), current_version):
-                        logging.info(f"发现新版本: {version_info['version']}")
-                        # 显示更新对话框
-                        self.handle_update_available(version_info)
+        import threading
+
+        def _do_check():
+            try:
+                logging.info("开始检查软件更新")
+                response = requests.post(
+                    'https://khsci.com/khQuant/series2-update.php',
+                    data={
+                        'action': 'check_update',
+                        'version': current_version,
+                        'channel': self.update_channel
+                    },
+                    timeout=5
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    logging.debug(f"服务器响应: {data}")
+
+                    if data.get('success'):
+                        version_info = data.get('data', {})
+                        logging.debug(f"获取到版本信息: {version_info}")
+
+                        if self.compare_versions(version_info.get('version', ''), current_version):
+                            logging.info(f"发现新版本: {version_info['version']}")
+                            # 通过QTimer在主线程中显示更新对话框
+                            QTimer.singleShot(0, lambda vi=version_info: self.handle_update_available(vi))
+                        else:
+                            logging.info("当前已是最新版本")
+                            self.check_finished.emit(True, "当前已是最新版本")
                     else:
-                        logging.info("当前已是最新版本")
-                        self.check_finished.emit(True, "当前已是最新版本")
+                        error_msg = data.get('data', '检查更新失败')
+                        logging.warning(f"检查更新失败: {error_msg}")
+                        self.check_finished.emit(False, error_msg)
                 else:
-                    error_msg = data.get('data', '检查更新失败')
-                    logging.warning(f"检查更新失败: {error_msg}")
+                    error_msg = f"服务器响应错误: {response.status_code}"
+                    logging.error(error_msg)
                     self.check_finished.emit(False, error_msg)
-            else:
-                error_msg = f"服务器响应错误: {response.status_code}"
-                logging.error(error_msg)
+
+            except Exception as e:
+                error_msg = f"检查更新时出错: {str(e)}"
+                logging.error(error_msg, exc_info=True)
                 self.check_finished.emit(False, error_msg)
-                
-        except Exception as e:
-            error_msg = f"检查更新时出错: {str(e)}"
-            logging.error(error_msg, exc_info=True)
-            self.check_finished.emit(False, error_msg)
+
+        threading.Thread(target=_do_check, daemon=True).start()
 
     def handle_update_available(self, version_info):
         try:
