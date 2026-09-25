@@ -4,75 +4,30 @@ import math
 from kh_stock_pools import DESKTOP_CODE_INDEX, desktop_pool_definitions
 from khPathUtils import (
     get_custom_stock_pool_path,
-    get_macos_logs_dir,
     get_stock_pool_path,
     get_stock_pool_write_dir,
-    get_user_packages_dir,
     is_frozen_runtime,
 )
+from kh_app_identity import (
+    APP_NAME, QT_APP, QT_ORG, default_duckdb_dir, documents_dir, local_appdata_dir,
+)
+
+WINDOW_TITLE = "看海量化回测系统（开源版）"
+
+if __name__ == "__main__" and sys.platform != "win32":
+    print("看海量化回测平台（开源版）只支持 Windows 10/11 64 位。")
+    sys.exit(2)
 
 _IS_FROZEN_RUNTIME = is_frozen_runtime()
 if _IS_FROZEN_RUNTIME:
-    # macOS .app 自重启后仍能识别打包状态，避免资源/可写目录退回源码路径。
     os.environ.setdefault("KHQUANT_PACKAGED", "1")
-
-
-def _relaunch_macos_app_outside_development_sandbox():
-    """将被开发工具沙箱启动的 Mac 安装版交回 LaunchServices。
-
-    TRAE 的 agent 沙箱只允许访问项目目录和临时目录。若直接在其中运行
-    .app，配置目录、日志目录以及用户选择的 DuckDB 目录都会被系统拒绝。
-    通过 ``open`` 重新启动后，新进程由 launchd 创建，不继承该文件沙箱。
-    """
-    if sys.platform != "darwin" or not _IS_FROZEN_RUNTIME:
-        return
-    if os.environ.get("KHQUANT_RELAUNCHED_OUTSIDE_SANDBOX") == "1":
-        return
-    if not (
-        os.environ.get("TRAE_SANDBOX_STORAGE_PATH")
-        or os.environ.get("TRAE_SANDBOX_CLI_PATH")
-    ):
-        return
-
-    executable = os.path.abspath(sys.executable)
-    app_bundle = os.path.dirname(os.path.dirname(os.path.dirname(executable)))
-    if not app_bundle.lower().endswith(".app") or not os.path.isdir(app_bundle):
-        return
-
-    try:
-        import subprocess as _startup_subprocess
-
-        launch_env = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.startswith("TRAE_SANDBOX_")
-            and not key.startswith("SAFE_RM_")
-        }
-        launch_env["KHQUANT_RELAUNCHED_OUTSIDE_SANDBOX"] = "1"
-        _startup_subprocess.Popen(
-            ["/usr/bin/open", "-n", app_bundle],
-            stdout=_startup_subprocess.DEVNULL,
-            stderr=_startup_subprocess.DEVNULL,
-            start_new_session=True,
-            env=launch_env,
-        )
-        raise SystemExit(0)
-    except SystemExit:
-        raise
-    except Exception as exc:
-        # 自动脱离失败时继续启动，让后续错误信息保留真实原因。
-        print(f"无法脱离开发工具沙箱，将继续当前进程: {exc}")
-
-
-_relaunch_macos_app_outside_development_sandbox()
 
 # ── 可复现性：固定哈希种子(与 kh.py 一致)──────────────────────────────
 # GUI 在同进程的 QThread 内直接运行 KhQuantFramework(非子进程)，故 GUI
 # 进程本身需固定 PYTHONHASHSEED，否则策略中 set 迭代顺序随机 → 回测结果
 # 每次不可复现。须早于 multiprocessing 导入；multiprocessing 子进程会继承
 # 本环境变量(=0)从而跳过重启，不影响 freeze_support 的打包子进程逻辑。
-# 使用子进程并等待，而不是 os.execv：后者会切断 VS Code/debugpy 的启动链，
-# 表现为按 F5 后终端没有报错、GUI 也不出现。
+# 使用子进程并等待，而不是 os.execv，保证父进程能拿到子进程的退出码。
 if os.environ.get("PYTHONHASHSEED") != "0":
     os.environ["PYTHONHASHSEED"] = "0"
     try:
@@ -90,37 +45,20 @@ import multiprocessing
 
 # 打包(PyInstaller)后，multiprocessing 以 spawn 方式启动的子进程（含资源跟踪进程）会重新执行本入口文件。
 # 必须在任何重型导入和 multiprocessing 资源分配之前调用 freeze_support()，否则打包版的子进程会重新跑到
-# main() 反复弹出主界面（macOS 上尤为明显：从 baostock 补充数据时会按工作进程数额外弹出多个主界面）。
-# PyInstaller 提供了跨平台的 freeze_support 实现；源码直接运行时该调用为 no-op，对 Windows/Linux/源码运行无任何副作用。
+# main() 反复弹出主界面（从 baostock 补充数据时会按工作进程数额外弹出多个主界面）。
+# 源码直接运行时该调用为 no-op。
 multiprocessing.freeze_support()
 
-# 桌面主窗口与定时补充各自单实例，二者可以同时运行。固定哈希中继父进程
-# 尚未走到这里，multiprocessing 子进程的 __name__ 也不是 __main__，不会
-# 抢占锁。必须早于日志初始化，防止重复调度器短暂争抢 scheduled_sync.log。
+# 桌面主窗口单实例。固定哈希中继父进程尚未走到这里，multiprocessing 子进程
+# 的 __name__ 也不是 __main__，不会抢占锁。必须早于日志初始化。
 _desktop_instance_lock = None
-_scheduled_instance_lock = None
 if __name__ == "__main__":
-    from kh_single_instance import (
-        DEFAULT_SCHEDULED_INSTANCE_KEY,
-        DesktopSingleInstanceLock,
-        notify_already_running,
-    )
+    from kh_single_instance import DesktopSingleInstanceLock, notify_already_running
 
-    if "--scheduled-sync" in sys.argv[1:]:
-        _scheduled_instance_lock = DesktopSingleInstanceLock(
-            key=DEFAULT_SCHEDULED_INSTANCE_KEY
-        )
-        if not _scheduled_instance_lock.acquire():
-            notify_already_running(
-                "定时数据补充已经在运行。请切换到现有窗口，无需重复启动。",
-                "看海量化 - 定时数据补充",
-            )
-            raise SystemExit(0)
-    else:
-        _desktop_instance_lock = DesktopSingleInstanceLock()
-        if not _desktop_instance_lock.acquire():
-            notify_already_running()
-            raise SystemExit(0)
+    _desktop_instance_lock = DesktopSingleInstanceLock()
+    if not _desktop_instance_lock.acquire():
+        notify_already_running()
+        raise SystemExit(0)
 
 import logging
 from logging.handlers import RotatingFileHandler
@@ -174,61 +112,6 @@ def _dispatch_duckdb_viewer_destroyed(owner, target):
     KhQuantGUI._on_duckdb_viewer_destroyed(owner, target)
 
 
-PLUGIN_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "plugins"))
-if PLUGIN_DIR not in sys.path:
-    sys.path.append(PLUGIN_DIR)
-
-# 添加用户自定义包目录
-_base_dir = os.path.dirname(os.path.abspath(__file__))
-USER_PACKAGES_DIR = get_user_packages_dir(_base_dir, create=True)
-if USER_PACKAGES_DIR not in sys.path:
-    # 用户扩展包只作为缺失依赖的补充，不能抢在程序自带核心依赖之前，
-    # 否则同名包可能遮蔽打包版本并导致难以复现的启动/导入异常。
-    sys.path.append(USER_PACKAGES_DIR)
-
-# 导入GUI模块中的StockDataProcessorGUI类
-try:
-    from GUI import StockDataProcessorGUI, setup_logging
-except Exception as _imp_exc:
-    logging.error(f"无法导入GUI模块: {_imp_exc}")
-    StockDataProcessorGUI = None
-    setup_logging = None
-
-# 导入内置VSCode编辑器管理器（内嵌 VSCode + debugpy 目前只适配 Windows，
-# macOS/Linux 上将禁用此入口，建议直接用系统 VSCode 打开策略文件）
-try:
-    from kh_platform import EMBEDDED_VSCODE_ENABLED as _EMBEDDED_VSCODE_ENABLED
-except ImportError:
-    _EMBEDDED_VSCODE_ENABLED = sys.platform == "win32"
-
-if _EMBEDDED_VSCODE_ENABLED:
-    try:
-        from editor_debug_modules.EmbeddedVSCodeManager import EmbeddedVSCodeManager
-        EMBEDDED_VSCODE_AVAILABLE = True
-    except ImportError:
-        logging.error("无法导入EmbeddedVSCodeManager模块")
-        EmbeddedVSCodeManager = None
-        EMBEDDED_VSCODE_AVAILABLE = False
-else:
-    logging.info("当前平台未启用内嵌 VSCode 编辑器（仅 Windows 支持）")
-    EmbeddedVSCodeManager = None
-    EMBEDDED_VSCODE_AVAILABLE = False
-
-from editor_debug_modules.vscode_helper import find_vscode_executable
-
-# 导入数据管理模块
-try:
-    from GUIDataViewer import GUIDataViewer  # 数据本地数据管理模块
-except ImportError:
-    logging.error("无法导入数据查看器模块")
-    GUIDataViewer = None
-
-try:
-    from GUIScheduler import GUIScheduler  # 数据定时补充模块
-except ImportError:
-    logging.error("无法导入数据定时补充模块")
-    GUIScheduler = None
-
 try:
     from BacktestHistoryManager import BacktestHistoryManager  # 回测历史管理模块
 except ImportError:
@@ -242,24 +125,8 @@ try:
 except ImportError as e:
     logging.error(f"导入必要模块失败: {str(e)}")
 
-# xtquant 仅 Windows + miniQMT 可用；GUI 主入口实际并未使用 XtQuantTrader/Callback，
-# 这里仍保留 import 以兼容旧代码引用，失败时静默放置为 None
-try:
-    from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback  # type: ignore
-except ImportError:
-    XtQuantTrader = None  # type: ignore
-    XtQuantTraderCallback = None  # type: ignore
-
 from SettingsDialog import SettingsDialog
 from qt_settings_bridge import KhQtSettings
-try:
-    from cli.web_launcher import launch_web_workbench
-    WEB_WORKBENCH_AVAILABLE = True
-except ImportError:
-    # CSkhQuant/Mac 公共发行版按发布边界不包含网页端模块；网页入口必须是
-    # 可选能力，不能因为缺少 webapp 让桌面主程序无法启动。
-    launch_web_workbench = None
-    WEB_WORKBENCH_AVAILABLE = False
 from backtest_runtime_config import (
     apply_system_runtime_settings,
     build_headless_settings,
@@ -279,32 +146,17 @@ from khUiScale import (
     force_primary_screen_dpi,
     get_platform_ui_metrics,
     get_adaptive_window_size,
-    is_macos_ui,
     get_preferred_ui_font_family,
     get_preferred_mono_font_family,
 )
 
 
-class WebWorkbenchLaunchNotifier(QObject):
-    """把守护线程的网页启动结果安全投递到 Qt 主线程。"""
-
-    result_signal = pyqtSignal(object)
-    error_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal()
-
 def get_logs_dir():
-    """获取日志目录的正确路径"""
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-    if sys.platform == "darwin" and is_frozen_runtime():
-        possible_dirs = [get_macos_logs_dir()]
-    else:
-        # Windows 与源码模式保持原有目录优先级。
-        possible_dirs = [
-            os.path.join(base_dir, 'logs'),
-            os.path.join(os.path.expanduser('~'), 'KhQuant', 'logs'),
-            os.path.join(os.environ.get('TEMP', '/tmp'), 'KhQuant', 'logs'),
-        ]
+    """获取日志目录：%LOCALAPPDATA%\\KhQuantOS\\logs，不可写时退到临时目录。"""
+    possible_dirs = [
+        local_appdata_dir('logs'),
+        os.path.join(os.environ.get('TEMP', '/tmp'), 'KhQuantOS', 'logs'),
+    ]
 
     for logs_dir in possible_dirs:
         try:
@@ -319,7 +171,7 @@ def get_logs_dir():
     
     # 如果所有目录都失败，使用临时目录
     import tempfile
-    logs_dir = os.path.join(tempfile.gettempdir(), 'KhQuant_logs')
+    logs_dir = os.path.join(tempfile.gettempdir(), 'KhQuantOS_logs')
     try:
         os.makedirs(logs_dir, exist_ok=True)
         print(f"使用临时日志目录: {logs_dir}")
@@ -328,51 +180,6 @@ def get_logs_dir():
         print(f"创建临时日志目录失败: {e}")
         return tempfile.gettempdir()
 
-
-def get_writable_duckdb_data_dir(preferred_path: str = "") -> str:
-    """返回可写的 DuckDB 数据目录。
-
-    优先级：
-    1. 用户已设置的路径（如果可写）
-    2. macOS 标准应用数据目录 ~/Library/Application Support/khQuant
-    3. /tmp/KhQuant/duckdb_data（兜底）
-    """
-    # 用户设置的路径
-    preferred_abs = ""
-    if preferred_path:
-        expanded = os.path.expanduser(os.path.expandvars(preferred_path))
-        preferred_abs = os.path.abspath(expanded)
-
-    def _try_path(abs_dir: str) -> bool:
-        """尝试创建目录并验证可写性"""
-        try:
-            os.makedirs(abs_dir, exist_ok=True)
-            for market in ('SH', 'SZ', 'BJ'):
-                os.makedirs(os.path.join(abs_dir, market), exist_ok=True)
-            test_file = os.path.join(abs_dir, '.write_test')
-            with open(test_file, 'w', encoding='utf-8') as f:
-                f.write('ok')
-            os.remove(test_file)
-            return True
-        except (OSError, PermissionError):
-            return False
-
-    # 1. 用户设置的路径可写则直接使用
-    if preferred_abs and _try_path(preferred_abs):
-        return preferred_abs
-
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-
-    stock_dir = os.path.join(base_dir, 'stock_data')
-    if _try_path(stock_dir):
-        return stock_dir
-
-    # 3. 兜底 /tmp
-    fallback = os.path.join('/tmp', 'KhQuant', 'duckdb_data')
-    if _try_path(fallback):
-        return fallback
-
-    return fallback
 
 LOGS_DIR = get_logs_dir()
 
@@ -435,11 +242,6 @@ logging.info(
 )
 if _desktop_instance_lock is not None and _desktop_instance_lock.error:
     logging.warning("跨进程单实例锁启用失败，已安全放行: %s", _desktop_instance_lock.error)
-if _scheduled_instance_lock is not None and _scheduled_instance_lock.error:
-    logging.warning(
-        "定时补充跨进程单实例锁启用失败，已安全放行: %s",
-        _scheduled_instance_lock.error,
-    )
 
 
 _SLIPPAGE_LABEL_TO_TYPE = {
@@ -538,15 +340,6 @@ def _merge_trade_cost_config(base_trade_cost, ui_trade_cost):
     return _normalize_trade_cost_config(merged)
 
 # 定义StockAccount类
-class StockAccount:
-    """账户类"""
-    def __init__(self, account_id, account_type="STOCK"):
-        self.account_id = account_id
-        self.account_type = account_type
-        self.total_asset = 0.0
-        self.cash = 0.0
-        self.market_value = 0.0
-        self.positions = []
 
 
 class IntegrityCheckThread(QThread):
@@ -611,9 +404,8 @@ class StrategyThread(QThread):
     error_signal = pyqtSignal(str, Exception)  # 错误信号
     status_signal = pyqtSignal(str)  # 状态信号
     finished_signal = pyqtSignal()  # 完成信号
-    debug_server_started = pyqtSignal(int)  # 调试服务器启动信号（传递端口号）
 
-    def __init__(self, config_path, strategy_file, trader_callback, debug_mode=False, debug_manager=None):
+    def __init__(self, config_path, strategy_file, trader_callback):
         super().__init__()
         self.config_path = config_path
         self.strategy_file = strategy_file
@@ -621,66 +413,14 @@ class StrategyThread(QThread):
         self.framework = None
         self.temp_config_paths = [config_path] if config_path else []
         self._is_running = True
-        self.debug_mode = debug_mode  # 新增：调试模式标志
-        self.debug_manager = debug_manager  # 新增：调试管理器
-        self._debug_signal_connected = False
-
-        if self.debug_manager is not None:
-            try:
-                self.debug_manager.debug_server_started.connect(
-                    self._forward_debug_server_started,
-                    Qt.QueuedConnection
-                )
-            except TypeError:
-                self.debug_manager.debug_server_started.connect(
-                    self._forward_debug_server_started
-                )
-            self._debug_signal_connected = True
 
     def run(self):
         """线程运行函数"""
         try:
-            # 如果启用调试模式，启动debugpy服务器
-            if self.debug_mode and self.debug_manager:
-                self.status_signal.emit("🔧 启动调试服务器...")
-                # debugpy.listen() 在同一进程中只能调用一次。后续回测应复用
-                # 已有监听端口；若重新查找，会得到下一个空闲端口并在界面上
-                # 错报端口，尽管实际附加仍连接到旧端口。
-                if (
-                    self.debug_manager.is_debug_server_running
-                    and self.debug_manager.debug_port
-                ):
-                    debug_port = self.debug_manager.debug_port
-                else:
-                    debug_port = self.debug_manager.find_available_port()
-                if debug_port:
-                    debug_started = self.debug_manager.start_debug_server(port=debug_port, wait_for_client=True)
-                    if debug_started:
-                        active_port = self.debug_manager.debug_port or debug_port
-                        self.status_signal.emit(f"✓ 调试服务器已启动，端口: {active_port}")
-                        self.status_signal.emit("⏸ 程序已暂停，等待调试器连接...")
-                        self.status_signal.emit("📍 VSCode将自动启动调试会话...")
-                        self.status_signal.emit("✓ 调试器已连接，策略开始运行")
-
-                        # 关键：让debugpy调试当前线程
-                        # 这样策略代码运行时，debugpy可以正确追踪
-                        try:
-                            import debugpy
-                            debugpy.debug_this_thread()
-                            self.status_signal.emit("✓ 当前线程已启用调试")
-                        except Exception as e:
-                            self.status_signal.emit(f"⚠ 启用线程调试失败: {e}")
-                    else:
-                        # 调试服务器启动失败（通常是因为已经运行过一次）
-                        self.status_signal.emit("⚠ 调试服务器启动失败，将以普通模式继续运行")
-                        self.status_signal.emit("💡 提示：要使用调试功能，请完全关闭并重启主程序")
-                else:
-                    self.status_signal.emit("✗ 无法找到可用的调试端口，将以普通模式继续运行")
-
             # 读取UI设置，传递给回测框架
             from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
             from PyQt5.QtWidgets import QMessageBox
-            settings = KhQtSettings('KHQuant', 'StockAnalyzer')
+            settings = KhQtSettings(QT_ORG, QT_APP)
             gui = self.trader_callback.gui if self.trader_callback and hasattr(self.trader_callback, 'gui') else None
             duckdb_data_path = gui._ensure_duckdb_data_path() if gui else settings.value('duckdb_data_path', '')
             
@@ -822,7 +562,7 @@ class StrategyThread(QThread):
                 },
                 include_runtime_settings={
                     'init_data_enabled': False,
-                    'khhistory_missing_data_prompt': settings_cfg.get('performance_khhistory_missing_data_prompt', False),
+                    'khhistory_missing_data_prompt': settings_cfg.get('performance_khhistory_missing_data_prompt', True),
                 },
             )
 
@@ -884,15 +624,6 @@ class StrategyThread(QThread):
             self.finished_signal.emit()
             # 现在设置运行状态为False
             self._is_running = False
-            if self.debug_manager is not None and self._debug_signal_connected:
-                try:
-                    self.debug_manager.debug_server_started.disconnect(self._forward_debug_server_started)
-                except TypeError:
-                    pass
-
-    def _forward_debug_server_started(self, port):
-        """转发调试服务器启动信号，确保在服务器真正监听后通知主线程"""
-        self.debug_server_started.emit(port)
 
     def stop(self):
         """停止策略"""
@@ -980,7 +711,7 @@ class KhQuantGUI(QMainWindow):
         logging.info(f"[INSTANCE] KhQuantGUI 实例创建中，当前实例数: {KhQuantGUI._instance_count}")
         
         # 初始化设置
-        self.settings = KhQtSettings('KHQuant', 'StockAnalyzer')
+        self.settings = KhQtSettings(QT_ORG, QT_APP)
         self._ensure_duckdb_data_path()
         
         # 初始化延迟日志显示相关属性（需要在早期初始化，避免AttributeError）
@@ -1030,7 +761,7 @@ class KhQuantGUI(QMainWindow):
         self._t0_warning_suppressed = set()
         
         # 设置窗口属性
-        self.setWindowTitle("看海量化回测系统")
+        self.setWindowTitle(WINDOW_TITLE)
         # 设置窗口图标
         self.setWindowIcon(QIcon(self.get_icon_path("stock_icon.ico")))
         
@@ -1056,10 +787,7 @@ class KhQuantGUI(QMainWindow):
         
         # 日志存储
         self.log_entries = []
-        
-        # 更新实盘数据获取模块状态
-        self.update_realtime_data_group_status()
-        
+
         # 连接信号到槽（使用QueuedConnection确保跨线程调用不阻塞）
         self.log_signal.connect(self._log_message, Qt.QueuedConnection)
         self.update_status_signal.connect(self._update_status_table, Qt.QueuedConnection)
@@ -1070,55 +798,6 @@ class KhQuantGUI(QMainWindow):
         self.log_flush_timer = QTimer()
         self.log_flush_timer.timeout.connect(self.flush_logs)
         self.log_flush_timer.start(5000)  # 每5秒刷新一次日志
-        
-        # 初始化代码编辑器模块（已废弃，现在使用EmbeddedVSCodeManager）
-        self.editor_module = None
-        # if get_editor_module is not None:
-        #     try:
-        #         self.editor_module = get_editor_module(self)
-        #         logging.info("代码编辑器模块初始化成功")
-        #     except Exception as e:
-        #         logging.error(f"代码编辑器模块初始化失败: {e}")
-
-        # 初始化调试模式管理器
-        self.debug_mode_enabled = False
-        try:
-            from editor_debug_modules.DebugModeIntegration import DebugModeManager
-            self.debug_manager = DebugModeManager(self)
-            # 连接调试消息信号到日志
-            self.debug_manager.debug_message.connect(lambda msg: logging.info(msg))
-            logging.info("调试模式管理器初始化成功")
-        except ImportError:
-            logging.warning("无法导入DebugModeManager，调试模式不可用")
-            self.debug_manager = None
-
-        # 初始化内置VSCode编辑器管理器
-        self.embedded_vscode_manager = None
-        if EMBEDDED_VSCODE_AVAILABLE and EmbeddedVSCodeManager is not None:
-            try:
-                self.embedded_vscode_manager = EmbeddedVSCodeManager(self)
-                # 连接信号
-                self.embedded_vscode_manager.communication_server_ready.connect(
-                    lambda port: self.log_message(
-                        f"内置VSCode编辑器通信服务已启动（端口 {port}）",
-                        "INFO",
-                    )
-                )
-                self.embedded_vscode_manager.communication_server_failed.connect(
-                    lambda message: self.log_message(
-                        "内置VSCode编辑器通信端口被占用或启动失败："
-                        f"{message}。回测功能仍可正常使用。",
-                        "WARNING",
-                    )
-                )
-                self.embedded_vscode_manager.editor_started.connect(self._on_embedded_editor_started)
-                self.embedded_vscode_manager.editor_stopped.connect(self._on_embedded_editor_stopped)
-                self.embedded_vscode_manager.file_opened.connect(self._on_embedded_editor_file_opened)
-                self.embedded_vscode_manager.debug_started.connect(self._on_embedded_editor_debug_started)
-                logging.info("内置VSCode编辑器管理器已创建，通信服务正在启动")
-            except Exception as e:
-                logging.error(f"内置VSCode编辑器管理器初始化失败: {e}")
-                self.embedded_vscode_manager = None
         
         # 记录启动信息到日志
         logging.info(f"软件启动时间: {self.start_time}")
@@ -1131,15 +810,8 @@ class KhQuantGUI(QMainWindow):
         self.center_window()
         self.show()
 
-        # macOS：首次启动自动安装命令行工具 kh（延迟执行，先让主窗口显示出来）
-        if sys.platform == 'darwin':
-            QTimer.singleShot(800, self.auto_install_cli_tools)
-
         # 初始化数据管理窗口实例变量
-        self.csv_manager_window = None
-        self.data_viewer_window = None
         self.duckdb_viewer_window = None
-        self.scheduler_window = None
         self._close_after_duckdb_viewer = False
         
         logging.info(f"[INSTANCE] KhQuantGUI 实例初始化完成，当前实例数: {KhQuantGUI._instance_count}")
@@ -1951,7 +1623,7 @@ class KhQuantGUI(QMainWindow):
         self._install_gui_log_handler()
         
         # 设置窗口标题
-        self.setWindowTitle("看海量化回测系统")
+        self.setWindowTitle(WINDOW_TITLE)
         
         # 设置窗口图标
         logo_path = self.get_icon_path("stock_icon.ico")
@@ -2080,48 +1752,16 @@ class KhQuantGUI(QMainWindow):
         right_panel.setLayout(self.right_layout)
         
         # 设置三个面板的最小宽度
-        if is_macos_ui():
-            left_panel.setMinimumWidth(self.ui_metrics["main_left_panel_min_width"])
-            middle_panel.setMinimumWidth(self.ui_metrics["main_middle_panel_min_width"])
-            right_panel.setMinimumWidth(self.ui_metrics["main_right_panel_min_width"])
-        else:
-            panel_min_width = self.ui_metrics["main_panel_min_width"]
-            left_panel.setMinimumWidth(panel_min_width)
-            middle_panel.setMinimumWidth(panel_min_width)
-            right_panel.setMinimumWidth(panel_min_width)
+        panel_min_width = self.ui_metrics["main_panel_min_width"]
+        left_panel.setMinimumWidth(panel_min_width)
+        middle_panel.setMinimumWidth(panel_min_width)
+        right_panel.setMinimumWidth(panel_min_width)
 
-        if is_macos_ui():
-            self.main_splitter = QSplitter(Qt.Horizontal)
-            self.main_splitter.setChildrenCollapsible(False)
-            self.main_splitter.setHandleWidth(6)
-            self.main_splitter.setStyleSheet("""
-                QSplitter {
-                    background-color: #2b2b2b;
-                }
-                QSplitter::handle {
-                    background-color: #404040;
-                    width: 6px;
-                    margin: 2px;
-                    border-radius: 2px;
-                }
-                QSplitter::handle:hover {
-                    background-color: #4e4e4e;
-                }
-            """)
-            self.main_splitter.addWidget(left_panel)
-            self.main_splitter.addWidget(middle_panel)
-            self.main_splitter.addWidget(right_panel)
-            self.main_splitter.setStretchFactor(0, 1)
-            self.main_splitter.setStretchFactor(1, 1)
-            self.main_splitter.setStretchFactor(2, 2)
-            self.main_splitter.setSizes(self.ui_metrics["main_splitter_sizes"])
-            main_layout.addWidget(self.main_splitter)
-        else:
-            # 添加三个面板到主布局
-            main_layout.addWidget(left_panel)
-            main_layout.addWidget(middle_panel)
-            main_layout.addWidget(right_panel)
-        
+        # 添加三个面板到主布局
+        main_layout.addWidget(left_panel)
+        main_layout.addWidget(middle_panel)
+        main_layout.addWidget(right_panel)
+
         # 调整大小以适应内容
         # self.adjustSize()  # 删除此行，因为它会覆盖最大化设置
         
@@ -2179,38 +1819,13 @@ class KhQuantGUI(QMainWindow):
         # 添加分隔符
         toolbar.addSeparator()
 
-        # 添加本地数据管理按钮 (miniQMT模式)
-        self.data_viewer_action = toolbar.addAction("本地数据管理")
-        self.data_viewer_action.setToolTip("查看和分析本地存储的股票数据")
-        self.data_viewer_action.triggered.connect(self.open_data_viewer)
-
-        # 添加定时补充按钮 (miniQMT模式)
-        self.scheduler_action = toolbar.addAction("定时补充数据")
-        self.scheduler_action.setToolTip("设置和管理数据定时补充任务")
-        self.scheduler_action.triggered.connect(self.open_scheduler)
-
-        # 添加CSV数据管理按钮 (miniQMT模式)
-        self.data_module_action = toolbar.addAction("CSV数据管理")
-        self.data_module_action.setToolTip("打开CSV数据下载、清洗和管理界面")
-        self.data_module_action.triggered.connect(self.open_data_module)
-
-        # 添加DuckDB数据管理按钮 (DuckDB模式，按钮名称改为"数据管理")
+        # 数据管理：浏览本地 DuckDB，用 BaoStock / Tushare 下载数据
         self.duckdb_viewer_action = toolbar.addAction("数据管理")
-        self.duckdb_viewer_action.setToolTip("打开DuckDB本地数据库管理界面")
+        self.duckdb_viewer_action.setToolTip("打开 DuckDB 本地数据管理，用 BaoStock / Tushare 下载数据")
         self.duckdb_viewer_action.triggered.connect(self.open_duckdb_viewer)
 
         # 添加分隔符
         toolbar.addSeparator()
-
-        # 调试模式开关（隐藏，由编辑器自动控制）
-        # 注释：调试模式现在由打开/关闭编辑器自动控制
-        # 打开编辑器时自动启用调试模式，关闭编辑器时自动禁用
-        self.debug_mode_checkbox = None  # 不再显示勾选框
-
-        # 调试状态指示器（隐藏）
-        self.debug_status_label = None  # 不再显示状态标签
-
-        # 不再添加调试相关的UI元素到工具栏
 
         # 添加设置按钮
         settings_action = toolbar.addAction("设置")
@@ -2243,7 +1858,7 @@ class KhQuantGUI(QMainWindow):
         self.status_indicator = QLabel()
         indicator_size = self.ui_metrics["toolbar_indicator_size"]
         self.status_indicator.setFixedSize(indicator_size, indicator_size)
-        self.status_indicator.setToolTip("MiniQMT状态")
+        self.status_indicator.setToolTip("DuckDB数据状态")
         
         # 创建一个容器来包装状态指示灯，并添加边距
         indicator_container = QWidget()
@@ -2252,33 +1867,6 @@ class KhQuantGUI(QMainWindow):
         indicator_layout.addWidget(self.status_indicator)
         toolbar.addWidget(indicator_container)
         
-        # macOS 下不显示编辑器按钮，避免暴露不适配的 Windows 专属入口
-        self._editor_btn = None
-        if not is_macos_ui():
-            self._editor_btn = QToolButton()
-            self._editor_btn.setText("编辑器")
-            try:
-                from kh_platform import EMBEDDED_VSCODE_ENABLED as _EVSC
-            except ImportError:
-                _EVSC = sys.platform == "win32"
-            self._editor_btn.setToolTip(
-                "打开代码编辑器（内嵌 VSCode）" if _EVSC
-                else "使用本机安装的 Visual Studio Code 打开策略文件"
-            )
-            self._editor_btn.clicked.connect(self.open_embedded_editor)
-            toolbar.addWidget(self._editor_btn)
-
-        # 网页回测入口：完整开发版启用；未包含 webapp 的公共发行版自动隐藏。
-        self._web_btn = None
-        if WEB_WORKBENCH_AVAILABLE:
-            self._web_btn = QToolButton()
-            self._web_btn.setIcon(QIcon(self.get_icon_path("web.svg")))
-            self._web_btn.setToolTip("打开网页回测工作台")
-            self._web_btn.clicked.connect(self.open_web_workbench)
-            toolbar.addWidget(self._web_btn)
-        else:
-            logging.info("当前发行版未包含网页回测模块，已隐藏网页入口")
-        
         # 添加帮助按钮
         self._help_btn = QToolButton()
         self._help_btn.setText("?")
@@ -2286,15 +1874,7 @@ class KhQuantGUI(QMainWindow):
         self._help_btn.clicked.connect(self.open_help_tutorial)
         toolbar.addWidget(self._help_btn)
 
-        # 添加安装命令行工具按钮（仅限 macOS）
-        if sys.platform == "darwin":
-            self._cli_install_btn = QToolButton()
-            self._cli_install_btn.setText("安装CLI")
-            self._cli_install_btn.setToolTip("在终端中全局安装 'kh' 命令行工具")
-            self._cli_install_btn.clicked.connect(self.install_cli_tools)
-            toolbar.addWidget(self._cli_install_btn)
-
-        # 应用编辑器/帮助按钮样式
+        # 应用帮助按钮样式
         self._apply_extra_btn_styles()
         
         # 添加定时器来检查软件状态
@@ -2308,71 +1888,6 @@ class KhQuantGUI(QMainWindow):
         # 设置工具栏样式
         self._apply_toolbar_style(toolbar)
 
-        # 根据数据源设置更新工具栏按钮可见性
-        self.update_data_toolbar_buttons()
-
-    def update_data_toolbar_buttons(self):
-        """根据数据源设置更新工具栏数据管理按钮的可见性
-
-        ``backtest_data_source`` 只决定回测读取路径，不应限制 DuckDB
-        数据管理器的入口。现代数据管理器内的历史导入窗口可以独立选择
-        MiniQMT 或大 QMT 原生桥，因此在 Windows 上始终保留“数据管理”按钮。
-        旧的 MiniQMT/CSV 按钮继续按原规则显示，兼容仍依赖这些入口的安装。
-
-        - DuckDB模式: 显示现代“数据管理”按钮
-        - miniQMT模式: 显示现代“数据管理”以及旧的“本地数据管理”、
-          “定时补充数据”、“CSV数据管理”按钮
-        """
-        try:
-            try:
-                from kh_platform import MINIQMT_LAUNCH_ENABLED
-            except ImportError:
-                MINIQMT_LAUNCH_ENABLED = sys.platform == "win32"
-
-            # macOS/Linux：无 miniQMT 客户端，固定只展示 DuckDB 数据管理入口
-            if not MINIQMT_LAUNCH_ENABLED:
-                if hasattr(self, 'data_viewer_action'):
-                    self.data_viewer_action.setVisible(False)
-                if hasattr(self, 'scheduler_action'):
-                    self.scheduler_action.setVisible(False)
-                if hasattr(self, 'data_module_action'):
-                    self.data_module_action.setVisible(False)
-                if hasattr(self, 'duckdb_viewer_action'):
-                    self.duckdb_viewer_action.setVisible(True)
-                logging.debug("当前平台无 miniQMT，工具栏已固定为 DuckDB 数据管理")
-                return
-
-            # 现代 DuckDB 管理器同时承载 MiniQMT/大QMT 原生桥历史导入，
-            # 与回测使用的 provider 无关。Windows 上不能因为用户选择
-            # xtdata（或其它 live provider）就把这个入口隐藏，否则用户
-            # 会被迫回到旧的 CSV/HTTP 数据管理界面。
-            if hasattr(self, 'duckdb_viewer_action'):
-                self.duckdb_viewer_action.setVisible(True)
-
-            # 获取当前数据源设置 (duckdb 或 xtdata)
-            data_source = self.settings.value('backtest_data_source', 'duckdb')
-
-            if data_source == 'duckdb':
-                # DuckDB回测模式：旧 MiniQMT 工具保持隐藏。
-                if hasattr(self, 'data_viewer_action'):
-                    self.data_viewer_action.setVisible(False)
-                if hasattr(self, 'scheduler_action'):
-                    self.scheduler_action.setVisible(False)
-                if hasattr(self, 'data_module_action'):
-                    self.data_module_action.setVisible(False)
-            else:
-                # miniQMT/其它 live provider 模式：保留旧按钮兼容，同时
-                # 保持上方现代 DuckDB 管理入口可见。
-                if hasattr(self, 'data_viewer_action'):
-                    self.data_viewer_action.setVisible(True)
-                if hasattr(self, 'scheduler_action'):
-                    self.scheduler_action.setVisible(True)
-                if hasattr(self, 'data_module_action'):
-                    self.data_module_action.setVisible(True)
-
-            logging.debug(f"工具栏数据按钮已更新，当前数据源: {data_source}")
-        except Exception as e:
-            logging.warning(f"更新工具栏按钮时出错: {e}")
 
     def _apply_toolbar_style(self, toolbar):
         """应用工具栏样式（避免缩放后出现浅色边线）"""
@@ -2512,28 +2027,11 @@ class KhQuantGUI(QMainWindow):
                     """)
 
     def _apply_extra_btn_styles(self):
-        """应用编辑器按钮和帮助按钮的样式（含 font-size，确保缩放后一致）"""
+        """应用帮助按钮的样式（含 font-size，确保缩放后一致）"""
         ui_font_family = get_preferred_ui_font_family() or "Microsoft YaHei UI"
         font_size = max(10, int(14 * getattr(self, 'font_scale', 1.0)))
         extra_button_height = self.ui_metrics["extra_button_height"]
         help_button_size = self.ui_metrics["help_button_size"]
-        if hasattr(self, '_editor_btn') and self._editor_btn:
-            self._editor_btn.setStyleSheet(f"""
-                QToolButton {{
-                    background-color: #505050;
-                    color: #ffffff;
-                    border: none;
-                    border-radius: 10px;
-                    font-family: "{ui_font_family}";
-                    font-weight: normal;
-                    font-size: {font_size}px;
-                    padding: 5px 10px;
-                    min-height: {extra_button_height}px;
-                }}
-                QToolButton:hover {{
-                    background-color: #606060;
-                }}
-            """)
         if hasattr(self, '_help_btn') and self._help_btn:
             self._help_btn.setStyleSheet(f"""
                 QToolButton {{
@@ -2553,134 +2051,12 @@ class KhQuantGUI(QMainWindow):
                     background-color: #606060;
                 }}
             """)
-        if hasattr(self, '_web_btn') and self._web_btn:
-            icon_size = max(15, int(help_button_size * 0.56))
-            self._web_btn.setIconSize(QSize(icon_size, icon_size))
-            self._web_btn.setStyleSheet(f"""
-                QToolButton {{
-                    background-color: #505050;
-                    border: none;
-                    border-radius: 10px;
-                    min-width: {help_button_size}px;
-                    max-width: {help_button_size}px;
-                    min-height: {help_button_size}px;
-                    max-height: {help_button_size}px;
-                }}
-                QToolButton:hover {{
-                    background-color: #3f617c;
-                }}
-                QToolButton:pressed {{
-                    background-color: #35536b;
-                }}
-                QToolButton:disabled {{
-                    background-color: #454545;
-                }}
-            """)
-
-    def enable_debug_mode(self):
-        """启用调试模式（由编辑器打开时自动调用）"""
-        from PyQt5.QtWidgets import QMessageBox
-
-        if self.debug_manager is None or not self.debug_manager.is_available():
-            QMessageBox.warning(
-                self,
-                "调试模式",
-                "debugpy未安装，无法启用调试模式。\n\n"
-                "请运行以下命令安装：\n"
-                "pip install debugpy"
-            )
-            return False
-
-        self.debug_mode_enabled = True
-        self.log_message("调试模式已自动启用（编辑器打开）", "INFO")
-        return True
-
-    def disable_debug_mode(self):
-        """禁用调试模式（由编辑器关闭时自动调用）"""
-        self.debug_mode_enabled = False
-        self.log_message("调试模式已自动禁用（编辑器关闭）", "INFO")
-
-    def on_debug_server_started(self, debug_port):
-        """调试服务器启动后的处理
-
-        Args:
-            debug_port: 调试服务器端口号
-        """
-        try:
-            self.log_message(f"调试服务器已启动在端口 {debug_port}", "INFO")
-            self._prepare_vscode_debug_attach(debug_port)
-
-        except Exception as e:
-            self.log_message(f"处理调试服务器启动事件失败: {e}", "ERROR")
-            logging.error(f"处理调试服务器启动事件失败: {e}", exc_info=True)
-
-    def _prepare_vscode_debug_attach(self, debug_port, initial_delay_ms=500):
-        """同步VSCode调试配置，并在需要时自动触发附加"""
-        if self.embedded_vscode_manager and self.embedded_vscode_manager.is_running:
-            workspace = getattr(self.embedded_vscode_manager, 'current_workspace', None)
-            if workspace:
-                self.embedded_vscode_manager._setup_workspace_config(workspace, debug_port)
-
-            self.log_message("正在自动启动VSCode调试会话...", "INFO")
-            QTimer.singleShot(initial_delay_ms, lambda: self._auto_start_vscode_debug(attempt=1))
-        else:
-            self.log_message("VSCode编辑器未运行，无法自动启动调试会话", "WARNING")
-            self.log_message("请手动在VSCode中按F5启动调试", "INFO")
-
-    def _auto_start_vscode_debug(self, attempt=1, max_attempts=3):
-        """自动启动VSCode调试会话"""
-        try:
-            if self.embedded_vscode_manager:
-                success = self.embedded_vscode_manager.auto_start_debug_session()
-                if success:
-                    self.log_message(f"✓ 已发送调试启动命令到VSCode（第{attempt}次）", "INFO")
-                    self.log_message("💡 VSCode应该会自动进入调试模式", "INFO")
-                    if self.debug_manager and self.debug_manager.is_debug_server_running:
-                        QTimer.singleShot(
-                            1800,
-                            lambda current_attempt=attempt, total_attempts=max_attempts: self._verify_vscode_debug_attach(
-                                current_attempt,
-                                total_attempts
-                            )
-                        )
-                else:
-                    self.log_message("⚠ 自动启动调试会话失败", "WARNING")
-                    self.log_message("📍 请手动在VSCode中按F5启动调试", "INFO")
-        except Exception as e:
-            self.log_message(f"自动启动VSCode调试失败: {e}", "ERROR")
-            logging.error(f"自动启动VSCode调试失败: {e}", exc_info=True)
-
-    def _verify_vscode_debug_attach(self, attempt, max_attempts):
-        """检查自动附加结果，必要时重试"""
-        try:
-            if not self.debug_manager or not self.debug_manager.is_debug_server_running:
-                return
-
-            debug_info = self.debug_manager.get_debug_info()
-            if debug_info.get("client_connected"):
-                self.log_message("✓ 调试器已连接，自动附加成功", "INFO")
-                return
-
-            if not self.embedded_vscode_manager or not self.embedded_vscode_manager.is_running:
-                self.log_message("⚠ VSCode编辑器未运行，停止自动重试附加", "WARNING")
-                return
-
-            if attempt >= max_attempts:
-                self.log_message("⚠ 自动附加未成功，请手动在VSCode中按F5启动调试", "WARNING")
-                return
-
-            next_attempt = attempt + 1
-            self.log_message(f"⚠ 第{attempt}次自动附加未成功，准备进行第{next_attempt}次重试", "WARNING")
-            QTimer.singleShot(1200, lambda: self._auto_start_vscode_debug(attempt=next_attempt, max_attempts=max_attempts))
-        except Exception as e:
-            self.log_message(f"检查调试附加状态失败: {e}", "ERROR")
-            logging.error(f"检查调试附加状态失败: {e}", exc_info=True)
 
     def _ensure_duckdb_data_path(self):
-        """返回用户已设置的 DuckDB 路径，若未设置则返回空字符串（不自动计算）。
+        """返回 DuckDB 数据目录。
 
-        策略：用户显式设置的路径会被保留；
-        未设置时返回空，由需要路径的模块自行计算默认值（避免启动时静默污染设置）。
+        用户设置过的目录优先（不可写时返回空）；没设置过时用开源版自己的默认
+        目录 %LOCALAPPDATA%\\KhQuantOS\\khData，只创建目录，不写进设置。
         """
         try:
             saved_path = self.settings.value('duckdb_data_path', '') or ''
@@ -2693,7 +2069,9 @@ class KhQuantGUI(QMainWindow):
                 logging.warning(f"保存的 DuckDB 路径不可写: {saved_path}")
                 return ''
 
-            return ''
+            default_path = default_duckdb_dir()
+            os.makedirs(default_path, exist_ok=True)
+            return default_path
         except Exception as e:
             logging.warning(f"获取 DuckDB 数据路径失败: {e}")
             return ''
@@ -2719,27 +2097,10 @@ class KhQuantGUI(QMainWindow):
             pass
 
     def check_software_status(self):
-        """检查软件状态(根据数据源类型检查不同的状态)"""
+        """检查 DuckDB 数据目录状态，并刷新状态栏里的路径显示。"""
         try:
-            # 顺带刷新 DuckDB 路径显示（设置变更后自动跟随）
             self._update_duckdb_path_label()
-
-            # 获取当前数据源设置
-            data_source = self.settings.value('backtest_data_source', 'duckdb')
-
-            if data_source == 'duckdb':
-                # DuckDB模式:检查数据库路径和数据
-                self.check_duckdb_status()
-            else:
-                # MiniQMT模式:检查MiniQMT进程
-                if sys.platform == 'win32':
-                    is_running = self.is_software_running("XtMiniQmt.exe")
-                    if is_running:
-                        self.update_status_indicator("green", "MiniQMT已启动")
-                    else:
-                        self.update_status_indicator("red", "MiniQMT未启动")
-                else:
-                    self.update_status_indicator("yellow", "MiniQMT仅支持Windows")
+            self.check_duckdb_status()
 
         except Exception as e:
             logging.error(f"检查软件状态时出错: {str(e)}")
@@ -2781,13 +2142,6 @@ class KhQuantGUI(QMainWindow):
             logging.error(f"检查DuckDB状态时出错: {str(e)}")
             self.update_status_indicator("red", "DuckDB状态检查失败")
 
-    def is_software_running(self, process_name):
-        """检查指定的进程是否正在运行"""
-        import psutil
-        for proc in psutil.process_iter(['name']):
-            if proc.info['name'].lower() == process_name.lower():
-                return True
-        return False
 
     def update_status_indicator(self, color, tooltip):
         """更新状态指示器"""
@@ -2836,7 +2190,6 @@ class KhQuantGUI(QMainWindow):
             "run_mode": "backtest",  # 固定为回测模式
             "account": {"account_id": "", "account_type": "STOCK"},
             "system": {
-                "userdata_path": "",
                 "session_id": int(datetime.now().timestamp()),
                 "check_interval": 3
             },
@@ -2920,7 +2273,7 @@ class KhQuantGUI(QMainWindow):
             "基准合约代码，用于计算策略相对基准的收益率\n"
             "支持两种格式:\n"
             "  - 标准格式: 000300.SH (沪深300)\n"
-            "  - miniQMT格式: sh.000300\n"
+            "  - BaoStock 格式: sh.000300\n"
             "常用指数:\n"
             "  000300.SH - 沪深300\n"
             "  000905.SH - 中证500\n"
@@ -3030,10 +2383,30 @@ class KhQuantGUI(QMainWindow):
         period_layout = QHBoxLayout()
         self.period_selector = NoWheelComboBox()
         self.period_selector.addItems(["tick", "1m", "5m", "1d"])
-        self.period_selector.setCurrentText("1m")  # 设置默认值
+        # 开源版：BaoStock 只有日线和 5 分钟线，1m / tick 需要自备数据
+        for _period, _tip in (
+            ("tick", "需自备数据：BaoStock 和 Tushare 都不提供 Tick，需自行导入 DuckDB"),
+            ("1m", "需自备数据：BaoStock 没有 1 分钟线；Tushare 需开通 stk_mins 权限才能下载"),
+        ):
+            _index = self.period_selector.findText(_period)
+            if _index >= 0:
+                self.period_selector.setItemData(_index, _tip, Qt.ToolTipRole)
+        self.period_selector.setCurrentText("1d")  # 设置默认值
         self.period_selector.currentTextChanged.connect(self.on_period_changed)
+        period_widget = QWidget()
+        period_widget.setStyleSheet("background-color: transparent;")
+        period_row = QHBoxLayout(period_widget)
+        period_row.setContentsMargins(0, 0, 0, 0)
+        period_row.addWidget(self.period_selector, 1)
+        period_hint = QLabel("1m / tick 需自备数据")
+        period_hint.setStyleSheet("color: #d7a64a;")
+        period_hint.setToolTip(
+            "BaoStock 只有日线和 5 分钟线。1 分钟线可用 Tushare 下载（需 stk_mins 权限），"
+            "Tick 需自行导入 DuckDB。"
+        )
+        period_row.addWidget(period_hint)
         data_layout.addWidget(QLabel("周期类型:"), 1, 0)
-        data_layout.addWidget(self.period_selector, 1, 1)
+        data_layout.addWidget(period_widget, 1, 1)
         
         # 字段列表选择
         fields_layout = QVBoxLayout()
@@ -3226,7 +2599,7 @@ class KhQuantGUI(QMainWindow):
         trigger_type_layout = QHBoxLayout()
         trigger_type_layout.addWidget(QLabel("触发类型:"))
         self.trigger_type_combo = NoWheelComboBox()
-        self.trigger_type_combo.addItems(["Tick触发", "1分钟K线触发", "5分钟K线触发", "日K线触发", "自定义定时触发"])
+        self.trigger_type_combo.addItems(["Tick触发（需自备数据）", "1分钟K线触发（需自备数据）", "5分钟K线触发", "日K线触发", "自定义定时触发"])
         self.trigger_type_combo.currentIndexChanged.connect(self.trigger_type_changed)
         trigger_type_layout.addWidget(self.trigger_type_combo)
         trigger_layout.addLayout(trigger_type_layout)
@@ -3348,38 +2721,6 @@ class KhQuantGUI(QMainWindow):
         
         # 添加到中间面板
         self.middle_layout.addWidget(trigger_group)
-        
-        # 创建实盘数据获取组
-        self.realtime_data_group = QGroupBox("实盘数据获取")
-        self.realtime_data_layout = QVBoxLayout()
-        
-        # 创建单选按钮组
-        self.realtime_data_radio_group = QButtonGroup(self)
-        self.full_quote_radio = QRadioButton("订阅全推行情")
-        self.single_quote_radio = QRadioButton("单股订阅")
-        self.realtime_data_radio_group.addButton(self.full_quote_radio)
-        self.realtime_data_radio_group.addButton(self.single_quote_radio)
-        
-        # 添加单选按钮到布局
-        self.realtime_data_layout.addWidget(self.full_quote_radio)
-        self.realtime_data_layout.addWidget(self.single_quote_radio)
-        
-        # 添加提示标签
-        self.custom_data_label = QLabel("请在策略中获取数据，可以使用单股订阅subscribe_quote+get_market_data_ex、获取全推数据 get_full_tick等方式实现")
-        self.custom_data_label.setWordWrap(True)
-        self.realtime_data_layout.addWidget(self.custom_data_label)
-        self.custom_data_label.hide()  # 默认隐藏
-        
-        self.realtime_data_group.setLayout(self.realtime_data_layout)
-        
-        # 默认选择单股订阅
-        self.single_quote_radio.setChecked(True)
-        
-        # 添加到中间面板
-        self.middle_layout.addWidget(self.realtime_data_group)
-        
-        # 默认禁用实盘数据获取组件
-        self.realtime_data_group.setEnabled(False)
         
         # 创建账户信息组
         account_group = QGroupBox("账户信息")
@@ -3689,7 +3030,6 @@ class KhQuantGUI(QMainWindow):
                 "account_id": self.settings.value('account_id', ''),
                 "account_type": self.settings.value('account_type', 'STOCK'),
             },
-            "data_mode": self.get_realtime_data_mode(),
             "backtest": backtest,
             "data": data,
             "market_callback": {
@@ -3711,9 +3051,6 @@ class KhQuantGUI(QMainWindow):
 
         if "account" not in cfg and (self._ui_state_changed(ui_state, "account") or not has_baseline):
             cfg.setdefault("account", {}).update(ui_state["account"])
-
-        if "data_mode" in cfg and self._ui_state_changed(ui_state, "data_mode"):
-            cfg["data_mode"] = ui_state["data_mode"]
 
         raw_base_bt = cfg.get("backtest", {})
         base_bt = (
@@ -3856,8 +3193,6 @@ class KhQuantGUI(QMainWindow):
                 4: "custom" # 自定义定时触发
             }
             
-            # 添加实盘数据获取模式配置
-            self.config["data_mode"] = self.get_realtime_data_mode()
             trigger_type = trigger_type_map[self.trigger_type_combo.currentIndex()]
             trigger_config = {
                 "type": trigger_type,
@@ -3901,11 +3236,6 @@ class KhQuantGUI(QMainWindow):
             self.config["market_callback"]["pre_market_time"] = self.pre_trigger_time.time().toString("HH:mm:ss")
             self.config["market_callback"]["post_market_enabled"] = self.post_trigger_checkbox.isChecked()
             self.config["market_callback"]["post_market_time"] = self.post_trigger_time.time().toString("HH:mm:ss")
-            
-            # 更新QMT路径
-            if "system" not in self.config:
-                self.config["system"] = {}
-            self.config["system"]["userdata_path"] = self.settings.value('qmt_path', 'D:\\国金证券QMT交易端\\userdata_mini')
             
             # 更新股票池配置
             stock_codes = []
@@ -4116,13 +3446,11 @@ class KhQuantGUI(QMainWindow):
             if strategy_file_to_run != strategy_file_raw:
                 self.log_message(f"策略文件已解析为: {strategy_file_to_run}", "INFO")
 
-            # 创建并启动策略线程（传递调试模式参数）
+            # 创建并启动策略线程
             self.strategy_thread = StrategyThread(
                 self.temp_config_path,
                 strategy_file_to_run,
                 self.trader_callback,
-                debug_mode=self.debug_mode_enabled,  # 新增参数
-                debug_manager=self.debug_manager if self.debug_mode_enabled else None  # 新增参数
             )
             
             # 注册元类型
@@ -4134,7 +3462,6 @@ class KhQuantGUI(QMainWindow):
             self.strategy_thread.error_signal.connect(self.on_strategy_error, Qt.QueuedConnection)
             self.strategy_thread.status_signal.connect(self.update_status, Qt.QueuedConnection)
             self.strategy_thread.finished_signal.connect(self.on_strategy_finished, Qt.QueuedConnection)
-            self.strategy_thread.debug_server_started.connect(self.on_debug_server_started, Qt.QueuedConnection)
             
             # 启动线程
             self.strategy_thread.start()  # 正确使用start()启动子线程
@@ -4202,10 +3529,6 @@ class KhQuantGUI(QMainWindow):
                 # 非回测模式直接隐藏
                 self.hide_progress()
                 self.status_label.setText("策略已停止" if was_stop_requested else "策略运行完成")
-
-            # 如果启用了调试模式，在线程真正结束后再清理调试会话，避免停止时阻塞主线程
-            if was_stop_requested and self.debug_mode_enabled and self.debug_manager:
-                self._finish_debug_session_after_stop()
 
             # 如果启用了延迟显示，提示用户正在收集日志
             # 但如果是"停止后直接退出"模式且策略已停止（不是自然完成），则跳过
@@ -4286,22 +3609,6 @@ class KhQuantGUI(QMainWindow):
         except Exception as e:
             self.log_error("处理策略完成回调时出错", e)
 
-    def _finish_debug_session_after_stop(self):
-        """策略线程结束后清理调试会话。"""
-        try:
-            self.debug_manager.stop_debug_server()
-            self.log_message("=" * 60, "INFO")
-            self.log_message("调试会话已结束", "INFO")
-            self.log_message("", "INFO")
-            self.log_message("💡 下次运行时可以继续使用调试功能：", "INFO")
-            self.log_message("   1. 保持主程序开启（无需重启）", "INFO")
-            self.log_message("   2. 点击'开始运行'", "INFO")
-            self.log_message("   3. 在VSCode中按F5重新连接调试器", "INFO")
-            self.log_message("", "INFO")
-            self.log_message("✓ 调试服务器仍在运行，可以随时重新连接", "INFO")
-            self.log_message("=" * 60, "INFO")
-        except Exception as e:
-            self.log_message(f"停止调试会话时出错: {str(e)}", "WARNING")
 
     def _close_when_strategy_thread_exited(self):
         """策略线程真正退出后再继续关闭主窗口。"""
@@ -4418,6 +3725,11 @@ class KhQuantGUI(QMainWindow):
                     event.ignore()
                     return
 
+            benchmark_dialog = getattr(self, '_benchmark_dialog', None)
+            if benchmark_dialog is not None and benchmark_dialog.is_running():
+                benchmark_dialog.thread.stop()
+                benchmark_dialog.thread.wait(15000)
+
             duckdb_close_state = self._request_duckdb_viewer_close_for_shutdown()
             if duckdb_close_state != "ready":
                 # 数据管理窗口可能正在等待导入/索引线程安全退出，或者用户在其
@@ -4426,7 +3738,7 @@ class KhQuantGUI(QMainWindow):
                 return
 
             # 恢复窗口标题
-            self.setWindowTitle("看海量化回测系统")
+            self.setWindowTitle(WINDOW_TITLE)
             
             # 保存窗口状态和位置
             self.settings.setValue("windowState", self.saveState())
@@ -4436,25 +3748,10 @@ class KhQuantGUI(QMainWindow):
             end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             self.log_message(f"软件关闭时间: {end_time}", "INFO")
             
-            # 关闭数据管理模块窗口
-            if hasattr(self, 'data_viewer_window') and self.data_viewer_window:
-                self.data_viewer_window.close()
-                self.data_viewer_window = None
-                
-            if hasattr(self, 'scheduler_window') and self.scheduler_window:
-                self.scheduler_window.close()
-                self.scheduler_window = None
-                
-            if hasattr(self, 'csv_manager_window') and self.csv_manager_window:
-                self.csv_manager_window.close()
-                self.csv_manager_window = None
-                
+            # 关闭回测历史窗口
             if hasattr(self, 'history_manager_window') and self.history_manager_window:
                 self.history_manager_window.close()
                 self.history_manager_window = None
-
-            if self.embedded_vscode_manager:
-                self.embedded_vscode_manager.cleanup()
 
             # 关闭 DuckDB 数据库连接
             try:
@@ -4561,10 +3858,7 @@ class KhQuantGUI(QMainWindow):
         self.min_volume.setEnabled(True)
         self.start_date.setEnabled(True)
         self.end_date.setEnabled(True)
-        
-        # 隐藏实盘数据获取模块
-        self.update_realtime_data_group_status()
-        
+
         # 更新状态
         self.update_status("当前模式：回测模式")
 
@@ -4604,7 +3898,7 @@ class KhQuantGUI(QMainWindow):
             
             # 更新窗口标题，显示当前配置文件名
             file_name = os.path.basename(file_path)
-            self.setWindowTitle(f"看海量化回测系统 - {file_name}")
+            self.setWindowTitle(f"{WINDOW_TITLE} - {file_name}")
             
             # 在日志中记录成功加载
             self.log_message(f"配置已从以下位置加载: {file_path}", "INFO")
@@ -4646,7 +3940,7 @@ class KhQuantGUI(QMainWindow):
 
             # 更新窗口标题
             file_name = os.path.basename(last_config_path)
-            self.setWindowTitle(f"看海量化回测系统 - {file_name}")
+            self.setWindowTitle(f"{WINDOW_TITLE} - {file_name}")
 
             # 记录日志
             self.log_message(f"已自动加载配置: {file_name}", "INFO")
@@ -4730,7 +4024,6 @@ class KhQuantGUI(QMainWindow):
             # 构造临时配置对象，复用主界面的配置加载逻辑
             temp_config = {
                 "strategy_file": config_dict.get("strategy_file", ""),
-                "data_mode": config_dict.get("data_mode", "single_quote"),
                 "data": {
                     "kline_period": config_dict.get("kline_period", "1m"),
                     "dividend_type": config_dict.get("dividend_type", "front"),
@@ -4799,15 +4092,6 @@ class KhQuantGUI(QMainWindow):
         # 运行模式固定为回测，无需更新选择器
         self.config["run_mode"] = "backtest"
             
-        # 更新实盘数据获取模式
-        if "data_mode" in self.config:
-            data_mode = self.config["data_mode"]
-            if data_mode == "full_quote":
-                self.full_quote_radio.setChecked(True)
-            elif data_mode == "single_quote":
-                self.single_quote_radio.setChecked(True)
-            # 如果是自定义模式(custom)，当触发类型设置为3(自定义)时会自动处理
-        
         # 更新回测参数
         backtest_config = self.config.get("backtest", {})
         if not isinstance(backtest_config, dict):
@@ -4916,28 +4200,6 @@ class KhQuantGUI(QMainWindow):
                 except Exception as e:
                     self.log_message(f"加载兼容性股票列表文件失败: {str(e)}", "WARNING")
                 
-        # 更新实盘数据获取模式 - 放在触发类型设置之后，因为需要根据触发类型调整界面
-        if "data_mode" in self.config:
-            data_mode = self.config["data_mode"]
-            # 根据数据模式设置相应的UI元素
-            if data_mode == "custom":
-                # 自定义模式不需要设置单选按钮
-                pass
-            elif data_mode == "full_quote":
-                self.full_quote_radio.setChecked(True)
-            else:  # single_quote
-                self.single_quote_radio.setChecked(True)
-
-        # 更新实盘数据获取模块的状态 - 需要在运行模式和触发类型都设置好后调用
-        self.update_realtime_data_group_status()
-
-    def update_account_display(self, account_info):
-        """更新账户信息显示"""
-        self.account_id_label.setText(f"账户号: {account_info['account_id']}")
-        self.account_type_label.setText(f"账户类型: {account_info['account_type']}")
-        self.total_asset_label.setText(f"总资产: {account_info['total_asset']:.2f}")
-        self.available_cash_label.setText(f"可用资金: {account_info['cash']:.2f}")
-        self.market_value_label.setText(f"持仓市值: {account_info['market_value']:.2f}")
 
     def on_start_date_changed(self, date):
         """开始日期变化时更新结束日期的最小值"""
@@ -5307,25 +4569,12 @@ class KhQuantGUI(QMainWindow):
                     return
             
             if os.path.exists(file_path):
-                vscode_path = find_vscode_executable()
-                if vscode_path:
-                    try:
-                        subprocess.Popen(
-                            [vscode_path, '--goto', file_path],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                        )
-                        self.log_message(f"内置编辑器路径: {vscode_path}", "INFO")
-                        self.update_status(f"已用内置VSCode打开自选清单文件: {file_path}")
-                        return
-                    except Exception as open_error:
-                        self.log_message(f"内置VSCode打开失败: {str(open_error)}", "WARNING")
-                        QMessageBox.warning(self, "错误", f"内置VSCode打开失败: {str(open_error)}")
-                        return
-
-                warning_msg = "未找到与主界面编辑器按钮一致的VSCode，已取消打开自选清单"
-                self.log_message(warning_msg, "WARNING")
-                QMessageBox.warning(self, "提示", "未找到可用的VSCode，已取消打开自选清单文件。")
+                try:
+                    os.startfile(file_path)
+                    self.update_status(f"已打开自选清单文件: {file_path}")
+                except OSError as open_error:
+                    self.log_message(f"打开自选清单文件失败: {open_error}", "WARNING")
+                    QMessageBox.warning(self, "错误", f"打开自选清单文件失败：{open_error}\n文件位置：{file_path}")
                 return
 
             self.update_status("找不到自选清单文件")
@@ -5413,16 +4662,6 @@ class KhQuantGUI(QMainWindow):
             
         except Exception as e:
             print(f"更新状态表格时出错: {str(e)}")
-
-    def select_qmt_path(self):
-        """QMT路径设置已移动到设置界面"""
-        pass
-
-    def init_trader_and_account(self):
-        """初始化交易接口并获取账户信息（回测模式不需要真实交易接口）"""
-        # 回测模式不需要初始化交易接口
-        logging.info("回测模式无需初始化交易接口")
-
 
 
     def _apply_slippage_input_mode(self, slippage_type, *, save_current=True, log_change=True):
@@ -5583,14 +4822,6 @@ class KhQuantGUI(QMainWindow):
             
             # 获取颜色
             color = color_map.get(level, "#e8e8e8")
-            
-            # Map dark colors to light colors if macos light theme is active
-            import sys
-            if sys.platform == 'darwin':
-                if color == '#e8e8e8': color = '#333333'  # White -> Dark Gray
-                elif color == '#FFA500': color = '#d35400' # Orange -> Darker Orange
-                elif color == '#FF0000': color = '#cc0000' # Red -> Darker Red
-                elif color == '#BB8FCE': color = '#8e44ad' # Light Purple -> Dark Purple
             
             # 格式化日志消息
             formatted_message = f'<span style="color: {color}">[{current_time}] [{level}] {message}</span><br>'
@@ -5877,18 +5108,12 @@ class KhQuantGUI(QMainWindow):
     def _check_data_integrity_before_backtest(self, runtime_config=None) -> bool:
         """
         在回测开始前检查股票池数据的完整性（使用后台线程和进度对话框）
-        注意：仅在DuckDB数据源模式下执行检查，miniQMT模式不支持数据完整性检查
 
         Returns:
             bool: True表示数据完整或用户选择继续，False表示用户取消回测
         """
         try:
             cfg = runtime_config or getattr(self, "_current_runtime_config", None) or self.config
-            # 检查数据源类型，只在DuckDB模式下检查
-            data_source = self.settings.value('backtest_data_source', 'duckdb')
-            if data_source != 'duckdb':
-                self.log_message(f"当前使用非DuckDB数据源（{data_source}），跳过本地数据库完整性检查", "INFO")
-                return True
 
             # 检查是否启用数据完整性检查
             check_enabled = self.settings.value('check_data_integrity', True, type=bool)
@@ -6503,27 +5728,9 @@ class KhQuantGUI(QMainWindow):
         """处理触发类型变更"""
         # 设置堆叠小部件的当前页面
         self.trigger_stack.setCurrentIndex(index)
-        
-        # 更新实盘数据获取模块的内容
-        if index == 0:  # Tick触发
-            self.full_quote_radio.show()
-            self.single_quote_radio.show()
-            self.custom_data_label.hide()
-        elif index == 1 or index == 2 or index == 3:  # 1分钟、5分钟或日K线触发
-            self.full_quote_radio.hide()
-            self.single_quote_radio.show()
-            self.single_quote_radio.setChecked(True)
-            self.custom_data_label.hide()
-        elif index == 4:  # 自定义定时触发
-            self.full_quote_radio.hide()
-            self.single_quote_radio.hide()
-            self.custom_data_label.show()
         show_daily_trigger_cap = (index == 3)
         self.daily_trigger_cap_widget.setVisible(show_daily_trigger_cap)
         self.daily_trigger_cap_spin.setEnabled(show_daily_trigger_cap)
-        
-        # 检查是否需要启用实盘数据获取模块
-        self.update_realtime_data_group_status()
 
     def is_in_trading_hours(self, seconds):
         """检查时间是否在交易时段内"""
@@ -6741,25 +5948,6 @@ class KhQuantGUI(QMainWindow):
             rows.append((code, stock_names.get(code, "--")))
         self._set_stock_list_rows(rows)
 
-    def update_realtime_data_group_status(self):
-        """更新实盘数据获取模块的显示和启用状态（固定隐藏）"""
-        # 回测模式下始终隐藏实盘数据获取模块
-        self.realtime_data_group.hide()
-
-    def get_realtime_data_mode(self):
-        """获取实盘数据获取模式"""
-        # 检查触发方式
-        trigger_type = self.trigger_type_combo.currentIndex()
-        
-        # 对于自定义定时触发，返回None或特殊值
-        if trigger_type == 4:
-            return "custom"
-            
-        # 对于其他触发方式，检查单选按钮状态
-        if self.full_quote_radio.isChecked():
-            return "full_quote"
-        else:
-            return "single_quote"
 
     def seconds_to_time(self, seconds):
         """将秒数转换为时间字符串"""
@@ -6847,22 +6035,9 @@ class KhQuantGUI(QMainWindow):
                         except Exception as e:
                             logging.warning(f"关闭DuckDB Viewer窗口时出错: {e}")
 
-                # 更新工具栏数据管理按钮可见性（根据数据源设置）
-                self.update_data_toolbar_buttons()
-
             # 如果需要，可以在这里处理设置对话框关闭后的操作
             self.check_software_status()
 
-            # 加载可能更新的配置
-            qsettings = KhQtSettings('KHQuant', 'StockAnalyzer')
-            client_path = qsettings.value('client_path', '')
-            if client_path:
-                # 更新配置中的客户端路径
-                if 'client_path' not in self.config:
-                    self.config['client_path'] = client_path
-
-                # 记录日志
-                logging.info(f"已更新miniQMT客户端路径: {client_path}")
 
         except Exception as e:
             logging.error(f"显示设置对话框时出错: {str(e)}")
@@ -6889,15 +6064,7 @@ class KhQuantGUI(QMainWindow):
             logging.error(f"更新延迟显示设置时出错: {str(e)}")
     
     def initialize_update_manager(self):
-        """初始化更新管理器（自动下载 exe 仅 Windows 有意义；macOS/Linux 走 pipx/git pull）"""
-        try:
-            from kh_platform import AUTO_UPDATE_ENABLED
-        except ImportError:
-            AUTO_UPDATE_ENABLED = sys.platform == "win32"
-        if not AUTO_UPDATE_ENABLED:
-            self.update_manager = None
-            logging.info("当前平台不支持自动更新（请使用 pipx upgrade khquant 或 git pull）")
-            return
+        """初始化更新管理器（发现新版本时提示去下载，从不强制更新）"""
         self.update_manager = UpdateManager(self)
         self.update_manager.check_finished.connect(self.handle_update_check_finished)
         
@@ -6908,17 +6075,14 @@ class KhQuantGUI(QMainWindow):
         """设置更新配置"""
         if not getattr(self, 'update_manager', None):
             return
-        settings = QSettings('KHQuant', 'StockAnalyzer')
+        settings = QSettings(QT_ORG, QT_APP)
         self.update_manager.auto_check = settings.value('auto_check_update', True, type=bool)
-        self.update_manager.update_channel = settings.value('update_channel', 'stable', type=str)
+        self.update_manager.update_channel = 'stable'
+
     
     def check_for_updates(self):
         """检查软件更新"""
         if not getattr(self, 'update_manager', None):
-            QMessageBox.information(
-                self, "当前平台不支持自动更新",
-                "请使用 pipx upgrade khquant 或 git pull 手动升级。"
-            )
             return
         try:
             logging.info("开始检查软件更新")
@@ -6955,60 +6119,25 @@ class KhQuantGUI(QMainWindow):
                 v = _vi().get('version', 'unknown')
             except Exception:
                 v = 'unknown'
-            QMessageBox.information(self, "版本信息", f"看海量化回测平台 v{v}")
+            QMessageBox.information(self, "版本信息", f"{APP_NAME} v{v}")
             return
         # 直接使用UpdateManager的方法
         self.update_manager.show_current_version()
 
-    def open_data_module(self):
-        """打开CSV数据管理模块"""
-        try:
-            # 记录日志
-            self.log_message("正在打开CSV数据管理模块...", "INFO")
-            
-            # 检查是否已经创建了CSV数据管理窗口
-            if hasattr(self, 'csv_manager_window') and self.csv_manager_window:
-                # 如果窗口已存在，最大化显示并激活它
-                self.csv_manager_window.showMaximized()
-                self.csv_manager_window.raise_()
-                self.csv_manager_window.activateWindow()
-                self.log_message("CSV数据管理模块窗口已激活", "INFO")
-                return
-            
-            # 创建新的CSV数据管理窗口
-            if StockDataProcessorGUI is not None:
-                try:
-                    self.csv_manager_window = StockDataProcessorGUI()
-                    # 连接窗口关闭信号，当窗口被关闭时清除引用
-                    self.csv_manager_window.destroyed.connect(lambda: setattr(self, 'csv_manager_window', None))
-                    self.csv_manager_window.showMaximized()  # 最大化显示
-                    self.log_message("CSV数据管理模块已成功打开", "INFO")
-                    return
-                except Exception as e:
-                    logging.error(f"使用导入方式打开CSV数据管理模块失败: {str(e)}", exc_info=True)
-                    # 继续尝试方法二
-            # 方法二：使用子进程运行GUI.py
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            gui_path = os.path.join(base_dir, 'GUI.py')
-            
-            if os.path.exists(gui_path):
-                self.log_message(f"找到GUI.py文件，路径: {gui_path}", "INFO")
-                import subprocess
-                subprocess.Popen([sys.executable, gui_path])
-                self.log_message("CSV数据管理模块已在新进程中启动", "INFO")
-            else:
-                self.log_message(f"未找到GUI.py文件: {gui_path}", "ERROR")
-                QMessageBox.critical(self, "错误", f"无法找到GUI.py文件: {gui_path}")
-            
-        except Exception as e:
-            error_message = f"打开CSV数据管理模块时出错: {str(e)}"
-            self.log_message(error_message, "ERROR")
-            logging.error(error_message, exc_info=True)
-            QMessageBox.critical(self, "错误", f"打开CSV数据管理模块时出错:\n{str(e)}")
 
     def open_duckdb_viewer(self):
         """打开DuckDB数据管理界面"""
         try:
+            benchmark_dialog = getattr(self, '_benchmark_dialog', None)
+            if benchmark_dialog is not None and benchmark_dialog.is_running():
+                QMessageBox.information(
+                    self, "基准指数正在下载",
+                    "首次启动的沪深300基准还在下载，完成后再打开数据管理。",
+                )
+                benchmark_dialog.show()
+                benchmark_dialog.raise_()
+                return
+
             # 记录日志
             self.log_message("正在打开DuckDB数据管理界面...", "INFO")
 
@@ -7100,475 +6229,6 @@ class KhQuantGUI(QMainWindow):
             logging.error(error_message, exc_info=True)
             QMessageBox.critical(self, "错误", f"打开DuckDB数据管理界面时出错:\n{str(e)}")
 
-    def open_data_viewer(self):
-        """打开数据查看器"""
-        try:
-            # 记录日志
-            self.log_message("正在打开数据查看器...", "INFO")
-            
-            # 检查是否已经创建了数据查看器窗口
-            if hasattr(self, 'data_viewer_window') and self.data_viewer_window:
-                # 如果窗口已存在，重新加载配置并最大化显示并激活它
-                if hasattr(self.data_viewer_window, "apply_ui_scale"):
-                    self.data_viewer_window.apply_ui_scale(get_ui_font_scale(self.settings))
-                self.data_viewer_window.reload_config_and_data()
-                self.data_viewer_window.showMaximized()
-                self.data_viewer_window.raise_()
-                self.data_viewer_window.activateWindow()
-                self.log_message("数据查看器窗口已激活并更新配置", "INFO")
-                return
-            
-            # 创建新的数据查看器窗口
-            if GUIDataViewer is not None:
-                self.data_viewer_window = GUIDataViewer()
-                if hasattr(self.data_viewer_window, "apply_ui_scale"):
-                    self.data_viewer_window.apply_ui_scale(get_ui_font_scale(self.settings))
-                # 连接窗口关闭信号，当窗口被关闭时清除引用
-                self.data_viewer_window.destroyed.connect(lambda: setattr(self, 'data_viewer_window', None))
-                self.data_viewer_window.showMaximized()  # 最大化显示
-                self.log_message("数据查看器已成功打开", "INFO")
-            else:
-                error_message = "数据查看器模块未正确导入"
-                self.log_message(error_message, "ERROR")
-                QMessageBox.critical(self, "错误", error_message)
-                
-        except Exception as e:
-            error_message = f"打开数据查看器时出错: {str(e)}"
-            self.log_message(error_message, "ERROR")
-            logging.error(error_message, exc_info=True)
-            QMessageBox.critical(self, "错误", f"打开数据查看器时出错:\n{str(e)}")
-
-    def open_scheduler(self):
-        """打开数据定时补充模块"""
-        try:
-            # 记录日志
-            self.log_message("正在打开数据定时补充模块...", "INFO")
-            
-            # 检查是否已经创建了定时补充器窗口
-            if hasattr(self, 'scheduler_window') and self.scheduler_window:
-                # 如果窗口已存在，最大化显示并激活它
-                self.scheduler_window.showMaximized()
-                self.scheduler_window.raise_()
-                self.scheduler_window.activateWindow()
-                self.log_message("数据定时补充模块窗口已激活", "INFO")
-                return
-            
-            # 创建新的定时补充器窗口
-            if GUIScheduler is not None:
-                self.scheduler_window = GUIScheduler()
-                # 连接窗口关闭信号，当窗口被关闭时清除引用
-                self.scheduler_window.destroyed.connect(lambda: setattr(self, 'scheduler_window', None))
-                self.scheduler_window.showMaximized()  # 最大化显示
-                self.log_message("数据定时补充模块已成功打开", "INFO")
-            else:
-                error_message = "数据定时补充模块未正确导入"
-                self.log_message(error_message, "ERROR")
-                QMessageBox.critical(self, "错误", error_message)
-                
-        except Exception as e:
-            error_message = f"打开数据定时补充模块时出错: {str(e)}"
-            self.log_message(error_message, "ERROR")
-            logging.error(error_message, exc_info=True)
-            QMessageBox.critical(self, "错误", f"打开数据定时补充模块时出错:\n{str(e)}")
-    
-    def _resolve_strategy_paths_for_editor(self):
-        """解析策略路径，供内嵌 / 系统 VSCode 共用。
-
-        Returns:
-            (workspace_path, file_to_open) 均为 str 或 None；用户取消或路径无效时返回 None。
-        """
-        strategy_file = self.strategy_path.text().strip()
-        workspace_path = None
-        file_to_open = None
-
-        if strategy_file:
-            resolved_strategy_file = self._resolve_strategy_file_path(strategy_file)
-            if os.path.exists(resolved_strategy_file):
-                workspace_path = os.path.dirname(resolved_strategy_file)
-                file_to_open = resolved_strategy_file
-                if resolved_strategy_file != strategy_file:
-                    self.log_message(f"策略文件已解析为: {resolved_strategy_file}", "INFO")
-                self.log_message(f"准备打开策略文件: {resolved_strategy_file}", "INFO")
-            else:
-                QMessageBox.warning(
-                    self,
-                    "策略文件不存在",
-                    f"找不到策略文件：\n{strategy_file}\n\n已尝试解析为：\n{resolved_strategy_file}\n\n请确认文件路径是否正确。"
-                )
-                return None
-        else:
-            reply = QMessageBox.question(
-                self,
-                "未设置策略文件",
-                "当前未设置策略文件，是否创建新策略？",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if reply != QMessageBox.Yes:
-                return None
-
-            default_dir = self.get_strategies_directory()
-            if not os.path.exists(default_dir):
-                os.makedirs(default_dir, exist_ok=True)
-
-            file_path, _ = QFileDialog.getSaveFileName(
-                self,
-                "创建新策略文件",
-                os.path.join(default_dir, "新策略.py"),
-                "Python文件 (*.py)"
-            )
-            if not file_path:
-                return None
-            self._create_strategy_template(file_path)
-            self.strategy_path.setText(file_path)
-            workspace_path = os.path.dirname(file_path)
-            file_to_open = file_path
-            self.log_message(f"已创建并准备打开策略文件: {file_path}", "INFO")
-
-        return (workspace_path, file_to_open)
-
-    def open_embedded_editor(self):
-        """打开代码编辑器（Windows：内嵌 VSCode + 调试；其它平台：系统 VSCode 或 Monaco）"""
-        try:
-            # 无外嵌 VSCode 时，用系统安装的 code（macOS/Linux 等）
-            if not self.embedded_vscode_manager:
-                code_exe = find_vscode_executable()
-                if code_exe:
-                    resolved = self._resolve_strategy_paths_for_editor()
-                    if resolved is None:
-                        return
-                    workspace_path, file_to_open = resolved
-                    target = file_to_open or workspace_path
-                    if not target:
-                        return
-                    try:
-                        subprocess.Popen(
-                            [code_exe, target],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                        )
-                        self.log_message(f"已使用系统 VSCode 打开: {target}", "INFO")
-                        self.update_status("已在系统 VSCode 中打开")
-                    except Exception as e:
-                        QMessageBox.warning(self, "打开失败", f"无法启动系统 VSCode：{e}")
-                    return
-
-            # 自动启用调试模式（仅内嵌编辑器路径需要）
-            if not self.enable_debug_mode():
-                self.log_message("调试模式启用失败，编辑器将以普通模式打开", "WARNING")
-
-            if self.embedded_vscode_manager:
-                resolved = self._resolve_strategy_paths_for_editor()
-                if resolved is None:
-                    self.disable_debug_mode()
-                    return
-                workspace_path, file_to_open = resolved
-
-                # 获取调试端口
-                debug_port = 15678  # 默认端口
-                if self.debug_manager:
-                    debug_port = self.debug_manager.debug_port
-
-                # 启动内置VSCode编辑器，传递调试端口
-                if self.embedded_vscode_manager.start_embedded_vscode(workspace_path, debug_port):
-                    self.log_message("内置VSCode编辑器启动成功", "INFO")
-                    self.update_status("内置编辑器已启动")
-
-                    # 如果有文件需要打开，延迟打开文件
-                    if file_to_open:
-                        # 使用QTimer延迟打开文件，给VSCode一些启动时间
-                        QTimer.singleShot(2000, lambda: self._open_file_in_vscode(file_to_open))
-
-                    if self.debug_mode_enabled and self.debug_manager and self.debug_manager.is_debug_server_running:
-                        self.log_message("检测到调试服务器仍在运行，正在恢复调试连接...", "INFO")
-                        QTimer.singleShot(
-                            1500,
-                            lambda port=self.debug_manager.debug_port: self._prepare_vscode_debug_attach(
-                                port,
-                                initial_delay_ms=500
-                            )
-                        )
-                else:
-                    # 真正的启动失败，尝试使用Monaco编辑器
-                    self.log_message("内置VSCode编辑器启动失败，尝试使用Monaco编辑器", "WARNING")
-                    # 调试模式只属于成功启动的内嵌 VSCode。若启动失败后回退到
-                    # Monaco，必须立即恢复普通运行模式，否则下一次回测会启动
-                    # debugpy 并无限等待一个实际上不存在的调试客户端。
-                    self.disable_debug_mode()
-                    self._fallback_to_monaco_editor()
-
-            # 备选方案：使用Monaco编辑器
-            elif self.editor_module:
-                self.editor_module.open_editor()
-                self.log_message("Monaco编辑器启动成功", "INFO")
-                self.update_status("Monaco编辑器已启动")
-
-            else:
-                # 显示安装指南
-                self._show_editor_installation_guide()
-                # 禁用调试模式
-                self.disable_debug_mode()
-
-        except Exception as e:
-            error_message = f"打开内置编辑器时出错: {str(e)}"
-            self.log_message(error_message, "ERROR")
-            logging.error(error_message, exc_info=True)
-            QMessageBox.critical(self, "错误", f"打开内置编辑器时出错:\n{str(e)}")
-            # 出错时禁用调试模式
-            self.disable_debug_mode()
-
-    def _open_file_in_vscode(self, file_path: str):
-        """在VSCode中打开文件"""
-        try:
-            if self.embedded_vscode_manager and self.embedded_vscode_manager.is_running:
-                self.embedded_vscode_manager.open_file(file_path)
-                self.log_message(f"在VSCode中打开文件: {file_path}", "INFO")
-            else:
-                self.log_message("VSCode编辑器未运行，无法打开文件", "WARNING")
-        except Exception as e:
-            self.log_message(f"在VSCode中打开文件失败: {str(e)}", "ERROR")
-            logging.error(f"在VSCode中打开文件失败: {e}", exc_info=True)
-
-    def _fallback_to_monaco_editor(self):
-        """备选方案：使用Monaco编辑器"""
-        try:
-            if self.editor_module:
-                self.editor_module.open_editor()
-                self.log_message("已切换到Monaco编辑器", "INFO")
-                self.update_status("Monaco编辑器已启动")
-            else:
-                # Monaco编辑器也不可用，显示安装指南
-                self._show_editor_installation_guide()
-        except Exception as e:
-            # Monaco编辑器启动失败，也显示安装指南（避免重复弹窗）
-            self.log_message(f"Monaco编辑器启动失败: {str(e)}", "ERROR")
-            # 不再调用_show_editor_installation_guide()，避免重复弹窗
-
-    def _show_editor_installation_guide(self):
-        """显示编辑器安装指南"""
-        message = """
-未找到VSCode安装。
-
-请按以下步骤安装VSCode：
-
-1. 访问 https://code.visualstudio.com/
-2. 下载并安装VSCode
-3. 重启看海量化回测系统
-
-安装完成后，即可使用内置编辑器的所有功能，包括代码高亮、智能补全、断点调试等。
-        """
-
-        QMessageBox.information(
-            self,
-            "需要安装VSCode",
-            message
-        )
-
-    def _create_strategy_template(self, file_path: str):
-        """创建策略文件模板"""
-        try:
-            from datetime import datetime
-            
-            template = '''# -*- coding: utf-8 -*-
-"""
-策略名称：新策略
-创建时间：{datetime}
-"""
-
-from khQuantImport import *  # 导入统一工具与指标
-
-
-def init(stocks=None, data=None):
-    """策略初始化（本策略无需特殊初始化）"""
-    pass  # 占位
-
-
-def khHandlebar(data: Dict) -> List[Dict]:
-    """
-    主策略函数
-    
-    参数:
-        data: 包含当前K线数据的字典
-    
-    返回:
-        signals: 信号列表
-    """
-    signals = []  # 信号列表
-    
-    # 在这里编写你的策略逻辑
-    
-    return signals  # 返回信号
-
-
-def khPreMarket(context: Dict) -> List[Dict]:
-    """
-    盘前处理函数（可选）
-    在每日开盘前的指定时间点调用
-    
-    参数:
-        context: 上下文字典
-    
-    返回:
-        signals: 信号列表
-    """
-    signals = []
-    return signals
-
-
-def khPostMarket(context: Dict) -> List[Dict]:
-    """
-    盘后处理函数（可选）
-    在每日收盘后的指定时间点调用
-    
-    参数:
-        context: 上下文字典
-    
-    返回:
-        signals: 信号列表
-    """
-    signals = []
-    return signals
-'''
-            
-            content = template.format(datetime=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            
-            # 确保目录存在
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            
-            # 写入文件
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            
-            self.log_message(f"已创建策略文件: {file_path}", "INFO")
-            
-        except Exception as e:
-            self.log_message(f"创建策略文件失败: {str(e)}", "ERROR")
-            logging.error(f"创建策略文件失败: {e}", exc_info=True)
-            raise
-
-    def get_strategies_directory(self):
-        """获取策略文件目录（新默认位置：~/Documents/KhQuant/strategies）"""
-        return self.get_user_strategies_dir()
-
-    # 内置编辑器事件处理方法
-    def _on_embedded_editor_started(self):
-        """内置编辑器启动事件"""
-        self.log_message("内置VSCode编辑器已启动", "INFO")
-        self.update_status("内置编辑器运行中")
-
-    def _on_embedded_editor_stopped(self):
-        """内置编辑器停止事件"""
-        self.log_message("内置VSCode编辑器已停止", "INFO")
-        self.update_status("内置编辑器已关闭")
-
-        # 自动禁用调试模式
-        self.disable_debug_mode()
-
-        # 如果调试服务器正在运行，停止它
-        if self.debug_manager and self.debug_manager.is_debug_server_running:
-            self.debug_manager.stop_debug_server()
-            self.log_message("调试会话已结束，调试服务器保持运行以便下次重连", "INFO")
-
-    def _on_embedded_editor_file_opened(self, file_path):
-        """内置编辑器文件打开事件"""
-        self.log_message(f"在内置编辑器中打开文件: {file_path}", "INFO")
-
-    def _on_embedded_editor_debug_started(self):
-        """内置编辑器调试开始事件"""
-        self.log_message("内置编辑器开始调试", "INFO")
-        self.update_status("调试会话已启动")
-    
-    def open_code_editor(self):
-        """打开代码编辑器"""
-        try:
-            if self.editor_module is not None:
-                # 获取当前选择的策略文件路径
-                strategy_file_path = self.config.get("strategy_file", "")
-                resolved_strategy_file = self._resolve_strategy_file_path(strategy_file_path)
-                
-                # 检查策略文件是否存在
-                if strategy_file_path and os.path.exists(resolved_strategy_file):
-                    # 如果策略文件存在，直接打开编辑器并加载文件
-                    self.editor_module.open_editor(resolved_strategy_file)
-                    self.log_message(f"代码编辑器已打开，加载策略文件: {resolved_strategy_file}", "INFO")
-                else:
-                    # 如果没有设置策略文件或文件不存在，提示用户选择或创建
-                    msg_box = QMessageBox(self)
-                    self.apply_dark_titlebar(msg_box)
-                    msg_box.setWindowTitle("策略文件")
-                    msg_box.setText("当前未设置策略文件或文件不存在。\n\n请选择操作:")
-                    msg_box.addButton("选择现有文件", QMessageBox.YesRole)
-                    msg_box.addButton("创建新文件", QMessageBox.NoRole)
-                    msg_box.addButton("取消", QMessageBox.RejectRole)
-                    reply = msg_box.exec_()
-                    
-                    if reply == 0:  # 选择现有文件
-                        # 选择现有策略文件
-                        file_path, _ = QFileDialog.getOpenFileName(
-                            self, "选择策略文件", 
-                            os.path.expanduser("~/Documents"), 
-                            "Python文件 (*.py);;所有文件 (*.*)"
-                        )
-                        if file_path:
-                            # 更新配置中的策略文件路径
-                            self.config["strategy_file"] = file_path
-                            self.strategy_path.setText(file_path)
-                            self.save_config()
-                            # 打开编辑器并加载文件
-                            self.editor_module.open_editor(file_path)
-                            self.log_message(f"代码编辑器已打开，加载策略文件: {file_path}", "INFO")
-                        else:
-                            return  # 用户取消了文件选择
-                    elif reply == 1:  # 创建新文件
-                        # 创建新策略文件
-                        file_path, _ = QFileDialog.getSaveFileName(
-                            self, "创建新策略文件", 
-                            os.path.expanduser("~/Documents/new_strategy.py"), 
-                            "Python文件 (*.py);;所有文件 (*.*)"
-                        )
-                        if file_path:
-                            # 创建基础策略文件模板
-                            template_content = '''# -*- coding: utf-8 -*-
-"""策略文件模板"""
-
-def init(context):
-    """初始化函数"""
-    pass
-
-def khHandlebar(context):
-    """主要策略逻辑函数"""
-    pass
-'''
-                            try:
-                                with open(file_path, 'w', encoding='utf-8') as f:
-                                    f.write(template_content)
-                                
-                                # 更新配置中的策略文件路径
-                                self.config["strategy_file"] = file_path
-                                self.strategy_path.setText(file_path)
-                                self.save_config()
-                                # 打开编辑器并加载文件
-                                self.editor_module.open_editor(file_path)
-                                self.log_message(f"新策略文件已创建并打开: {file_path}", "INFO")
-                            except Exception as e:
-                                error_message = f"创建策略文件失败: {str(e)}"
-                                self.log_message(error_message, "ERROR")
-                                QMessageBox.critical(self, "错误", error_message)
-                                return
-                        else:
-                            return  # 用户取消了文件保存
-                    else:  # reply == 2 或其他值，表示取消
-                        # 用户选择取消
-                        return
-            else:
-                error_message = "代码编辑器模块未正确初始化"
-                self.log_message(error_message, "ERROR")
-                QMessageBox.critical(self, "错误", error_message)
-        except Exception as e:
-            error_message = f"打开代码编辑器时出错: {str(e)}"
-            self.log_message(error_message, "ERROR")
-            logging.error(error_message, exc_info=True)
-            QMessageBox.critical(self, "错误", f"打开代码编辑器时出错:\n{str(e)}")
-    
     def open_history_manager(self):
         """打开回测历史管理器"""
         try:
@@ -7623,164 +6283,6 @@ def khHandlebar(context):
         painter.drawRect(self.rect().adjusted(2, 2, -2, -2))
         '''
 
-    def _resolve_cli_kh_path(self):
-        """返回 kh 启动器的绝对路径（源码与 macOS .app）。"""
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        if sys.platform == "darwin" and is_frozen_runtime():
-            executable = os.path.abspath(sys.executable)
-            app_bundle = os.path.dirname(os.path.dirname(os.path.dirname(executable)))
-            candidates = [
-                os.path.join(app_bundle, "Contents", "MacOS", "kh"),
-                os.path.join(app_bundle, "Contents", "Frameworks", "kh"),
-                os.path.join(base_dir, "kh"),
-            ]
-            for candidate in candidates:
-                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-                    return candidate
-            return candidates[0]
-        return os.path.join(base_dir, "kh")
-
-    def install_cli_tools(self):
-        """安装 macOS 下的全局命令行工具 kh（工具栏按钮触发，带提示弹窗）"""
-        if sys.platform != 'darwin':
-            return
-
-        kh_path = self._resolve_cli_kh_path()
-        if not os.path.isfile(kh_path) or not os.access(kh_path, os.X_OK):
-            QMessageBox.warning(self, "错误", f"找不到命令行工具: {kh_path}")
-            return
-
-        target_path = "/usr/local/bin/kh"
-        try:
-            # 检查是否已存在并且指向正确
-            if os.path.islink(target_path) and os.path.realpath(target_path) == os.path.realpath(kh_path):
-                self.settings.setValue('cli_auto_install_done', True)
-                QMessageBox.information(self, "提示", "命令行工具 'kh' 已经安装成功。")
-                return
-
-            # 执行提权操作创建软链接
-            script = f'do shell script "mkdir -p /usr/local/bin && ln -sf \\"{kh_path}\\" \\"{target_path}\\"" with administrator privileges'
-            result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
-
-            if result.returncode == 0:
-                self.settings.setValue('cli_auto_install_done', True)
-                QMessageBox.information(self, "成功", "命令行工具 'kh' 安装成功！\n现在您可以在终端中使用 'kh' 命令了。")
-            else:
-                QMessageBox.warning(self, "安装失败", f"授权失败或被取消:\n{result.stderr}")
-
-        except Exception as e:
-            QMessageBox.warning(self, "安装失败", f"发生错误:\n{str(e)}")
-
-    def auto_install_cli_tools(self):
-        """首次启动时自动安装命令行工具 kh（无需点击按钮）。
-
-        仅 macOS。已正确安装或此前已自动尝试过则跳过，避免每次启动都弹授权框。
-        写入 /usr/local/bin 需管理员权限，故首次会弹一次系统授权框。
-        """
-        if sys.platform != 'darwin':
-            return
-        try:
-            kh_path = self._resolve_cli_kh_path()
-            if not os.path.exists(kh_path):
-                return
-
-            target_path = "/usr/local/bin/kh"
-            # 已正确链接：记录标记并跳过
-            if os.path.islink(target_path) and os.path.realpath(target_path) == os.path.realpath(kh_path):
-                self.settings.setValue('cli_auto_install_done', True)
-                return
-
-            # 此前已自动尝试过（成功或被取消）则不再打扰；用户仍可用工具栏按钮手动安装
-            if self.settings.value('cli_auto_install_done', False, type=bool):
-                return
-
-            script = f'do shell script "mkdir -p /usr/local/bin && ln -sf \\"{kh_path}\\" \\"{target_path}\\"" with administrator privileges'
-            result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
-            # 无论结果如何都置标记，避免每次启动反复弹框
-            self.settings.setValue('cli_auto_install_done', True)
-            if result.returncode == 0:
-                logging.info("已自动安装命令行工具 kh 到 /usr/local/bin")
-            else:
-                logging.info(f"自动安装 kh 未完成（可能被取消）: {result.stderr.strip()}")
-        except Exception as e:
-            logging.warning(f"自动安装 kh 失败: {e}")
-
-    def open_web_workbench(self):
-        """启动或复用独立的网页回测服务。"""
-        if not WEB_WORKBENCH_AVAILABLE or launch_web_workbench is None:
-            QMessageBox.information(self, "网页回测", "当前发行版未包含网页回测模块。")
-            return
-        current_thread = getattr(self, "_web_launch_thread", None)
-        if current_thread is not None and current_thread.is_alive():
-            self.update_status("网页回测服务正在启动，请稍候")
-            return
-        if getattr(self, "_web_btn", None):
-            self._web_btn.setEnabled(False)
-        config_path = getattr(self, "current_config_file", None)
-        if not config_path or not os.path.isfile(config_path):
-            config_path = None
-
-        self.log_message("正在启动网页回测服务，请稍候…", "INFO")
-        self.update_status("正在启动网页回测服务，请稍候…")
-        notifier = WebWorkbenchLaunchNotifier(self)
-        notifier.result_signal.connect(self._on_web_workbench_started)
-        notifier.error_signal.connect(self._on_web_workbench_failed)
-
-        def launch_in_background():
-            try:
-                result = launch_web_workbench(config_path)
-                try:
-                    notifier.result_signal.emit(result)
-                except RuntimeError:
-                    pass
-            except Exception as exc:
-                try:
-                    notifier.error_signal.emit(str(exc))
-                except RuntimeError:
-                    pass
-            finally:
-                try:
-                    notifier.finished_signal.emit()
-                except RuntimeError:
-                    pass
-
-        worker = threading.Thread(
-            target=launch_in_background,
-            name="KhQuantWebLauncher",
-            daemon=True,
-        )
-        self._web_launch_thread = worker
-        self._web_launch_notifier = notifier
-        notifier.finished_signal.connect(
-            lambda: self._finish_web_launch_thread(worker, notifier)
-        )
-        worker.start()
-
-    def _on_web_workbench_started(self, result):
-        if result.status == "reused":
-            detail = f"并载入配置：{result.project_name}" if result.project_name else ""
-            message = f"已打开正在运行的网页回测工作台{detail}"
-        else:
-            message = "网页回测服务已启动并打开，关闭主界面后仍会继续运行"
-        self.log_message(message, "INFO")
-        self.update_status(message)
-        if getattr(self, "_web_btn", None):
-            self._web_btn.setEnabled(True)
-
-    def _on_web_workbench_failed(self, detail):
-        if getattr(self, "_web_btn", None):
-            self._web_btn.setEnabled(True)
-        error_msg = f"打开网页回测工作台失败：{detail}"
-        self.log_message(error_msg, "ERROR")
-        self.update_status("网页回测服务启动失败")
-        QMessageBox.critical(self, "网页回测", error_msg)
-
-    def _finish_web_launch_thread(self, worker, notifier):
-        if getattr(self, "_web_launch_thread", None) is worker:
-            self._web_launch_thread = None
-        if getattr(self, "_web_launch_notifier", None) is notifier:
-            self._web_launch_notifier = None
-        notifier.deleteLater()
 
     def open_help_tutorial(self):
         """打开在线教程页面"""
@@ -7913,17 +6415,12 @@ def khHandlebar(context):
 
             # 构建配置字典
             config = {
-                "system": {
-                    "userdata_path": self.settings.value('qmt_path', 'D:\\国金证券QMT交易端\\userdata_mini')
-                },
                 "run_mode": self.get_run_mode(),
                 "account": {
                     "account_id": self.settings.value('account_id', ''),
                     "account_type": self.settings.value('account_type', 'STOCK')
                 },
                 "strategy_file": strategy_file_for_save,
-                # 添加实盘数据获取模式配置
-                "data_mode": self.get_realtime_data_mode(),
                 "backtest": {
                     "start_time": self.start_date.date().toString("yyyyMMdd"),
                     "end_time": self.end_date.date().toString("yyyyMMdd"),
@@ -7979,7 +6476,7 @@ def khHandlebar(context):
             
             # 更新窗口标题，显示当前配置文件名
             file_name = os.path.basename(file_path)
-            self.setWindowTitle(f"看海量化回测系统 - {file_name}")
+            self.setWindowTitle(f"{WINDOW_TITLE} - {file_name}")
             
             # 记录日志
             self.log_message(f"配置已保存到: {file_path}", "INFO")
@@ -8032,17 +6529,12 @@ def khHandlebar(context):
 
                 # 构建配置字典
                 config = {
-                    "system": {
-                        "userdata_path": self.settings.value('qmt_path', 'D:\\国金证券QMT交易端\\userdata_mini')
-                    },
                     "run_mode": self.get_run_mode(),
                     "account": {
                         "account_id": self.settings.value('account_id', ''),
                         "account_type": self.settings.value('account_type', 'STOCK')
                     },
                     "strategy_file": strategy_file_for_save,
-                    # 添加实盘数据获取模式配置
-                    "data_mode": self.get_realtime_data_mode(),
                     "backtest": {
                         "start_time": self.start_date.date().toString("yyyyMMdd"),
                         "end_time": self.end_date.date().toString("yyyyMMdd"),
@@ -8342,26 +6834,75 @@ def khHandlebar(context):
             
             msg_box.exec_()
 
+    def run_first_run_guide(self):
+        """首次启动引导：选数据目录、导入 V2.1 设置、补沪深300基准，数据为空时引导去下载。"""
+        from kh_first_run import BenchmarkDownloadDialog, FirstRunDialog, needs_first_run
+
+        if not needs_first_run(self.settings):
+            return
+        dialog = FirstRunDialog(self, self.settings)
+        self.apply_dark_titlebar(dialog)
+        if dialog.exec_() != QDialog.Accepted:
+            self.log_message("已跳过首次启动引导，下次启动时会再次显示", "INFO")
+            return
+        self.log_message(f"数据目录: {dialog.data_dir}", "INFO")
+        if dialog.imported_keys:
+            self.log_message(f"已从 V2.1 导入设置: {', '.join(dialog.imported_keys)}", "INFO")
+            if 'last_config_path' in dialog.imported_keys:
+                self.auto_load_last_config()
+        self.check_software_status()
+        if dialog.benchmark_requested:
+            self._benchmark_dialog = BenchmarkDownloadDialog(dialog.data_dir, self)
+            if self._benchmark_dialog.start():
+                self._benchmark_dialog.thread.finished.connect(
+                    lambda _result=None, data_dir=dialog.data_dir: QTimer.singleShot(
+                        300, lambda: self._suggest_download_if_empty(data_dir)
+                    )
+                )
+                self._benchmark_dialog.show()
+                return
+        self._suggest_download_if_empty(dialog.data_dir)
+
+    def _suggest_download_if_empty(self, data_dir):
+        """数据目录里除了基准以外没有行情库时，引导用户去数据管理下载。"""
+        stock_dbs = 0
+        for market in ('SH', 'SZ', 'BJ'):
+            market_dir = os.path.join(data_dir, market)
+            if not os.path.isdir(market_dir):
+                continue
+            stock_dbs += sum(
+                1 for name in os.listdir(market_dir)
+                if name.lower().endswith('.db') and name.upper() != '000300.DB'
+            )
+        self.check_software_status()
+        if stock_dbs:
+            return
+        msg_box = QMessageBox(self)
+        self.apply_dark_titlebar(msg_box)
+        msg_box.setWindowTitle("还没有行情数据")
+        msg_box.setIcon(QMessageBox.Information)
+        msg_box.setText(
+            "数据目录里还没有股票行情，回测前需要先下载。\n\n"
+            "• 日线、5 分钟线：「数据管理 → BaoStock导入」，免费，不用注册账号\n"
+            "• 1 分钟线：「数据管理 → Tushare导入」，需要在设置里填 Token 并开通 stk_mins 权限\n\n"
+            "下载时开始日期要早于回测开始日期，给均线等指标留出预热期。"
+        )
+        open_btn = msg_box.addButton("打开数据管理", QMessageBox.AcceptRole)
+        msg_box.addButton("稍后", QMessageBox.RejectRole)
+        msg_box.exec_()
+        if msg_box.clickedButton() is open_btn:
+            self.open_duckdb_viewer()
+
     def get_user_strategies_dir(self):
-        r"""获取用户策略文件目录路径（新默认位置：~/Documents/KhQuant/strategies）
+        r"""获取用户策略文件目录路径：文档\KhQuant_OS\strategies
 
-        说明：旧版本默认写在 %LOCALAPPDATA%\KhQuant\strategies，长期大量读写可能
-        触发 Windows 组件损坏和杀毒拦截问题，现改为 Documents 下独立目录。
+        和 CS 版（文档\KhQuant）分开，两边的示例策略互不覆盖。
         """
-        if os.name == 'nt':  # Windows
-            candidates = [
-                os.path.join(os.path.expanduser('~'), 'Documents', 'KhQuant', 'strategies'),
-            ]
-        else:  # Linux/Mac
-            candidates = [
-                os.path.join(os.path.expanduser('~'), 'KhQuant', 'strategies'),
-            ]
-
-        # 受限环境下优先回退到项目内目录，避免因为无权写用户目录而启动失败
-        candidates.extend([
+        candidates = [
+            documents_dir('strategies'),
+            # 受限环境下回退到项目内目录，避免因为无权写用户目录而启动失败
             os.path.join(os.path.dirname(os.path.abspath(__file__)), 'user_data', 'strategies'),
-            os.path.join('/tmp', 'KhQuant', 'strategies'),
-        ])
+        ]
 
         for strategies_dir in candidates:
             try:
@@ -8373,12 +6914,8 @@ def khHandlebar(context):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'strategies')
 
     def get_legacy_strategies_dir(self):
-        """获取旧版策略目录路径（仅用于检测与迁移，不再作为默认写入位置）"""
-        if os.name == 'nt':
-            user_data_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'KhQuant')
-        else:
-            user_data_dir = os.path.join(os.path.expanduser('~'), '.khquant')
-        return os.path.join(user_data_dir, 'strategies')
+        """V2.1 的策略目录 %LOCALAPPDATA%\\KhQuant\\strategies（只读，仅用于复制旧策略）"""
+        return os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'KhQuant', 'strategies')
 
     def init_user_strategies(self, check_legacy=True):
         """初始化用户策略目录，复制默认策略文件，并按需检测旧目录提示迁移
@@ -8419,7 +6956,7 @@ def khHandlebar(context):
         return user_strategies_dir
 
     def check_and_migrate_legacy_strategies(self):
-        """检测旧版 AppData\\Local\\KhQuant\\strategies 目录并提示一键迁移"""
+        """检测 V2.1 的策略目录，提示把旧策略复制一份过来（原文件不动）"""
         legacy_dir = self.get_legacy_strategies_dir()
         if not os.path.isdir(legacy_dir):
             return
@@ -8443,15 +6980,14 @@ def khHandlebar(context):
 
         msg_box = QMessageBox(self)
         self.apply_dark_titlebar(msg_box)
-        msg_box.setWindowTitle("策略目录迁移提示")
+        msg_box.setWindowTitle("复制 V2.1 的策略")
         msg_box.setIcon(QMessageBox.Question)
         msg_box.setText(
-            f"检测到旧策略目录中有 {len(legacy_files)} 个文件：\n{legacy_dir}\n\n"
-            f"长期将策略写入 C 盘 AppData 目录可能引发 Windows 组件损坏、"
-            f"杀毒拦截等问题（曾有用户出现 QMT 无法加载，需用 DISM 修复）。\n\n"
-            f"建议迁移到新的默认位置：\n{new_dir}\n\n是否现在一键迁移？"
+            f"检测到 V2.1 的策略目录中有 {len(legacy_files)} 个文件：\n{legacy_dir}\n\n"
+            f"要把它们复制到开源版的策略目录吗？\n{new_dir}\n\n"
+            f"只复制，不改动也不删除 V2.1 目录里的文件，V2.1 仍可照常使用。"
         )
-        migrate_btn = msg_box.addButton("一键迁移", QMessageBox.AcceptRole)
+        migrate_btn = msg_box.addButton("复制过来", QMessageBox.AcceptRole)
         later_btn = msg_box.addButton("稍后提醒", QMessageBox.RejectRole)
         never_btn = msg_box.addButton("不再提醒", QMessageBox.DestructiveRole)
         msg_box.setDefaultButton(migrate_btn)
@@ -8492,19 +7028,19 @@ def khHandlebar(context):
                 self.log_message(f"迁移失败 {name}: {e}", "WARNING")
                 failed.append(name)
 
-        summary_lines = [f"已迁移到：\n{new_dir}", ""]
+        summary_lines = [f"已复制到：\n{new_dir}", ""]
         summary_lines.append(f"成功: {len(migrated)}")
         if renamed:
             summary_lines.append(f"重命名: {len(renamed)}（目标目录存在同名文件）")
         if failed:
             summary_lines.append(f"失败: {len(failed)}")
         summary_lines.append("")
-        summary_lines.append("旧目录文件已保留，确认无误后可手动删除：")
+        summary_lines.append("V2.1 目录里的文件原样保留：")
         summary_lines.append(legacy_dir)
 
         msg = QMessageBox(self)
         self.apply_dark_titlebar(msg)
-        msg.setWindowTitle("迁移完成")
+        msg.setWindowTitle("复制完成")
         msg.setIcon(QMessageBox.Information)
         msg.setText("\n".join(summary_lines))
         msg.exec_()
@@ -8512,7 +7048,7 @@ def khHandlebar(context):
         # 迁移过后不再提醒
         self.settings.setValue('strategies_migration_dismissed', True)
         self.log_message(
-            f"策略迁移完成: 成功{len(migrated)}, 重命名{len(renamed)}, 失败{len(failed)}",
+            f"V2.1 策略复制完成: 成功{len(migrated)}, 重命名{len(renamed)}, 失败{len(failed)}",
             "INFO"
         )
 
@@ -8670,7 +7206,7 @@ class DisclaimerDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("看海量化回测系统 - 免责声明")
+        self.setWindowTitle(f"{WINDOW_TITLE} - 免责声明")
         self.setModal(True)
         self.setFixedSize(800, 600)
         self.center_on_screen()
@@ -8763,16 +7299,16 @@ class DisclaimerDialog(QDialog):
         layout.addWidget(title_label)
         
         # 免责声明内容
-        disclaimer_text = """在使用"看海量化回测系统"（以下简称"本系统"）之前，请务必仔细阅读并充分理解本文的全部条款。这些条款构成了您与本系统作者之间关于使用本软件的重要约定。
+        disclaimer_text = """在使用"看海量化回测系统（开源版）"（以下简称"本系统"）之前，请务必仔细阅读并充分理解本文的全部条款。这些条款构成了您与本系统作者之间关于使用本软件的重要约定。
 
 
-第一章  系统依赖与免责声明
+第一章  数据来源与免责声明
 
-■ 对MiniQMT的依赖
-本系统的行情数据获取与交易执行功能，完全依赖于您本地安装的MiniQMT客户端。为了实现回测功能，本系统会在本地存储和处理从MiniQMT下载的行情数据，但系统本身不生产任何原始数据。
+■ 数据来源
+本系统只读取您本地 DuckDB 数据库里的行情数据进行回测。数据由您自己通过 BaoStock（免费）或 Tushare（需要账号与相应权限）下载，也可以自行导入；系统本身不生产任何原始数据。
 
 ■ 数据验证与检验机制
-本系统在运行过程中包含了数据有效性检验功能，会对从MiniQMT获取的数据进行基础的完整性和格式校验。但需要明确的是，这些检验仅为程序正常运行的技术保障，不能等同于对数据准确性的担保。市场数据的准确性和及时性完全取决于券商MiniQMT及其上游数据源。
+本系统在运行过程中包含了数据有效性检验功能，会对本地数据进行基础的完整性和格式校验。但需要明确的是，这些检验仅为程序正常运行的技术保障，不能等同于对数据准确性的担保。市场数据的准确性和及时性完全取决于 BaoStock、Tushare 等数据提供方。
 
 ■ 核心功能定位
 请注意，当前版本的"看海量化回测系统"是一款策略回测与研究平台，其核心功能是历史数据验证，当前官方版本不包含任何直接执行实盘交易的功能。
@@ -8780,7 +7316,7 @@ class DisclaimerDialog(QDialog):
 ■ 全面责任界定
 本系统作者的责任仅限于提供软件工具本身。使用本软件过程中遇到的任何问题，包括但不限于系统故障、数据错误、策略失效、操作失误、电脑故障等，均由用户自行承担全部责任。对于因以下原因导致的任何直接或间接损失，作者不承担任何形式的法律或经济责任：
 
-    • 券商MiniQMT客户端或其服务器的任何故障、错误、延迟或数据偏差
+    • BaoStock、Tushare 等第三方数据服务的任何故障、错误、延迟、限流或数据偏差
     • 网络连接问题、运营商服务中断等第三方因素
     • 用户自行修改代码以启用实盘交易功能后，所产生的一切后果（包括但不限于任何资金损失）
     • 本软件自身的任何漏洞、错误、兼容性问题或运行异常
@@ -8823,23 +7359,13 @@ class DisclaimerDialog(QDialog):
 任何违反此声明的商业行为所引发的一切法律纠纷、商业风险及经济损失，均由该使用者自行承担。作者保留对所有侵权行为进行法律追究的权利。
 
 
-第四章  内部交流群说明
+第四章  问题反馈
 
-■ 加入方式与条件
-通过作者提供的推荐渠道开通MiniQMT账户的用户，可以联系作者加入内部交流群。(加群免费)
-
-■ 群成员专享权益
-内部群成员可以享受以下权益：
-    • 内测版本优先体验权：最新功能的内测版本优先推送，可比公开发布提前体验新特性
-    • 版本抢先获取：软件正式版本发布后，群成员可通过内部渠道更早获得下载链接和更新包，无需等待公开发布
-    • 问题优先支持：在使用过程中遇到的技术问题，能够得到更优先、更及时的响应和技术支持
-    • 策略思路分享：群内会不定期分享一些原创的策略思路、编程技巧或市场分析心得
-    • 内部策略代码：群成员可获得一些未公开发布的实用策略代码示例，用于学习参考
-    • 直接反馈通道：可以直接向作者反馈建议和需求，影响软件未来的开发方向
-    • 同好交流平台：与其他量化爱好者深度交流，分享经验，共同进步
-
-■ 群规与维护
-内部群主要用于技术交流和软件支持，请遵守基本的讨论秩序。群内严禁任何形式的广告、推销或与量化交易无关的内容。
+■ 反馈渠道
+使用中遇到的问题和建议，请在 GitHub 或 Gitee 提交 Issue：
+    • https://github.com/khscience/OSkhQuant/issues
+    • https://gitee.com/mrkanhai/oskhquant/issues
+提交时请附上软件版本、操作步骤和日志（%LOCALAPPDATA%\\KhQuantOS\\logs），便于定位问题。
 
 
 第五章  投资风险免责声明
@@ -8951,46 +7477,8 @@ class _DarkTitleBarFilter(QObject):
 
 def main():
     try:
-        if "--scheduled-sync" in sys.argv[1:]:
-            from GUIScheduledDataSync import main as scheduled_sync_main
-            return scheduled_sync_main(instance_lock=_scheduled_instance_lock)
-
         force_primary_screen_dpi()
         app = QApplication(sys.argv)
-
-        def activate_macos_frontmost():
-            """尽力将 macOS 应用切到前台，避免 Dock 启动后进程存在但窗口不激活。"""
-            if sys.platform != 'darwin':
-                return
-
-            try:
-                from AppKit import NSApplication, NSApplicationActivationPolicyRegular
-
-                ns_app = NSApplication.sharedApplication()
-                ns_app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
-                ns_app.activateIgnoringOtherApps_(True)
-                logging.info("已通过 AppKit 请求 macOS 将应用切到前台")
-                return
-            except Exception:
-                # AppKit 不可用（未安装 pyobjc）属正常情况，静默回退到 AppleScript
-                pass
-
-            try:
-                # 源码运行：使用 PID 激活
-                import os
-                pid = os.getpid()
-                subprocess.Popen(
-                    [
-                        "/usr/bin/osascript",
-                        "-e",
-                        f'tell application "System Events" to set frontmost of the first process whose unix id is {pid} to true'
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                logging.info("已通过 AppleScript (PID) 请求 macOS 将应用切到前台")
-            except Exception as exc:
-                logging.warning(f"AppleScript 前台激活失败: {exc}")
 
         # 全局深色标题栏：所有弹窗/对话框统一风格（必须保留引用防止被回收）
         app._dark_titlebar_filter = _DarkTitleBarFilter(app)
@@ -9051,8 +7539,8 @@ def main():
         QMetaType.type("QTextCursor")
         
         # 设置应用程序名称和组织名称
-        app.setApplicationName("KhQuant")
-        app.setOrganizationName("KhQuant")
+        app.setApplicationName(QT_APP)
+        app.setOrganizationName(QT_ORG)
         
         def get_app_icon_path(icon_name):
             return os.path.join(os.path.dirname(__file__), 'icons', icon_name)
@@ -9129,10 +7617,13 @@ def main():
                     window.activateWindow()
                     app.processEvents()
                     logging.info(f"主窗口激活完成，isVisible={window.isVisible()}, isActive={window.isActiveWindow()}")
-                    activate_macos_frontmost()
-                    QTimer.singleShot(150, activate_macos_frontmost)
 
                     def _run_legacy_migration_check():
+                        # 首次启动引导（数据目录、V2.1 设置导入、自动补基准）先于旧策略迁移
+                        try:
+                            window.run_first_run_guide()
+                        except Exception as exc:
+                            logging.warning(f"首次启动引导失败: {exc}", exc_info=True)
                         try:
                             if not getattr(window, '_legacy_migration_checked', False):
                                 window._legacy_migration_checked = True
@@ -9156,8 +7647,7 @@ def main():
                         
                         window.raise_()
                         window.activateWindow()
-                        activate_macos_frontmost()
-                        
+
                         QTimer.singleShot(500, _run_legacy_migration_check)
 
                     # 免责声明弹窗展示规则：
@@ -9172,8 +7662,6 @@ def main():
                         QTimer.singleShot(500, _run_legacy_migration_check)
                     else:
                         # 稍微延后执行免责声明，确保主窗口有足够的时间完成首屏绘制和前台激活
-                        # 在macOS下，由于系统安全隔离和沙盒机制，QDialog的模态属性可能导致整个应用卡死
-                        # 因此，在macOS下我们使用非模态对话框，或者干脆不在启动时弹窗，改为首次点击某个功能时再弹
                         QTimer.singleShot(600, _show_disclaimer_and_continue)
 
                 except Exception as e:
@@ -9236,18 +7724,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # 平台守卫：Linux 当前未启用 GUI（Windows / macOS + PyQt5 可用）
-    try:
-        from kh_platform import GUI_ENABLED, PLATFORM_NAME
-    except ImportError:
-        import importlib.util
-        _has_qt = importlib.util.find_spec("PyQt5") is not None
-        GUI_ENABLED = sys.platform in ("win32", "darwin") and _has_qt
-        PLATFORM_NAME = sys.platform
-    if not GUI_ENABLED:
-        print(f"当前平台 ({PLATFORM_NAME}) 未启用 GUI（目前支持 Windows / macOS），请使用 CLI：kh --help")
-        sys.exit(2)
-
     import multiprocessing
     try:
         multiprocessing.set_start_method('spawn', force=True)

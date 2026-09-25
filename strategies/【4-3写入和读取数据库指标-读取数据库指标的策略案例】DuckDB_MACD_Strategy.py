@@ -11,8 +11,18 @@ params = {
     'buy_ratio_multiplier': random.uniform(0.5, 1.0) # 随机买入比例乘数
 }
 
-_g_duckdb_path = r"D:\khData"
+_g_duckdb_path = ""
 _g_buy_ratio   = 0.1
+
+
+def _configured_duckdb_path():
+    """开源版设置里的 DuckDB 数据目录；没设置过时用默认目录 %LOCALAPPDATA%\\KhQuantOS\\khData。"""
+    try:
+        import kh_settings
+        from kh_app_identity import default_duckdb_dir
+        return kh_settings.load().get("duckdb_data_path") or default_duckdb_dir()
+    except Exception:
+        return os.path.join(os.environ.get("LOCALAPPDATA", ""), "KhQuantOS", "khData")
 
 def init(stock_list, data):
     global _g_duckdb_path, _g_buy_ratio
@@ -20,7 +30,7 @@ def init(stock_list, data):
     logging.info(f"随机参数: 买入比例乘数={params['buy_ratio_multiplier']:.2f}")
     logging.info("说明：本策略直接从本地 DuckDB 读取之前计算并写入的 MACD 字段进行交易判断。")
     clear_khDuckDB_cache()
-    _g_duckdb_path = os.environ.get("DUCKDB_DATA_ROOT", r"D:\khData")
+    _g_duckdb_path = os.environ.get("DUCKDB_DATA_ROOT") or _configured_duckdb_path()
     _g_buy_ratio   = (1.0 / max(len(stock_list), 1)) * params['buy_ratio_multiplier']
 
 

@@ -74,7 +74,8 @@ DEFAULTS = {
     "performance_khhistory_cache_mode": DEFAULT_PERFORMANCE_CONFIG["khhistory_cache_mode"],
     "performance_khhistory_prefetch_end": DEFAULT_PERFORMANCE_CONFIG["khhistory_prefetch_end"],
     "performance_khhistory_memory_fastpath": DEFAULT_PERFORMANCE_CONFIG["khhistory_memory_fastpath"],
-    "performance_khhistory_missing_data_prompt": False,
+    # 开源版默认打开：V2.1 的 khHistory 缺数据会自动下载，2.2 返回空，提示能让用户及时发现
+    "performance_khhistory_missing_data_prompt": True,
     "performance_empty_data_log_mode": DEFAULT_PERFORMANCE_CONFIG["empty_data_log_mode"],
     "performance_duckdb_order_mode": DEFAULT_PERFORMANCE_CONFIG["duckdb_order_mode"],
     "performance_duckdb_load_batch_size": DEFAULT_PERFORMANCE_CONFIG["duckdb_load_batch_size"],

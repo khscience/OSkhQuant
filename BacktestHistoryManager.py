@@ -38,19 +38,9 @@ _HISTORY_CACHE_FILES = ("config.csv", "summary.csv", "daily_stats.csv", "trades.
 
 def _history_cache_path() -> str:
     """返回历史索引缓存路径，确保源码版和安装版都不会写入程序目录。"""
-    if sys.platform == "win32":
-        base = os.environ.get("LOCALAPPDATA") or os.path.join(
-            os.path.expanduser("~"), "AppData", "Local"
-        )
-        cache_dir = os.path.join(base, "KhQuant", "cache")
-    elif sys.platform == "darwin":
-        cache_dir = os.path.join(os.path.expanduser("~/Library/Caches"), "khQuant")
-    else:
-        cache_dir = os.path.join(
-            os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
-            "khquant",
-        )
-    return os.path.join(cache_dir, "backtest_history_index.json")
+    from kh_app_identity import local_appdata_dir
+
+    return os.path.join(local_appdata_dir("cache"), "backtest_history_index.json")
 
 
 class _ActionButtonDelegate(QStyledItemDelegate):
@@ -205,34 +195,33 @@ class BacktestHistoryManager(QMainWindow):
     def init_ui(self):
         """初始化用户界面"""
         # 设置窗口标题栏颜色（仅适用于Windows）
-        if sys.platform == 'win32':
-            try:
-                from ctypes import windll, c_int, byref, sizeof, create_string_buffer, create_unicode_buffer, Structure, POINTER
-                from ctypes.wintypes import DWORD, HWND, BOOL
+        try:
+            from ctypes import windll, c_int, byref, sizeof, create_string_buffer, create_unicode_buffer, Structure, POINTER
+            from ctypes.wintypes import DWORD, HWND, BOOL
 
-                # 定义必要的Windows API常量和结构
-                DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-                DWMWA_CAPTION_COLOR = 35  # 标题栏颜色
-                
-                # 启用深色模式
-                windll.dwmapi.DwmSetWindowAttribute(
-                    int(self.winId()),
-                    DWMWA_USE_IMMERSIVE_DARK_MODE,
-                    byref(c_int(2)),  # 2 means true
-                    sizeof(c_int)
-                )
-                
-                # 设置标题栏颜色
-                caption_color = DWORD(0x2b2b2b)  # 使用与主界面相同的颜色
-                windll.dwmapi.DwmSetWindowAttribute(
-                    int(self.winId()),
-                    DWMWA_CAPTION_COLOR,
-                    byref(caption_color),
-                    sizeof(caption_color)
-                )
+            # 定义必要的Windows API常量和结构
+            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+            DWMWA_CAPTION_COLOR = 35  # 标题栏颜色
 
-            except Exception as e:
-                logging.warning(f"设置标题栏深色模式失败: {str(e)}")
+            # 启用深色模式
+            windll.dwmapi.DwmSetWindowAttribute(
+                int(self.winId()),
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                byref(c_int(2)),  # 2 means true
+                sizeof(c_int)
+            )
+
+            # 设置标题栏颜色
+            caption_color = DWORD(0x2b2b2b)  # 使用与主界面相同的颜色
+            windll.dwmapi.DwmSetWindowAttribute(
+                int(self.winId()),
+                DWMWA_CAPTION_COLOR,
+                byref(caption_color),
+                sizeof(caption_color)
+            )
+
+        except Exception as e:
+            logging.warning(f"设置标题栏深色模式失败: {str(e)}")
         
         self.setWindowTitle("回测历史结果管理器")
         # 根据表格列的实际宽度设置窗口宽度

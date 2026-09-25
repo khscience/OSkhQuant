@@ -2,13 +2,24 @@
 """
 【重要提示】
 1. 本文件不是交易策略文件，不可在策略回测框架中直接加载。
-2. 本文件是一个独立的数据处理程序，需要直接在编辑器下运行。
-3. 运行前，请务必将代码中的 DuckDB 数据库路径（duckdb_path）修改为你本地实际的数据存放路径。
+2. 本文件是一个独立的数据处理程序，需要在开源版源码目录下用 Python 直接运行（python 文件名.py）。
+3. 数据库路径默认取开源版设置里的 DuckDB 数据目录，也可以用环境变量 DUCKDB_DATA_ROOT 指定。
+   不要写到 CS 版在用的目录：开源版的 khDuckWrite 会拒绝写入可能和 CS 共用的目录。
 """
 
 import os
 import sys
 import pandas as pd
+
+
+def _configured_duckdb_path():
+    """开源版设置里的 DuckDB 数据目录；没设置过时用默认目录 %LOCALAPPDATA%\\KhQuantOS\\khData。"""
+    try:
+        import kh_settings
+        from kh_app_identity import default_duckdb_dir
+        return kh_settings.load().get("duckdb_data_path") or default_duckdb_dir()
+    except Exception:
+        return os.path.join(os.environ.get("LOCALAPPDATA", ""), "KhQuantOS", "khData")
 
 # 为了能导入上一级目录（也就是项目根目录）的 khQTTools 模块，需要将上一级目录加入系统路径
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -53,7 +64,7 @@ def main():
     # 第一步：基础配置
     # ---------------------------------------------------------
     # 设定本地 DuckDB 数据库的存放根目录
-    duckdb_path = os.environ.get("DUCKDB_DATA_ROOT", r"D:\khData")
+    duckdb_path = os.environ.get("DUCKDB_DATA_ROOT") or _configured_duckdb_path()
     
     # 设定数据周期。本例以日线("1d")为例
     period = "1d"

@@ -68,7 +68,7 @@ def load_tushare_settings() -> TushareRuntimeSettings:
     try:
         from qt_settings_bridge import KhQtSettings
 
-        KhQtSettings("KHQuant", "StockAnalyzer")
+        KhQtSettings()
     except (ImportError, ModuleNotFoundError):
         pass
 

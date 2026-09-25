@@ -1,9 +1,9 @@
 # coding: utf-8
 """Bridge Qt UI preferences and shared KhQuant settings.
 
-QSettings is still used for window geometry and GUI-only state. Settings that
-affect backtest behavior are routed to ~/.khquant/settings.json so GUI and CLI
-share one source of truth.
+QSettings（HKCU\\Software\\KHQuant\\StockAnalyzerOS）只存窗口位置等界面状态；
+影响回测的设置写在 ~/.khquant_os/settings.json，是唯一真源。
+开源版绝不读写 CS 版的 ~/.khquant/settings.json 和 V2.1 / CS 的 QSettings。
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from typing import Any
 from PyQt5.QtCore import QSettings
 
 import kh_settings as global_settings
+from kh_app_identity import LEGACY_V21_QT_APP, LEGACY_V21_QT_ORG, QT_APP, QT_ORG
 
 
 SHARED_SETTING_KEYS = set(global_settings.DEFAULTS.keys()) | {
@@ -27,7 +28,11 @@ _TUSHARE_MIGRATION_MARKER = "_shared_tushare_settings_migrated_v1"
 
 
 class KhQtSettings:
-    def __init__(self, organization: str = "KHQuant", application: str = "StockAnalyzer"):
+    def __init__(self, organization: str = QT_ORG, application: str = QT_APP):
+        # 兜底：漏改的旧调用若传入 V2.1 / CS 的名称，也改用开源版自己的位置，
+        # 否则下面的迁移会把 Tushare 配置写回 V2.1 / CS 的注册表。
+        if (organization, application) == (LEGACY_V21_QT_ORG, LEGACY_V21_QT_APP):
+            organization, application = QT_ORG, QT_APP
         self._qsettings = QSettings(organization, application)
         self._migrate_legacy_shared_settings()
 
@@ -76,8 +81,6 @@ class KhQtSettings:
 
     def _migrate_legacy_shared_settings(self):
         try:
-            # Mac 旧版配置位于 ~/.khquant。先通过共享设置层完成位置迁移，
-            # 再执行 QSettings 的字段迁移，避免默认值覆盖旧配置。
             global_settings.load()
             os.makedirs(global_settings.SETTINGS_DIR, exist_ok=True)
             if os.path.exists(global_settings.SETTINGS_FILE):

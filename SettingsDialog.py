@@ -15,7 +15,9 @@ from PyQt5.QtGui import QFont, QIcon, QDoubleValidator, QIntValidator
 
 from khQTTools import get_and_save_stock_list
 from khPathUtils import get_stock_pool_write_dir
-from khUiScale import get_ui_font_scale, get_platform_ui_metrics, is_macos_ui
+from khUiScale import get_ui_font_scale, get_platform_ui_metrics
+from kh_app_identity import QT_APP, QT_ORG, default_duckdb_dir
+from kh_data_dir_policy import SHARED_WRITE_WARNING, claim_if_new, may_be_shared_with_cs
 from data_integrity_policy import normalize_integrity_mode
 from performance_config import DEFAULT_PERFORMANCE_CONFIG
 from performance_config import PERFORMANCE_PRESETS, normalize_performance_preset, performance_preset_settings
@@ -33,7 +35,7 @@ except ImportError:
             "version": "1.0.0",
             "build_date": "2023-01-01",
             "channel": "stable",
-            "app_name": "看海量化交易平台"
+            "app_name": "看海量化回测平台（开源版）"
         }
 
 
@@ -127,7 +129,7 @@ class SettingsDialog(QDialog):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.settings = KhQtSettings('KHQuant', 'StockAnalyzer')
+        self.settings = KhQtSettings(QT_ORG, QT_APP)
         self.font_scale = get_ui_font_scale(self.settings)
         self.ui_metrics = get_platform_ui_metrics(self.font_scale)
         self.small_font_size = max(11, int(12 * self.font_scale))
@@ -152,8 +154,8 @@ class SettingsDialog(QDialog):
         minimum_height = 560
         if screen is not None:
             available = screen.availableGeometry()
-            horizontal_margin = 80 if is_macos_ui() else 40
-            vertical_margin = 120 if is_macos_ui() else 60
+            horizontal_margin = 40
+            vertical_margin = 60
             max_width = max(500, available.width() - horizontal_margin)
             max_height = max(minimum_height, available.height() - vertical_margin)
             self.setMinimumWidth(min(minimum_width, max_width))
@@ -162,8 +164,6 @@ class SettingsDialog(QDialog):
                 min(max(default_width, self.minimumWidth()), max_width),
                 min(max(default_height, self.minimumHeight()), max_height),
             )
-            if is_macos_ui():
-                self.setMaximumHeight(max_height)
         else:
             self.setMinimumWidth(minimum_width)
             self.setMinimumHeight(minimum_height)
@@ -173,8 +173,6 @@ class SettingsDialog(QDialog):
         # 主布局
         layout = QVBoxLayout(self)
         layout.setSpacing(self.ui_metrics["settings_layout_spacing"])
-        if is_macos_ui():
-            layout.setContentsMargins(14, 14, 14, 14)
 
         tab_padding_v = self.ui_metrics["settings_tab_padding_v"]
         tab_padding_h = self.ui_metrics["settings_tab_padding_h"]
@@ -224,33 +222,10 @@ class SettingsDialog(QDialog):
         performance_tab_layout.setContentsMargins(12, 12, 12, 12)
         performance_tab_layout.setSpacing(12)
 
-        # 创建第三个标签页（包管理设置）—— macOS 下不显示
-        if not is_macos_ui():
-            pkg_tab = QWidget()
-            pkg_tab_layout = QVBoxLayout(pkg_tab)
-            pkg_tab_layout.setContentsMargins(12, 12, 12, 12)
-            pkg_tab_layout.setSpacing(12)
-
-            try:
-                from GUIPackageManager import GUIPackageManager
-
-                self.pkg_manager = GUIPackageManager(self)
-                self.pkg_manager.close_btn.hide()
-                pkg_tab_layout.addWidget(self.pkg_manager)
-
-            except ImportError:
-                error_label = QLabel("无法加载包管理器模块。")
-                pkg_tab_layout.addWidget(error_label)
-            except Exception as e:
-                error_label = QLabel(f"加载包管理器失败: {str(e)}")
-                pkg_tab_layout.addWidget(error_label)
-
         # 添加标签页到TabWidget
         self.tab_widget.addTab(self._wrap_tab_content(basic_tab), "基本设置")
         self.tab_widget.addTab(self._wrap_tab_content(data_tab), "数据设置")
         self.tab_widget.addTab(self._wrap_tab_content(performance_tab), "回测性能")
-        if not is_macos_ui():
-            self.tab_widget.addTab(self._wrap_tab_content(pkg_tab), "包管理")
 
         # 将TabWidget添加到主布局
         layout.addWidget(self.tab_widget, 1)
@@ -735,7 +710,7 @@ class SettingsDialog(QDialog):
         account_type_label = QLabel("账户类型:")
         account_type_label.setStyleSheet("color: #E0E0E0;")
         self.account_type_selector = NoWheelComboBox()
-        self.account_type_selector.addItems(["STOCK", "CREDIT", "FUTURES"])
+        self.account_type_selector.addItems(["STOCK"])
         self.account_type_selector.setFixedWidth(180)
         self.account_type_selector.setStyleSheet("""
             QComboBox {
@@ -792,48 +767,46 @@ class SettingsDialog(QDialog):
         basic_params_group.setLayout(basic_params_layout)
         basic_tab_layout.addWidget(basic_params_group)
 
-        # 股票列表管理组（macOS 下不展示更新成分股列表按钮）
-        if not is_macos_ui():
-            stock_list_group = QGroupBox("股票列表管理")
-            stock_list_group.setStyleSheet("""
-                QGroupBox {
-                    border: 1px solid #505050;
-                    border-radius: 5px;
-                    margin-top: 12px;
-                    padding-top: 15px;
-                    color: #E0E0E0;
-                }
-                QGroupBox::title {
-                    subcontrol-origin: margin;
-                    left: 7px;
-                    padding: 0 3px;
-                }
-            """)
-            stock_list_layout = QVBoxLayout()
+        # 股票列表管理组
+        stock_list_group = QGroupBox("股票列表管理")
+        stock_list_group.setStyleSheet("""
+            QGroupBox {
+                border: 1px solid #505050;
+                border-radius: 5px;
+                margin-top: 12px;
+                padding-top: 15px;
+                color: #E0E0E0;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 7px;
+                padding: 0 3px;
+            }
+        """)
+        stock_list_layout = QVBoxLayout()
 
-            update_stock_list_btn = QPushButton("更新成分股列表")
-            update_stock_list_btn.setObjectName("update_stock_list_btn")
-            update_stock_list_btn.setMinimumHeight(34)
-            update_stock_list_btn.setMaximumWidth(260)
-            update_stock_list_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            update_stock_list_btn.setToolTip(
-                "更新本地股票池、指数成分股及场内基金列表（含 ETF/LOF）。\n"
-                "优先使用同花顺（扶摇）接口；未配置 API Key 时可退为使用 BaoStock（不含转债/基金列表）。\n"
-                "运行时需耐心等待，无需频繁更新。"
-            )
-            update_stock_list_btn.clicked.connect(self.update_stock_list)
-            stock_list_layout.addWidget(update_stock_list_btn, 0, Qt.AlignLeft)
+        update_stock_list_btn = QPushButton("更新成分股列表")
+        update_stock_list_btn.setObjectName("update_stock_list_btn")
+        update_stock_list_btn.setMinimumHeight(34)
+        update_stock_list_btn.setMaximumWidth(260)
+        update_stock_list_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        update_stock_list_btn.setToolTip(
+            "通过 BaoStock 更新本地股票池和主要指数成分股（随包的基金、转债列表保持不变）。\n"
+            "运行时需耐心等待，无需频繁更新。"
+        )
+        update_stock_list_btn.clicked.connect(self.update_stock_list)
+        stock_list_layout.addWidget(update_stock_list_btn, 0, Qt.AlignLeft)
 
-            stock_list_hint = QLabel(
-                "优先同花顺（扶摇）接口，可更新 A 股、主要指数及场内基金；"
-                "若未配置同花顺 API Key，可退为使用 BaoStock（保留原有基金和转债列表）。"
-            )
-            stock_list_hint.setWordWrap(True)
-            stock_list_hint.setStyleSheet(f"color: #A0A0A0; font-size: {self.small_font_size}px;")
-            stock_list_layout.addWidget(stock_list_hint)
+        stock_list_hint = QLabel(
+            "通过 BaoStock 更新 A 股与主要指数成分股，免费、不用账号；"
+            "随包的场内基金和转债列表保持不变。"
+        )
+        stock_list_hint.setWordWrap(True)
+        stock_list_hint.setStyleSheet(f"color: #A0A0A0; font-size: {self.small_font_size}px;")
+        stock_list_layout.addWidget(stock_list_hint)
 
-            stock_list_group.setLayout(stock_list_layout)
-            basic_tab_layout.addWidget(stock_list_group)
+        stock_list_group.setLayout(stock_list_layout)
+        basic_tab_layout.addWidget(stock_list_group)
 
         # 版本信息组
         version_group = QGroupBox("版本信息")
@@ -862,11 +835,6 @@ class SettingsDialog(QDialog):
             build_date_label = QLabel(f"构建日期：{version_info['build_date']}")
             build_date_label.setStyleSheet("color: #E0E0E0;")
             version_layout.addWidget(build_date_label)
-        # 添加更新通道信息
-        if 'channel' in version_info:
-            channel_label = QLabel(f"更新通道：{version_info['channel']}")
-            channel_label.setStyleSheet("color: #E0E0E0;")
-            version_layout.addWidget(channel_label)
 
         version_group.setLayout(version_layout)
         basic_tab_layout.addWidget(version_group)
@@ -894,13 +862,6 @@ class SettingsDialog(QDialog):
         """)
         path_layout = QVBoxLayout()
 
-        # macOS 及新版统一不展示 miniQMT 路径与旧版历史补充源（各数据源已在数据管理模块独立提供），
-        # 但仍创建对应控件以保持兼容与设置项保存。
-        self.client_path_edit = QLineEdit()
-        self.client_path_edit.setText(self.settings.value('client_path', ''))
-        self.qmt_path_edit = QLineEdit()
-        self.qmt_path_edit.setText(self.settings.value('qmt_path', 'D:\\国金证券QMT交易端\\userdata_mini'))
-
         # 添加DuckDB数据路径设置
         duckdb_path_label = QLabel("DuckDB数据路径:")
         duckdb_path_label.setStyleSheet("color: #E0E0E0; margin-top: 5px;")
@@ -920,8 +881,9 @@ class SettingsDialog(QDialog):
                 border: 1px solid #606060;
             }
         """)
-        # 从设置中读取DuckDB数据路径，默认为空
-        self.duckdb_path_edit.setText(self.settings.value('duckdb_data_path', ''))
+        # 从设置中读取DuckDB数据路径；没设置过时显示开源版默认目录
+        self._initial_duckdb_path = self.settings.value('duckdb_data_path', '') or ''
+        self.duckdb_path_edit.setText(self._initial_duckdb_path or default_duckdb_dir())
         self.duckdb_path_edit.setPlaceholderText("请选择DuckDB数据存储路径")
 
         duckdb_browse_button = QPushButton("浏览...")
@@ -945,69 +907,20 @@ class SettingsDialog(QDialog):
         path_layout.addLayout(duckdb_input_layout)
 
         # 添加DuckDB路径说明
-        duckdb_desc = QLabel("用于存储DuckDB本地数据库文件的目录（例如: D:\\khData）")
+        duckdb_desc = QLabel(
+            "开源版只读这个目录里的 DuckDB 数据回测。默认 %LOCALAPPDATA%\\KhQuantOS\\khData，"
+            "建议换到非系统盘。不要和 CS 版共用同一个目录：两边会互相锁库，可以用下面的按钮复制一份 CS 数据。"
+        )
+        duckdb_desc.setWordWrap(True)
         duckdb_desc.setStyleSheet(f"color: #A0A0A0; font-size: {self.small_font_size}px;")
         path_layout.addWidget(duckdb_desc)
 
-        # 添加回测数据源选择（macOS 下仅支持 DuckDB，不展示选择器）
-        self.data_source_combo = QComboBox()
-        if is_macos_ui():
-            self.data_source_combo.addItems(["DuckDB本地数据库"])
-            self.data_source_combo.setCurrentIndex(0)
-        else:
-            data_source_label = QLabel("回测数据源:")
-            data_source_label.setStyleSheet("color: #E0E0E0; margin-top: 15px; font-weight: bold;")
-            path_layout.addWidget(data_source_label)
-
-            data_source_layout = QHBoxLayout()
-            self.data_source_combo.addItems(["miniQMT", "DuckDB本地数据库"])
-            self.data_source_combo.setStyleSheet("""
-                QComboBox {
-                    border: 1px solid #505050;
-                    border-radius: 2px;
-                    padding: 5px;
-                    background-color: #404040;
-                    color: #E0E0E0;
-                    min-width: 200px;
-                }
-                QComboBox:focus {
-                    border: 1px solid #606060;
-                }
-                QComboBox::drop-down {
-                    border: none;
-                    width: 20px;
-                }
-                QComboBox::down-arrow {
-                    image: none;
-                    border-left: 5px solid transparent;
-                    border-right: 5px solid transparent;
-                    border-top: 5px solid #E0E0E0;
-                    margin-right: 5px;
-                }
-                QComboBox QAbstractItemView {
-                    background-color: #404040;
-                    color: #E0E0E0;
-                    selection-background-color: #505050;
-                }
-            """)
-            current_source = self.settings.value('backtest_data_source', 'duckdb')
-            if current_source == 'duckdb':
-                self.data_source_combo.setCurrentIndex(1)
-            else:
-                self.data_source_combo.setCurrentIndex(0)
-
-            data_source_layout.addWidget(self.data_source_combo)
-            data_source_layout.addStretch()
-            path_layout.addLayout(data_source_layout)
-
-            source_desc = QLabel("DuckDB: 使用本地DuckDB数据库（推荐，高速离线回测）\nminiQMT: 使用QMT客户端数据（需要miniQMT运行）")
-            source_desc.setStyleSheet(f"color: #A0A0A0; font-size: {self.small_font_size}px;")
-            path_layout.addWidget(source_desc)
-
-        # 内部创建 history_source_combo 供设置项读写，UI已移入数据管理模块各入口
-        self.history_source_combo = QComboBox()
-        self.history_source_combo.addItem("MiniQMT（xtdata）", "miniqmt")
-        self.history_source_combo.setCurrentIndex(0)
+        copy_cs_button = QPushButton("复制 CS 数据…")
+        copy_cs_button.setFixedWidth(140)
+        copy_cs_button.setStyleSheet(duckdb_browse_button.styleSheet())
+        copy_cs_button.setToolTip("把看海量化 CS 版的数据复制一份到开源版的目录，之后两边互不锁库")
+        copy_cs_button.clicked.connect(self._open_data_copy_dialog)
+        path_layout.addWidget(copy_cs_button, 0, Qt.AlignLeft)
 
         client_group.setLayout(path_layout)
         data_tab_layout.addWidget(client_group)
@@ -1155,7 +1068,7 @@ class SettingsDialog(QDialog):
         self.perf_khhistory_missing_prompt_checkbox = QCheckBox("khHistory 缺历史数据时弹窗确认")
         self.perf_khhistory_missing_prompt_checkbox.setStyleSheet("color: #E0E0E0;")
         self.perf_khhistory_missing_prompt_checkbox.setChecked(
-            self.settings.value("performance_khhistory_missing_data_prompt", False, type=bool)
+            self.settings.value("performance_khhistory_missing_data_prompt", True, type=bool)
         )
         details_layout.addWidget(self.perf_khhistory_missing_prompt_checkbox)
         _add_desc(details_layout, "打开后，GUI 回测遇到 khHistory 历史数据不足会提示是否继续。大批量压测建议关闭，避免反复弹窗。")
@@ -1477,53 +1390,6 @@ class SettingsDialog(QDialog):
 
         data_tab_layout.addWidget(tushare_group)
 
-        # --- 同花顺 API Key ---
-        ths_group = QGroupBox("同花顺（扶摇）接口配置")
-        ths_group.setStyleSheet(groupbox_style)
-        ths_layout = QVBoxLayout(ths_group)
-        ths_layout.setSpacing(10)
-
-        ths_row = QHBoxLayout()
-        ths_label = QLabel("API Key:")
-        ths_label.setStyleSheet("color: #E0E0E0;")
-        ths_label.setFixedWidth(label_width)
-        self.ths_api_key_edit = QLineEdit()
-        self.ths_api_key_edit.setEchoMode(QLineEdit.Password)
-        self.ths_api_key_edit.setPlaceholderText("在 https://fuyao.aicubes.cn/admin 免费申领")
-        self.ths_api_key_edit.setStyleSheet(lineedit_style)
-
-        from duckdb_storage.ths_config import get_ths_api_key
-        _ths_key = get_ths_api_key()
-        if _ths_key:
-            self.ths_api_key_edit.setText(_ths_key)
-
-        self.ths_key_toggle_btn = QPushButton("显示")
-        self.ths_key_toggle_btn.setCheckable(True)
-        self.ths_key_toggle_btn.setFixedWidth(55)
-        self.ths_key_toggle_btn.setStyleSheet(btn_style)
-        self.ths_key_toggle_btn.toggled.connect(self._toggle_ths_key_visibility)
-
-        self.ths_test_btn = QPushButton("测试连接")
-        self.ths_test_btn.setFixedWidth(80)
-        self.ths_test_btn.setStyleSheet(btn_style)
-        self.ths_test_btn.clicked.connect(self._test_ths_connection)
-
-        ths_row.addWidget(ths_label)
-        ths_row.addWidget(self.ths_api_key_edit)
-        ths_row.addWidget(self.ths_key_toggle_btn)
-        ths_row.addWidget(self.ths_test_btn)
-        ths_layout.addLayout(ths_row)
-
-        ths_hint = QLabel(
-            "同花顺官方开放平台（扶摇）免费提供 A 股日线及复权数据，不限制累计调用次数。"
-            " <a href='https://fuyao.aicubes.cn/admin/' style='color: #4da6ff; text-decoration: underline;'>免费申请 API Key ↗</a>"
-        )
-        ths_hint.setStyleSheet("color: #888888; font-size: 12px;")
-        ths_hint.setWordWrap(True)
-        ths_hint.setOpenExternalLinks(True)
-        ths_layout.addWidget(ths_hint)
-
-        data_tab_layout.addWidget(ths_group)
         data_tab_layout.addStretch()
 
         # ============ 底部按钮布局(所有标签页共用) ============
@@ -1648,16 +1514,6 @@ class SettingsDialog(QDialog):
         scroll_area.setWidget(content_widget)
         return scroll_area
 
-    def browse_client(self):
-        """浏览选择客户端路径"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择miniQMT客户端程序",  # 更新这里的提示文字
-            self.client_path_edit.text(),
-            "可执行文件 (*.exe)"
-        )
-        if file_path:
-            self.client_path_edit.setText(file_path)
 
     def _toggle_token_visibility(self, checked: bool):
         """切换 token 明文/密文显示。"""
@@ -1666,47 +1522,6 @@ class SettingsDialog(QDialog):
         )
         self.tushare_token_toggle_btn.setText("隐藏" if checked else "显示")
 
-    def _toggle_ths_key_visibility(self, checked):
-        self.ths_api_key_edit.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
-        self.ths_key_toggle_btn.setText("隐藏" if checked else "显示")
-
-    def _test_ths_connection(self):
-        key = self.ths_api_key_edit.text().strip()
-        from duckdb_storage.ths_config import validate_ths_api_key
-        ok, msg = validate_ths_api_key(key)
-        if not ok:
-            QMessageBox.warning(self, "提示", f"请先输入有效的 API Key: {msg}")
-            return
-        self.ths_test_btn.setEnabled(False)
-        self.ths_test_btn.setText("测试中...")
-
-        class THSTestConnThread(QThread):
-            finished_signal = pyqtSignal(bool, str)
-            def __init__(self, k):
-                super().__init__()
-                self.k = k
-            def run(self):
-                from duckdb_storage.ths_importer import THSImporter
-                importer = THSImporter(api_key=self.k)
-                ok, res_msg = importer.test_connection()
-                self.finished_signal.emit(ok, res_msg)
-
-        def _on_done(ok, res_msg):
-            self.ths_test_btn.setEnabled(True)
-            self.ths_test_btn.setText("测试连接")
-            if ok:
-                QMessageBox.information(self, "连接成功", res_msg)
-            else:
-                QMessageBox.warning(self, "连接失败", res_msg)
-
-        self._ths_test_thread = THSTestConnThread(key)
-        self._ths_test_thread.finished_signal.connect(_on_done)
-        self._ths_test_thread.start()
-
-    def _open_ths_register_url(self):
-        """打开同花顺（扶摇）API Key 申请管理页面"""
-        from duckdb_storage.ths_config import FUYAO_ADMIN_URL
-        webbrowser.open(FUYAO_ADMIN_URL)
 
     @staticmethod
     def _normalize_url_text(url: str) -> str:
@@ -1769,88 +1584,6 @@ class SettingsDialog(QDialog):
         self._tushare_test_thread.finished_signal.connect(_on_done)
         self._tushare_test_thread.start()
 
-    def _on_history_source_combo_changed(self, index: int):
-        """当历史数据源切换时，动态更新测试按钮文本和状态提示"""
-        if not hasattr(self, 'probe_bridge_btn'):
-            return
-        self.probe_bridge_btn.setText("测试MiniQMT")
-        self.probe_bridge_btn.setToolTip("测试MiniQMT客户端运行及xtquant连接状态")
-        if hasattr(self, 'bridge_status_label'):
-            self.bridge_status_label.setText("")
-
-    def _on_probe_source_clicked(self):
-        """点击测试当前选中的历史数据补充源"""
-        if (
-            hasattr(self, 'history_source_combo')
-            and self.history_source_combo.currentData() == 'miniqmt'
-        ):
-            self._on_probe_miniqmt()
-        else:
-            self._on_probe_native_bridge()
-
-    def _on_probe_miniqmt(self):
-        """测试MiniQMT客户端与xtdata连接状态"""
-        try:
-            if sys.platform != 'win32':
-                self.bridge_status_label.setText("✗ 仅支持Windows")
-                self.bridge_status_label.setStyleSheet("color: #ff4d4f; font-weight: bold; margin-left: 10px;")
-                QMessageBox.warning(self, "不支持", "MiniQMT仅支持Windows操作系统。")
-                return
-
-            import psutil
-            miniqmt_running = False
-            for proc in psutil.process_iter(['name']):
-                try:
-                    if proc.info['name'] and proc.info['name'].lower() == "xtminiqmt.exe":
-                        miniqmt_running = True
-                        break
-                except Exception:
-                    pass
-
-            xtdata_ok = False
-            try:
-                from xtquant import xtdata
-                stock_list = xtdata.get_stock_list_in_sector('沪深A股')
-                if stock_list and len(stock_list) > 0:
-                    xtdata_ok = True
-            except Exception:
-                pass
-
-            if xtdata_ok:
-                self.bridge_status_label.setText("✓ MiniQMT已连接")
-                self.bridge_status_label.setStyleSheet("color: #52c41a; font-weight: bold; margin-left: 10px;")
-                QMessageBox.information(self, "连接成功", "MiniQMT (xtquant) 连接正常，可正常获取行情数据。")
-            elif miniqmt_running:
-                self.bridge_status_label.setText("! 客户端运行中但未就绪")
-                self.bridge_status_label.setStyleSheet("color: #faad14; font-weight: bold; margin-left: 10px;")
-                QMessageBox.warning(self, "未就绪", "检测到 MiniQMT 客户端进程正在运行，但 xtdata 接口尚未能成功获取数据，请确保已在 MiniQMT 中登录行情。")
-            else:
-                self.bridge_status_label.setText("✗ MiniQMT未启动")
-                self.bridge_status_label.setStyleSheet("color: #ff4d4f; font-weight: bold; margin-left: 10px;")
-                QMessageBox.warning(self, "未启动", "未检测到运行中的 MiniQMT 客户端进程。\n请先启动并登录 MiniQMT 客户端。")
-        except Exception as exc:
-            self.bridge_status_label.setText("✗ 探测失败")
-            self.bridge_status_label.setStyleSheet("color: #ff4d4f; font-weight: bold; margin-left: 10px;")
-            QMessageBox.warning(self, "探测异常", f"检测 MiniQMT 时发生异常: {exc}")
-
-    def _on_probe_native_bridge(self):
-        """测试大QMT原生桥连接状态"""
-        try:
-            from kh_qmt_native_bridge.detector import detect_native_bridge, BridgeState
-            probe = detect_native_bridge()
-            state_str = str(probe.state or "")
-            if probe.state in {BridgeState.READY, BridgeState.BUSY, "ready", "busy"}:
-                self.bridge_status_label.setText(f"✓ 已连接 (PID {probe.pid or '运行中'})")
-                self.bridge_status_label.setStyleSheet("color: #52c41a; font-weight: bold; margin-left: 10px;")
-                QMessageBox.information(self, "连接成功", f"大 QMT 原生桥正常运行中！\n状态: {state_str}\n进程 PID: {probe.pid or '已运行'}")
-            else:
-                self.bridge_status_label.setText(f"✗ 未就绪 ({state_str})")
-                self.bridge_status_label.setStyleSheet("color: #ff4d4f; font-weight: bold; margin-left: 10px;")
-                QMessageBox.warning(self, "未就绪", f"未检测到运行中的大 QMT 原生桥。\n当前状态: {state_str}\n请确认大 QMT 中已启动 KH_QMT_NATIVE_BRIDGE 策略。")
-        except Exception as exc:
-            self.bridge_status_label.setText("✗ 探测失败")
-            self.bridge_status_label.setStyleSheet("color: #ff4d4f; font-weight: bold; margin-left: 10px;")
-            QMessageBox.warning(self, "探测异常", f"检测原生桥时发生异常: {exc}")
 
     def _persist_ui_font_scale(self):
         """即时保存界面字号倍率，避免未点击保存时丢失"""
@@ -1872,14 +1605,6 @@ class SettingsDialog(QDialog):
     def save_settings(self):
         """保存设置"""
         try:
-            # 保存客户端路径
-            client_path = self.client_path_edit.text().strip()
-            if client_path and not os.path.exists(client_path):
-                QMessageBox.warning(self, "警告", "指定的客户端路径不存在")
-                return
-                
-            self.settings.setValue('client_path', client_path)
-            
             # 保存无风险收益率
             risk_free_rate = self.risk_free_rate_edit.text().strip()
             try:
@@ -1967,33 +1692,25 @@ class SettingsDialog(QDialog):
             account_type = self.account_type_selector.currentText()
             self.settings.setValue('account_type', account_type)
             
-            # 保存QMT路径
-            qmt_path = self.qmt_path_edit.text().strip()
-            self.settings.setValue('qmt_path', qmt_path)
-
-            # 保存回测数据源设置（按当前文本判断，兼容 macOS 仅 DuckDB 的情况）
-            data_source_text = self.data_source_combo.currentText()
-            data_source = 'duckdb' if 'DuckDB' in data_source_text else 'xtdata'
-            self.settings.setValue('backtest_data_source', data_source)
-
-            # 保存历史补数数据源设置并同步至全系统
-            history_source = None
-            if hasattr(self, 'history_source_combo'):
-                history_source = str(self.history_source_combo.currentData() or 'miniqmt')
-                self.settings.setValue('history_import_source', history_source)
-                try:
-                    from PyQt5.QtCore import QSettings
-                    history_settings = QSettings('KHQuant', 'HistoryImport')
-                    history_settings.setValue('history_import_source', history_source)
-                    history_settings.sync()
-                except Exception:
-                    pass
-
-            # 验证：如果选择DuckDB但未设置路径，阻止保存
+            # DuckDB 数据目录（开源版唯一的回测数据源）
             duckdb_path = self.duckdb_path_edit.text().strip()
-            if data_source == 'duckdb' and not duckdb_path:
-                QMessageBox.warning(self, "警告", "您选择了DuckDB作为回测数据源，但未设置DuckDB数据路径。\n请先点击「浏览」设置路径。")
+            if not duckdb_path:
+                QMessageBox.warning(self, "警告", "请先设置DuckDB数据路径。")
                 return
+            if (
+                os.path.normcase(os.path.abspath(duckdb_path))
+                != os.path.normcase(os.path.abspath(self._initial_duckdb_path or default_duckdb_dir()))
+                and may_be_shared_with_cs(duckdb_path)
+            ):
+                reply = QMessageBox.warning(
+                    self, "这个目录可能和 CS 共用",
+                    f"{duckdb_path}\n\n可能也在被看海量化 CS 版使用。{SHARED_WRITE_WARNING}\n"
+                    "在这个目录里导入、核验索引、WAL 修复都要逐次确认，策略里的 khDuckWrite 会拒绝写入。\n\n"
+                    "建议改用开源版自己的目录，并用「复制 CS 数据…」复制一份。仍然使用这个目录吗？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
             if duckdb_path:
                 try:
                     duckdb_path, created_duckdb_dir = self._normalize_and_create_duckdb_path(duckdb_path)
@@ -2013,27 +1730,10 @@ class SettingsDialog(QDialog):
                     return
 
             self.settings.setValue('duckdb_data_path', duckdb_path)
-
-            # 同步关键路径与数据源至 CLI settings (.khquant/settings.json)
+            self._initial_duckdb_path = duckdb_path
             try:
-                import kh_settings as _kh_settings
-                cli_cfg = _kh_settings.load()
-                if history_source is not None:
-                    cli_cfg["history_import_source"] = history_source
-                cli_cfg["backtest_data_source"] = data_source
-                if duckdb_path:
-                    cli_cfg["duckdb_data_path"] = duckdb_path
-                if qmt_path:
-                    cli_cfg["qmt_path"] = qmt_path
-                if hasattr(self, 'bigqmt_path_edit'):
-                    bigqmt_path = self.bigqmt_path_edit.text().strip()
-                    self.settings.setValue('qmt_native_python_dir', bigqmt_path)
-                    if bigqmt_path:
-                        cli_cfg["qmt_native_python_dir"] = bigqmt_path
-                    else:
-                        cli_cfg.pop("qmt_native_python_dir", None)
-                _kh_settings.save(cli_cfg)
-            except Exception:
+                claim_if_new(duckdb_path, "设置里选择的新目录")
+            except OSError:
                 pass
 
             # 保存回测性能设置（系统级，不写入 .kh）
@@ -2178,20 +1878,6 @@ class SettingsDialog(QDialog):
             self.tushare_proxy_url_edit.setText(proxy_url)
             self.settings.setValue('tushare_proxy_url', proxy_url)
 
-            # 保存同花顺 API Key
-            ths_key_plain = self.ths_api_key_edit.text().strip()
-            if ths_key_plain:
-                from duckdb_storage.ths_config import validate_ths_api_key, set_ths_api_key
-                key_ok, key_msg = validate_ths_api_key(ths_key_plain)
-                if not key_ok:
-                    QMessageBox.warning(self, "同花顺 API Key 无效", key_msg)
-                    self.ths_api_key_edit.setFocus()
-                    return
-                set_ths_api_key(ths_key_plain)
-            else:
-                from duckdb_storage.ths_config import set_ths_api_key
-                set_ths_api_key("")
-
             success_message = "设置已保存"
             if ui_scale_changed:
                 success_message += "（界面字号已更新，部分窗口需重新打开）"
@@ -2305,15 +1991,6 @@ class SettingsDialog(QDialog):
         ]
         return all(comparisons)
 
-    def _on_dynamic_load_changed(self, state):
-        """动态数据加载开关状态变化时的处理
-
-        Args:
-            state: 复选框状态（Qt.Checked 或 Qt.Unchecked）
-        """
-        enabled = state == Qt.Checked
-        self.chunk_size_edit.setEnabled(enabled)
-
     def on_volume_limit_toggled(self):
         """成交量限制开关切换"""
         enabled = self.volume_limit_checkbox.isChecked()
@@ -2329,69 +2006,29 @@ class SettingsDialog(QDialog):
         self.allow_partial_label.setStyleSheet(f"color: {label_color};")
 
     def open_feedback_page(self):
-        """打开反馈问题页面"""
-        url = "https://khsci.com/khQuant/suggestions.php"
+        """打开反馈问题页面（GitHub Issues）"""
+        url = "https://github.com/khscience/OSkhQuant/issues"
         webbrowser.open(url)
+
+    def _open_data_copy_dialog(self):
+        """复制 CS 数据到开源版目录；复制完成后把目录填进输入框（点保存才生效）。"""
+        from duckdb_storage.data_copy_dialog import DataCopyDialog
+
+        target = self.duckdb_path_edit.text().strip() or default_duckdb_dir()
+        dialog = DataCopyDialog(self, target_dir=target)
+        dialog.copied.connect(self.duckdb_path_edit.setText)
+        dialog.exec_()
         
     def update_stock_list(self):
         """更新股票列表"""
         update_stock_list_btn = self.findChild(QPushButton, "update_stock_list_btn")
         try:
-            # 1. 检查同花顺 API Key
-            from duckdb_storage.ths_config import get_ths_api_key, validate_ths_api_key, FUYAO_ADMIN_URL
-            if hasattr(self, 'ths_api_key_edit'):
-                current_ths_key = self.ths_api_key_edit.text().strip()
-            else:
-                current_ths_key = get_ths_api_key()
-
-            key_valid, _ = validate_ths_api_key(current_ths_key)
-
-            target_source = "ths"
-            if not key_valid:
-                # 弹窗提醒用户未配置同花顺 API Key
-                msg_box = QMessageBox(self)
-                msg_box.setWindowTitle("更新成分股列表 - 提示")
-                msg_box.setIcon(QMessageBox.Information)
-                msg_box.setText(
-                    "<b>更新成分股列表优先推荐使用同花顺（扶摇）接口。</b><br><br>"
-                    "检测到您当前尚未配置有效的<b>同花顺 API Key</b>。<br><br>"
-                    "• <b>退为使用 BaoStock</b>：无需密钥，更新 A 股与主要指数成分股（保留现有基金和转债）。<br>"
-                    "• <b>前往配置 API Key</b>：切换到数据设置并打开同花顺开放平台，免费申领配置 Key。<br>"
-                    "• <b>取消</b>：暂不执行更新。"
-                )
-                use_bs_btn = msg_box.addButton("退为使用 BaoStock", QMessageBox.ActionRole)
-                config_btn = msg_box.addButton("前往配置 API Key", QMessageBox.ActionRole)
-                cancel_btn = msg_box.addButton("取消", QMessageBox.RejectRole)
-                msg_box.setDefaultButton(use_bs_btn)
-
-                msg_box.exec_()
-                clicked_btn = msg_box.clickedButton()
-
-                if clicked_btn == cancel_btn:
-                    return
-                elif clicked_btn == config_btn:
-                    if hasattr(self, 'tab_widget'):
-                        self.tab_widget.setCurrentIndex(1)
-                    if hasattr(self, 'ths_api_key_edit'):
-                        self.ths_api_key_edit.setFocus()
-                    webbrowser.open(FUYAO_ADMIN_URL)
-                    return
-                elif clicked_btn == use_bs_btn:
-                    target_source = "baostock"
-            else:
-                target_source = "ths"
-
             # 禁用按钮
             if update_stock_list_btn:
                 update_stock_list_btn.setEnabled(False)
 
             # 创建进度对话框
-            initial_msg = (
-                "正在通过同花顺（扶摇）接口更新股票列表..."
-                if target_source == "ths"
-                else "正在通过 BaoStock 更新股票列表..."
-            )
-            self.progress_dialog = QProgressDialog(initial_msg, None, 0, 0, self)
+            self.progress_dialog = QProgressDialog("正在通过 BaoStock 更新股票列表...", None, 0, 0, self)
             self.progress_dialog.setWindowModality(Qt.WindowModal)
             self.progress_dialog.setCancelButton(None)
             self.progress_dialog.show()
@@ -2401,11 +2038,7 @@ class SettingsDialog(QDialog):
             data_dir = get_stock_pool_write_dir(create=True)
 
             # 获取更新管理器（多进程版本）
-            update_manager = get_and_save_stock_list(
-                data_dir,
-                preferred_source=target_source,
-                ths_api_key=current_ths_key,
-            )
+            update_manager = get_and_save_stock_list(data_dir, preferred_source="baostock")
 
             # 连接信号
             update_manager.progress.connect(self.show_update_progress)
@@ -2460,25 +2093,6 @@ class SettingsDialog(QDialog):
         if update_stock_list_btn:
             update_stock_list_btn.setEnabled(True)
 
-    def browse_qmt_path(self):
-        """浏览选择QMT路径"""
-        qmt_path = QFileDialog.getExistingDirectory(
-            self,
-            "选择QMT数据路径",
-            self.qmt_path_edit.text()
-        )
-        if qmt_path:
-            self.qmt_path_edit.setText(qmt_path)
-
-    def browse_bigqmt_path(self):
-        """浏览选择大QMT脚本或安装目录"""
-        path = QFileDialog.getExistingDirectory(
-            self,
-            "选择大QMT脚本或安装目录",
-            self.bigqmt_path_edit.text() if hasattr(self, 'bigqmt_path_edit') else ""
-        )
-        if path and hasattr(self, 'bigqmt_path_edit'):
-            self.bigqmt_path_edit.setText(path)
 
     def browse_duckdb_path(self):
         """浏览选择DuckDB数据路径"""

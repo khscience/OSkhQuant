@@ -146,28 +146,27 @@ class StockAnalysisWindow(QMainWindow):
     
     def _setup_dark_titlebar(self):
         """设置深色标题栏"""
-        if sys.platform == 'win32':
-            try:
-                from ctypes import windll, c_int, byref, sizeof
-                DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-                DWMWA_CAPTION_COLOR = 35
-                
-                windll.dwmapi.DwmSetWindowAttribute(
-                    int(self.winId()),
-                    DWMWA_USE_IMMERSIVE_DARK_MODE,
-                    byref(c_int(2)),
-                    sizeof(c_int)
-                )
-                
-                caption_color = c_int(0x2b2b2b)
-                windll.dwmapi.DwmSetWindowAttribute(
-                    int(self.winId()),
-                    DWMWA_CAPTION_COLOR,
-                    byref(caption_color),
-                    sizeof(caption_color)
-                )
-            except Exception as e:
-                print(f"设置标题栏深色模式失败: {str(e)}")
+        try:
+            from ctypes import windll, c_int, byref, sizeof
+            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+            DWMWA_CAPTION_COLOR = 35
+
+            windll.dwmapi.DwmSetWindowAttribute(
+                int(self.winId()),
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                byref(c_int(2)),
+                sizeof(c_int)
+            )
+
+            caption_color = c_int(0x2b2b2b)
+            windll.dwmapi.DwmSetWindowAttribute(
+                int(self.winId()),
+                DWMWA_CAPTION_COLOR,
+                byref(caption_color),
+                sizeof(caption_color)
+            )
+        except Exception as e:
+            print(f"设置标题栏深色模式失败: {str(e)}")
     
     def _load_icon(self):
         """加载窗口图标"""
@@ -1258,20 +1257,19 @@ class IntradayChartDialog(QDialog):
 
     def _setup_dark_titlebar(self):
         """设置深色标题栏"""
-        if sys.platform == 'win32':
-            try:
-                from ctypes import windll, c_int, byref, sizeof
-                DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-                DWMWA_CAPTION_COLOR = 35
-                windll.dwmapi.DwmSetWindowAttribute(
-                    int(self.winId()), DWMWA_USE_IMMERSIVE_DARK_MODE,
-                    byref(c_int(2)), sizeof(c_int))
-                caption_color = c_int(0x2b2b2b)
-                windll.dwmapi.DwmSetWindowAttribute(
-                    int(self.winId()), DWMWA_CAPTION_COLOR,
-                    byref(caption_color), sizeof(caption_color))
-            except:
-                pass
+        try:
+            from ctypes import windll, c_int, byref, sizeof
+            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+            DWMWA_CAPTION_COLOR = 35
+            windll.dwmapi.DwmSetWindowAttribute(
+                int(self.winId()), DWMWA_USE_IMMERSIVE_DARK_MODE,
+                byref(c_int(2)), sizeof(c_int))
+            caption_color = c_int(0x2b2b2b)
+            windll.dwmapi.DwmSetWindowAttribute(
+                int(self.winId()), DWMWA_CAPTION_COLOR,
+                byref(caption_color), sizeof(caption_color))
+        except:
+            pass
 
     def _init_ui(self):
         """初始化UI"""

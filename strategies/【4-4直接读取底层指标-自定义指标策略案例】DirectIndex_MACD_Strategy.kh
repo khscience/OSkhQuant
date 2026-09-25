@@ -1,14 +1,10 @@
 {
-    "system": {
-        "userdata_path": "D:/国金证券QMT交易端/userdata_mini"
-    },
     "run_mode": "backtest",
     "account": {
         "account_id": "",
         "account_type": "STOCK"
     },
     "strategy_file": "【4-4直接读取底层指标-自定义指标策略案例】DirectIndex_MACD_Strategy.py",
-    "data_mode": "single_quote",
     "backtest": {
         "start_time": "20240101",
         "end_time": "20251231",

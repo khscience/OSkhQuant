@@ -9,7 +9,7 @@ matplotlib.use('Qt5Agg')
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                           QLabel, QTabWidget, QTableWidget, QTableWidgetItem,
                           QGroupBox, QSplitter, QGridLayout, QHeaderView, QSizePolicy,
-                          QPushButton, QMessageBox)
+                          QPushButton, QMessageBox, QApplication)
 from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal, QTimer, QRect, QEvent
 from PyQt5.QtGui import QPalette, QColor, QIcon
 import matplotlib.pyplot as plt
@@ -274,7 +274,7 @@ class BacktestResultWindow(QMainWindow):
         self.font_scale = self.detect_screen_resolution()
 
         # 从设置读取无风险收益率和数据源配置
-        settings = KhQtSettings('KHQuant', 'StockAnalyzer')
+        settings = KhQtSettings()
         self.risk_free_rate = float(settings.value('risk_free_rate', '0.03'))
         print(f"使用无风险收益率: {self.risk_free_rate}")
 
@@ -285,32 +285,31 @@ class BacktestResultWindow(QMainWindow):
         self.price_decimals = 2
         
         # 设置窗口标题栏颜色（仅适用于Windows）
-        if sys.platform == 'win32':
-            try:
-                from ctypes import windll, c_int, byref, sizeof
-                
-                # 定义Windows API常量
-                DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-                DWMWA_CAPTION_COLOR = 35
-                
-                # 启用深色模式
-                windll.dwmapi.DwmSetWindowAttribute(
-                    int(self.winId()),
-                    DWMWA_USE_IMMERSIVE_DARK_MODE,
-                    byref(c_int(2)),  # 2表示启用
-                    sizeof(c_int)
-                )
-                
-                # 设置标题栏颜色
-                caption_color = c_int(0x333333)  # 使用与主界面相同的颜色
-                windll.dwmapi.DwmSetWindowAttribute(
-                    int(self.winId()),
-                    DWMWA_CAPTION_COLOR,
-                    byref(caption_color),
-                    sizeof(caption_color)
-                )
-            except Exception as e:
-                print(f"设置标题栏深色模式失败: {str(e)}")
+        try:
+            from ctypes import windll, c_int, byref, sizeof
+
+            # 定义Windows API常量
+            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+            DWMWA_CAPTION_COLOR = 35
+
+            # 启用深色模式
+            windll.dwmapi.DwmSetWindowAttribute(
+                int(self.winId()),
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                byref(c_int(2)),  # 2表示启用
+                sizeof(c_int)
+            )
+
+            # 设置标题栏颜色
+            caption_color = c_int(0x333333)  # 使用与主界面相同的颜色
+            windll.dwmapi.DwmSetWindowAttribute(
+                int(self.winId()),
+                DWMWA_CAPTION_COLOR,
+                byref(caption_color),
+                sizeof(caption_color)
+            )
+        except Exception as e:
+            print(f"设置标题栏深色模式失败: {str(e)}")
         
         # 设置窗口标题
         self.setWindowTitle("回测结果分析")
@@ -573,8 +572,6 @@ class BacktestResultWindow(QMainWindow):
         self.update()
 
     def apply_dark_titlebar(self, widget):
-        if sys.platform != 'win32':
-            return
         try:
             from ctypes import windll, c_int, byref, sizeof
             DWMWA_USE_IMMERSIVE_DARK_MODE = 20
@@ -595,6 +592,74 @@ class BacktestResultWindow(QMainWindow):
         except Exception:
             pass
 
+    def _benchmark_missing(self) -> bool:
+        """回测目录里的 benchmark.csv 缺失、为空或没有有效收盘价。"""
+        path = os.path.join(self.backtest_dir, "benchmark.csv")
+        if not os.path.exists(path):
+            return True
+        try:
+            frame = pd.read_csv(path, encoding='utf-8-sig')
+        except Exception:
+            return True
+        if frame.empty or 'close' not in frame.columns:
+            return True
+        return pd.to_numeric(frame['close'], errors='coerce').dropna().empty
+
+    def _update_benchmark_warning(self):
+        bar = getattr(self, 'benchmark_warning_bar', None)
+        if bar is None:
+            return
+        try:
+            bar.setVisible(self._benchmark_missing())
+        except Exception:
+            bar.setVisible(False)
+
+    def _open_benchmark_supplement(self):
+        """补基准数据：沪深300 直接用 BaoStock 补；其他基准引导到数据管理。"""
+        gui = None
+        for widget in QApplication.topLevelWidgets():
+            if hasattr(widget, 'open_duckdb_viewer') and hasattr(widget, '_ensure_duckdb_data_path'):
+                gui = widget
+                break
+        code = str(getattr(self, 'benchmark_code', '') or '000300.SH').strip().upper()
+        if gui is None:
+            QMessageBox.information(
+                self, "补基准数据",
+                f"请在主界面「数据管理 → BaoStock导入」里下载 {code} 的日线，然后重新运行回测。",
+            )
+            return
+        viewer_open = False
+        try:
+            viewer_open = bool(gui._duckdb_viewer_is_open())
+        except Exception:
+            viewer_open = False
+        if code != '000300.SH' or viewer_open:
+            QMessageBox.information(
+                self, "补基准数据",
+                f"请在「数据管理 → BaoStock导入」里用「手动输入」填 {code}，下载日线后重新运行回测。",
+            )
+            gui.open_duckdb_viewer()
+            return
+
+        data_dir = gui._ensure_duckdb_data_path()
+        if not data_dir:
+            QMessageBox.warning(self, "补基准数据", "请先在设置里配置 DuckDB 数据目录。")
+            return
+        from kh_data_dir_policy import SHARED_WRITE_WARNING, may_be_shared_with_cs
+        if may_be_shared_with_cs(data_dir):
+            reply = QMessageBox.question(
+                self, "数据目录可能和 CS 共用",
+                f"{data_dir}\n\n{SHARED_WRITE_WARNING}\n仍然往这个目录下载 000300.SH 吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        from kh_first_run import BenchmarkDownloadDialog
+        dialog = BenchmarkDownloadDialog(data_dir, gui)
+        gui._benchmark_dialog = dialog
+        if dialog.start():
+            dialog.show()
+
     def open_results_folder(self):
         try:
             backtest_dir = os.path.abspath(self.backtest_dir)
@@ -607,14 +672,7 @@ class BacktestResultWindow(QMainWindow):
                 msg_box.exec_()
                 return
 
-            if sys.platform == 'win32':
-                os.startfile(backtest_dir)
-            elif sys.platform == 'darwin':
-                import subprocess
-                subprocess.Popen(['open', backtest_dir])
-            else:
-                import subprocess
-                subprocess.Popen(['xdg-open', backtest_dir])
+            os.startfile(backtest_dir)
 
             file_descriptions = [
                 ("config.csv", "回测配置（策略名称、回测区间、初始资金、基准等）"),
@@ -655,49 +713,53 @@ class BacktestResultWindow(QMainWindow):
         main_layout.setSpacing(10)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_widget.setLayout(main_layout)
-        
+
+        # 缺少基准时的提示条（数据加载后按 benchmark.csv 判断是否显示）
+        self.benchmark_warning_bar = QWidget()
+        self.benchmark_warning_bar.setStyleSheet(
+            "QWidget { background-color: #4a3b1a; border-radius: 4px; }"
+            "QLabel { color: #f0c674; background: transparent; }"
+        )
+        warning_layout = QHBoxLayout(self.benchmark_warning_bar)
+        warning_layout.setContentsMargins(10, 6, 10, 6)
+        warning_label = QLabel(
+            "缺少基准指数数据，收益曲线里没有基准线，也不计算 α、β。补完基准数据后重新运行回测即可。"
+        )
+        warning_label.setWordWrap(True)
+        warning_layout.addWidget(warning_label, 1)
+        supplement_btn = QPushButton("补基准数据")
+        supplement_btn.setStyleSheet(
+            "QPushButton { background-color: #6b5420; color: #ffffff; border: none; "
+            "border-radius: 4px; padding: 4px 12px; }"
+            "QPushButton:hover { background-color: #7d6326; }"
+        )
+        supplement_btn.clicked.connect(self._open_benchmark_supplement)
+        warning_layout.addWidget(supplement_btn)
+        self.benchmark_warning_bar.setVisible(False)
+        main_layout.addWidget(self.benchmark_warning_bar)
+
         toolbar_layout = QHBoxLayout()
         toolbar_layout.setContentsMargins(0, 0, 0, 0)
         toolbar_layout.addStretch()
         self.export_results_btn = QPushButton("导出回测结果")
-        
-        # macOS 使用深灰色样式，Windows 使用蓝色样式
-        if sys.platform == 'darwin':
-            self.export_results_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: #505050;
-                    color: #e8e8e8;
-                    border: none;
-                    border-radius: {int(6 * self.font_scale)}px;
-                    padding: {int(6 * self.font_scale)}px {int(14 * self.font_scale)}px;
-                    font-size: {int(14 * self.font_scale)}px;
-                    font-weight: bold;
-                }}
-                QPushButton:hover {{
-                    background-color: #606060;
-                }}
-                QPushButton:pressed {{
-                    background-color: #404040;
-                }}
-            """)
-        else:
-            self.export_results_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: #0078d7;
-                    color: #ffffff;
-                    border: none;
-                    border-radius: {int(6 * self.font_scale)}px;
-                    padding: {int(6 * self.font_scale)}px {int(14 * self.font_scale)}px;
-                    font-size: {int(14 * self.font_scale)}px;
-                    font-weight: bold;
-                }}
-                QPushButton:hover {{
-                    background-color: #1a86d9;
-                }}
-                QPushButton:pressed {{
-                    background-color: #0063b1;
-                }}
-            """)
+
+        self.export_results_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #0078d7;
+                color: #ffffff;
+                border: none;
+                border-radius: {int(6 * self.font_scale)}px;
+                padding: {int(6 * self.font_scale)}px {int(14 * self.font_scale)}px;
+                font-size: {int(14 * self.font_scale)}px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: #1a86d9;
+            }}
+            QPushButton:pressed {{
+                background-color: #0063b1;
+            }}
+        """)
         self.export_results_btn.setMinimumHeight(int(30 * self.font_scale))
         self.export_results_btn.clicked.connect(self.open_results_folder)
         toolbar_layout.addWidget(self.export_results_btn)
@@ -1040,66 +1102,36 @@ class BacktestResultWindow(QMainWindow):
         self.last_valid_tab_index = 2  # 绩效分析的索引
 
         # 为个股分析标签设置不同的样式
-        if sys.platform == 'darwin':
-            tab_widget.tabBar().setStyleSheet(f"""
-                QTabBar::tab {{
-                    background-color: #404040;
-                    color: #e8e8e8;
-                    padding: {int(8 * self.font_scale)}px {int(16 * self.font_scale)}px;
-                    margin-right: 2px;
-                    border-top-left-radius: 4px;
-                    border-top-right-radius: 4px;
-                    font-size: {int(14 * self.font_scale)}px;
-                }}
-                QTabBar::tab:selected {{
-                    background-color: #333333;
-                    border-bottom: 2px solid #505050;
-                }}
-                QTabBar::tab:hover {{
-                    background-color: #505050;
-                }}
-                QTabBar::tab:last {{
-                    background-color: #505050;
-                    color: #e8e8e8;
-                    font-weight: bold;
-                    border: 1px solid #606060;
-                    border-bottom: none;
-                }}
-                QTabBar::tab:last:hover {{
-                    background-color: #606060;
-                }}
-            """)
-        else:
-            tab_widget.tabBar().setStyleSheet(f"""
-                QTabBar::tab {{
-                    background-color: #404040;
-                    color: #e8e8e8;
-                    padding: {int(8 * self.font_scale)}px {int(16 * self.font_scale)}px;
-                    margin-right: 2px;
-                    border-top-left-radius: 4px;
-                    border-top-right-radius: 4px;
-                    font-size: {int(14 * self.font_scale)}px;
-                }}
-                QTabBar::tab:selected {{
-                    background-color: #333333;
-                    border-bottom: 2px solid #007acc;
-                }}
-                QTabBar::tab:hover {{
-                    background-color: #505050;
-                }}
-                QTabBar::tab:last {{
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 #4a6fa5, stop:1 #3d5a80);
-                    color: #ffffff;
-                    font-weight: bold;
-                    border: 1px solid #5a7fb5;
-                    border-bottom: none;
-                }}
-                QTabBar::tab:last:hover {{
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                        stop:0 #5a8fc5, stop:1 #4d7aa0);
-                }}
-            """)
+        tab_widget.tabBar().setStyleSheet(f"""
+            QTabBar::tab {{
+                background-color: #404040;
+                color: #e8e8e8;
+                padding: {int(8 * self.font_scale)}px {int(16 * self.font_scale)}px;
+                margin-right: 2px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                font-size: {int(14 * self.font_scale)}px;
+            }}
+            QTabBar::tab:selected {{
+                background-color: #333333;
+                border-bottom: 2px solid #007acc;
+            }}
+            QTabBar::tab:hover {{
+                background-color: #505050;
+            }}
+            QTabBar::tab:last {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #4a6fa5, stop:1 #3d5a80);
+                color: #ffffff;
+                font-weight: bold;
+                border: 1px solid #5a7fb5;
+                border-bottom: none;
+            }}
+            QTabBar::tab:last:hover {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #5a8fc5, stop:1 #4d7aa0);
+            }}
+        """)
 
         # 连接标签切换信号
         tab_widget.currentChanged.connect(self._on_tab_changed)
@@ -1435,6 +1467,7 @@ class BacktestResultWindow(QMainWindow):
         self.benchmark_code = data['benchmark_code']
         self.benchmark_base_price = data.get('benchmark_base_price')
         self.benchmark_df = data['benchmark_df']
+        self._update_benchmark_warning()
 
         config_row = data['config_row']
         daily_stats_df = data['daily_stats_df']
@@ -1667,6 +1700,7 @@ class BacktestResultWindow(QMainWindow):
             print(f"使用基准合约代码: {self.benchmark_code}")
             self.benchmark_base_price = resolve_benchmark_base_price(benchmark_df, daily_stats_df)
             self.benchmark_df = benchmark_df
+            self._update_benchmark_warning()
 
             # 更新基本信息
             self.update_basic_info(config_df.iloc[0], daily_stats_df, benchmark_df)

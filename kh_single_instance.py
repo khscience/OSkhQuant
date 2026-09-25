@@ -82,14 +82,13 @@ def notify_already_running(
     title: str = APP_NAME,
 ):
     """在重型 GUI 导入前告知用户已有主程序，不结束任何现有进程。"""
-    if sys.platform == "win32":
-        try:
-            import ctypes
+    try:
+        import ctypes
 
-            ctypes.windll.user32.MessageBoxW(None, message, title, 0x40)
-            return
-        except Exception:
-            pass
+        ctypes.windll.user32.MessageBoxW(None, message, title, 0x40)
+        return
+    except Exception:
+        pass
     try:
         print(message, file=sys.stderr)
     except Exception:
