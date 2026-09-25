@@ -1,0 +1,54 @@
+name: 同步到 Gitee Release
+
+# GitHub 上的 Release 人工确认并发布后，手动运行本流程：
+# 从 GitHub Release 下载同一份安装包和校验和，上传到 Gitee，两边文件完全相同。
+# 需要在仓库 Secrets 里配置 GITEE_TOKEN（Gitee 私人令牌，只勾选 projects 权限）。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要同步的标签，例如 v2.2.0"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  gitee:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      GITEE_REPO: mrkanhai/oskhquant
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: 检查令牌
+        shell: pwsh
+        run: |
+          if (-not $env:GITEE_TOKEN) { throw "没有配置 GITEE_TOKEN" }
+      - name: 下载 GitHub Release 附件
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          gh release download $env:TAG --repo ${{ github.repository }} --dir release --pattern "*.exe" --pattern "SHA256SUMS.txt"
+          Get-ChildItem release | Format-Table Name, Length
+      - name: 创建 Gitee Release 并上传
+        shell: pwsh
+        run: |
+          $api = "https://gitee.com/api/v5/repos/$env:GITEE_REPO"
+          $release = Invoke-RestMethod -Method Post -Uri "$api/releases" -Body @{
+            access_token     = $env:GITEE_TOKEN
+            tag_name         = $env:TAG
+            name             = "看海量化回测平台（开源版） $env:TAG"
+            body             = "安装包与 GitHub Release 相同，校验见 SHA256SUMS.txt。更新内容见 CHANGELOG.md。"
+            target_commitish = "main"
+            prerelease       = "false"
+          }
+          foreach ($file in Get-ChildItem release) {
+            Write-Host "上传 $($file.Name)（$([math]::Round($file.Length / 1MB, 1)) MB）"
+            curl.exe --fail -sS -F "access_token=$env:GITEE_TOKEN" -F "file=@$($file.FullName)" `
+              "$api/releases/$($release.id)/attach_files"
+            if ($LASTEXITCODE -ne 0) {
+              throw "上传 $($file.Name) 失败（Gitee 对附件大小有限制，超限时请在 Release 说明里改放 GitHub 下载链接）"
+            }
+          }

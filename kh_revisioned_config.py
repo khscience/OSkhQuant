@@ -1,9 +1,5 @@
 # coding: utf-8
-"""通用配置文件的跨进程锁、revision 与 compare-and-swap。
-
-该模块属于主程序通用能力，不能依赖仅在私有 Windows 发行链路中安装的
-``kh_bigqmt_bridge``。大QMT桥接内部保留自己的 Python 3.6 兼容实现。
-"""
+"""通用配置文件的跨进程锁、revision 与 compare-and-swap。"""
 from __future__ import annotations
 
 import json

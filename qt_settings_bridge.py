@@ -3,7 +3,7 @@
 
 QSettings（HKCU\\Software\\KHQuant\\StockAnalyzerOS）只存窗口位置等界面状态；
 影响回测的设置写在 ~/.khquant_os/settings.json，是唯一真源。
-开源版绝不读写 CS 版的 ~/.khquant/settings.json 和 V2.1 / CS 的 QSettings。
+开源版绝不读写 CS 版的设置文件，也不读写 V2.1 / CS 的 QSettings。
 """
 from __future__ import annotations
 

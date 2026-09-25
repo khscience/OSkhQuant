@@ -1,0 +1,72 @@
+name: 构建安装包
+
+# 推送 v2.x.y 标签时构建安装包，并创建 GitHub 草稿 Release（人工确认后再发布）。
+# 附件用英文文件名：GitHub 会去掉附件名里的中文。
+on:
+  push:
+    tags: ["v2.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 安装依赖（锁定版本）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.lock -r requirements-build.lock pytest
+      - name: 核对版本号和标签
+        shell: pwsh
+        run: |
+          $version = python -c "from version import get_version; print(get_version())"
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "version.py 里的版本 $version 和标签 ${{ github.ref_name }} 不一致"
+          }
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+      - name: 运行测试
+        run: python -m pytest tests -q
+      - name: PyInstaller 打包
+        run: pyinstaller --noconfirm khQuant_inno.spec
+      - name: Inno Setup 生成安装包
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          & $iscc "/DMyAppVersion=$env:APP_VERSION" installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup 编译失败" }
+      - name: 生成校验和
+        shell: pwsh
+        run: |
+          $name = "khQuantOS_Setup_V$env:APP_VERSION.exe"
+          $hash = (Get-FileHash "Output\$name" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Out-File -Encoding ascii "Output\SHA256SUMS.txt"
+          Get-Content "Output\SHA256SUMS.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: khQuantOS-${{ env.APP_VERSION }}
+          path: |
+            Output/khQuantOS_Setup_V${{ env.APP_VERSION }}.exe
+            Output/SHA256SUMS.txt
+      - name: 创建 GitHub 草稿 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: 看海量化回测平台（开源版） ${{ github.ref_name }}
+          body: |
+            安装包：khQuantOS_Setup_V${{ env.APP_VERSION }}.exe（Windows 10/11 64 位）
+            校验：SHA256SUMS.txt
+            更新内容见 CHANGELOG.md；从 V2.1 升级请先看 docs/从V2.1迁移.md。
+          files: |
+            Output/khQuantOS_Setup_V${{ env.APP_VERSION }}.exe
+            Output/SHA256SUMS.txt

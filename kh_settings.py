@@ -1,7 +1,7 @@
 # coding: utf-8
 """全局配置管理 (~/.khquant_os/settings.json)
 
-开源版只读写自己的配置文件，绝不读写 CS 版的 ~/.khquant/settings.json。
+开源版只读写自己的配置文件，绝不读写 CS 版的设置文件。
 - 回测数据源固定为 DuckDB：旧配置里存的任何数据源名都按 duckdb 处理；
 - 读取时不回写文件，遇到不认识的旧键也不报错；
 - 性能预设相关函数与会影响成交的默认值（成交量限制、参与率、部分成交）
@@ -148,7 +148,7 @@ PERFORMANCE_PRESET_SETTING_MAP = {
 
 
 def normalize_data_source(value) -> str:
-    """开源版只读 DuckDB。旧配置里的 xtdata / miniqmt / qmt_native 等一律当作 duckdb。"""
+    """开源版只读 DuckDB。旧配置里的其他数据源名（如 xtdata、miniqmt）一律当作 duckdb。"""
     return "duckdb"
 
 
