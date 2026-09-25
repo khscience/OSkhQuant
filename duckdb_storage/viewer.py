@@ -37,6 +37,9 @@ from tushare_config import load_tushare_settings
 from duckdb_storage.lock_retry import is_duckdb_lock_error, parse_duckdb_lock_error
 from duckdb_storage.lock_diagnostics import inspect_process_identity
 from duckdb_storage.lock_diagnostics_dialog import DatabaseOccupancyDialog
+from kh_data_dir_policy import (
+    claim_if_new, mark_os_owned, may_be_shared_with_cs, shared_dir_write_message,
+)
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -1054,6 +1057,17 @@ class DuckDBViewer(QMainWindow):
         self.progress_bar.setVisible(False)
         self.statusBar.addPermanentWidget(self.progress_bar)
 
+        self.baostock_usage_label = QLabel("")
+        self.baostock_usage_label.setToolTip(
+            "BaoStock 当天已用的请求次数（软件每天最多用 3 万次，按数据目录分别计数）。\n"
+            "增量下载前复权数据会把本地整段历史重新拉一遍，全市场只更新日线约需 1.5 万次。"
+        )
+        self.statusBar.addPermanentWidget(self.baostock_usage_label)
+        self._baostock_usage_timer = QTimer(self)
+        self._baostock_usage_timer.setInterval(15000)
+        self._baostock_usage_timer.timeout.connect(self._refresh_baostock_usage_label)
+        self._baostock_usage_timer.start()
+
         self.statusBar.showMessage("就绪")
 
         # 在界面构建完成后统一应用缩放，避免后续样式覆盖字号设置
@@ -1079,6 +1093,11 @@ class DuckDBViewer(QMainWindow):
         tushare_action.setToolTip("使用 Tushare 接口下载日线、1分钟、5分钟行情（需在软件设置中配置Token，分钟数据需要相应权限）")
         tushare_action.triggered.connect(self.show_tushare_import_dialog)
         toolbar.addAction(tushare_action)
+
+        copy_cs_action = QAction("复制CS数据", self)
+        copy_cs_action.setToolTip("把看海量化 CS 版的数据复制一份给开源版用，之后两边各用各的目录，互不锁库")
+        copy_cs_action.triggered.connect(self.show_data_copy_dialog)
+        toolbar.addAction(copy_cs_action)
 
         toolbar.addSeparator()
 
@@ -1424,6 +1443,10 @@ class DuckDBViewer(QMainWindow):
         if os.path.exists(metadata_path):
             return False
 
+        try:
+            claim_if_new(path, "数据管理初始化空目录")
+        except OSError as exc:
+            logging.warning(f"登记开源版数据目录失败: {exc}")
         DuckDBManager.close_read_only_instances(path)
         init_manager = DuckDBManager(data_root=path, read_only=False)
         try:
@@ -1479,6 +1502,100 @@ class DuckDBViewer(QMainWindow):
             pass
         return True
 
+    def _confirm_shared_cs_write(self, operation_name: str) -> bool:
+        """数据目录可能和 CS 共用时，每次写操作前都让用户确认。
+
+        返回 True 表示可以继续。OS 自己的目录不询问；还没有数据的新目录会
+        顺手登记为 OS 的目录。用户选择「这不是 CS 的目录」后补上标记，以后
+        不再询问。
+        """
+        root = getattr(self, "data_root", None)
+        if not root:
+            return True
+        try:
+            if not may_be_shared_with_cs(root):
+                claim_if_new(root, "数据管理首次写入")
+                return True
+        except OSError as exc:
+            logging.warning(f"判断数据目录归属失败: {exc}")
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("数据目录可能和 CS 共用")
+        box.setText(shared_dir_write_message(root, operation_name))
+        box.setInformativeText(
+            "建议给开源版单独用一个目录：点工具栏「复制CS数据」，把 CS 的数据复制一份过去。"
+        )
+        continue_btn = box.addButton("仍然继续（仅这一次）", QMessageBox.AcceptRole)
+        not_cs_btn = box.addButton("这不是 CS 的目录，以后不再询问", QMessageBox.ActionRole)
+        cancel_btn = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is not_cs_btn:
+            try:
+                mark_os_owned(root, "用户确认不是 CS 的目录")
+            except OSError as exc:
+                QMessageBox.warning(self, "无法记录", f"写入目录标记失败：{exc}")
+                return False
+            return True
+        return clicked is continue_btn
+
+    def _refresh_baostock_usage_label(self):
+        label = getattr(self, "baostock_usage_label", None)
+        if label is None:
+            return
+        root = getattr(self, "data_root", None)
+        if not root or not os.path.isdir(root):
+            label.setText("")
+            return
+        try:
+            tracker = get_baostock_request_tracker(root)
+            label.setText(f"BaoStock 今日已用 {tracker.get_count()}/{tracker.display_limit} 次")
+        except Exception:
+            label.setText("")
+
+    def show_data_copy_dialog(self):
+        """打开「复制 CS 数据」对话框；复制完成后可切换到新目录。"""
+        from duckdb_storage.data_copy_dialog import DataCopyDialog
+
+        existing = getattr(self, "data_copy_dialog", None)
+        if existing is not None:
+            try:
+                existing.show()
+                existing.raise_()
+                existing.activateWindow()
+                return
+            except RuntimeError:
+                self.data_copy_dialog = None
+        source = ""
+        root = getattr(self, "data_root", None)
+        if root and may_be_shared_with_cs(root):
+            source = root
+        dialog = DataCopyDialog(self, source_dir=source)
+        dialog.copied.connect(self._on_data_copied)
+        dialog.finished.connect(lambda _code=0: setattr(self, "data_copy_dialog", None))
+        self.data_copy_dialog = dialog
+        dialog.show()
+
+    def _on_data_copied(self, target: str):
+        reply = QMessageBox.question(
+            self,
+            "改用复制出来的目录",
+            f"数据已复制到：\n{target}\n\n要把开源版的数据目录改成它，并在这里打开吗？"
+            "\n（回测和数据管理以后都用这个目录，不再碰 CS 的目录。）",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            import kh_settings
+            kh_settings.set_value("duckdb_data_path", target)
+        except Exception as exc:
+            QMessageBox.warning(self, "保存设置失败", f"没能把数据目录写进设置：{exc}\n请到「设置 → 数据设置」里手动修改。")
+        self.load_data_root(target)
+
     def _request_writable_manager(self, operation_name: str = "执行写操作"):
         """为 GUI 写入口统一申请写连接，并处理跨进程 DuckDB 占用。
 
@@ -1486,6 +1603,8 @@ class DuckDBViewer(QMainWindow):
         只有用户在弹窗中明确确认后才会结束外部占用进程。
         """
         if DuckDBViewer._reject_while_reindex_active(self, operation_name):
+            return None
+        if not self._confirm_shared_cs_write(operation_name):
             return None
         try:
             return self._ensure_writable_manager()
@@ -1630,6 +1749,7 @@ class DuckDBViewer(QMainWindow):
             # 刷新股票列表
             self.refresh_stock_list()
 
+            self._refresh_baostock_usage_label()
             mode_text = "只读浏览" if read_only else "读写管理"
             if initialized_empty_dir:
                 self.statusBar.showMessage(f"已初始化空DuckDB目录并加载({mode_text}): {path}")
@@ -2226,6 +2346,8 @@ class DuckDBViewer(QMainWindow):
             return
         if not self.manager:
             QMessageBox.warning(self, "提示", "请先加载数据目录")
+            return
+        if not self._confirm_shared_cs_write("WAL 修复"):
             return
 
         confirm = QMessageBox.question(
@@ -4758,6 +4880,13 @@ class BaoStockImportDialog(QDialog):
         self.period_5m_end.setDate(today)
         period_layout.addWidget(self.period_5m_end, 1, 4)
 
+        self.warmup_hint_label = QLabel(
+            "提示：开始日期要早于回测开始日期，给均线、MACD 等指标留出预热期（例如用 60 日均线，至少往前多下 3 个月）。BaoStock 只有日线和 5 分钟线，没有 1 分钟和 Tick。"
+        )
+        self.warmup_hint_label.setWordWrap(True)
+        self.warmup_hint_label.setStyleSheet("color: #8a5a00;")
+        period_layout.addWidget(self.warmup_hint_label, 2, 0, 1, 5)
+
         layout.addWidget(period_group)
 
         adjustment_group = QGroupBox("价格字段（原始价必存，复权价可选）")
@@ -6444,6 +6573,13 @@ class TushareImportDialog(QDialog):
         self.period_5m_end.setCalendarPopup(True)
         self.period_5m_end.setDate(today)
         period_layout.addWidget(self.period_5m_end, 2, 4)
+
+        self.warmup_hint_label = QLabel(
+            "提示：开始日期要早于回测开始日期，给均线、MACD 等指标留出预热期（例如用 60 日均线，至少往前多下 3 个月）。1 分钟线需要 Tushare 的 stk_mins 权限；指数只有日线。"
+        )
+        self.warmup_hint_label.setWordWrap(True)
+        self.warmup_hint_label.setStyleSheet("color: #8a5a00;")
+        period_layout.addWidget(self.warmup_hint_label, 3, 0, 1, 5)
 
         layout.addWidget(period_group)
 

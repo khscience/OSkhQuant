@@ -2916,6 +2916,7 @@ def khDuckWrite(
         - 缺字段时自动 ALTER TABLE 添加
         - 默认仅更新已有 time 记录，避免插入空行
         - 可选插入不存在的 time 记录
+        - 开源版：数据目录可能和 CS 共用时拒绝写入（SharedDataDirWriteRefused）
 
     参数:
         stock_list: 股票代码或列表，支持 '000001.SZ' / 'sz.000001' 等格式
@@ -2966,6 +2967,20 @@ def khDuckWrite(
         fields_list = [fields]
     else:
         fields_list = list(fields)
+
+    # 开源版：目录可能和 CS 共用时拒绝写入（必须在打开写连接之前判断）
+    guard_root = duckdb_path
+    if not guard_root:
+        try:
+            from duckdb_storage.manager import DuckDBManager as _GuardManager
+            _existing = getattr(_GuardManager, "_instance", None)
+            if _existing is not None and getattr(_existing, "_initialized", False):
+                guard_root = getattr(_existing, "data_root", None)
+        except Exception:
+            guard_root = None
+    if guard_root:
+        from kh_data_dir_policy import refuse_strategy_write_if_shared
+        refuse_strategy_write_if_shared(guard_root)
 
     try:
         from duckdb_storage.manager import DuckDBManager
