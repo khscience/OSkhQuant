@@ -1,10 +1,10 @@
 name: 构建安装包
 
-# 推送 v2.x.y 标签时构建安装包，并创建 GitHub 草稿 Release（人工确认后再发布）。
+# 推送 V2.x.y 标签（沿用 V2.1.4 的大写 V）时构建安装包，并创建 GitHub 草稿 Release（人工确认后再发布）。
 # 附件用英文文件名：GitHub 会去掉附件名里的中文。
 on:
   push:
-    tags: ["v2.*"]
+    tags: ["V2.*", "v2.*"]
 
 permissions:
   contents: write
@@ -28,7 +28,7 @@ jobs:
         shell: pwsh
         run: |
           $version = python -c "from version import get_version; print(get_version())"
-          if ("v$version" -ne "${{ github.ref_name }}") {
+          if ("${{ github.ref_name }}".TrimStart("vV") -cne $version) {
             throw "version.py 里的版本 $version 和标签 ${{ github.ref_name }} 不一致"
           }
           "APP_VERSION=$version" >> $env:GITHUB_ENV

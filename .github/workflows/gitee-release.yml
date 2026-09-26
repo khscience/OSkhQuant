@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "要同步的标签，例如 v2.2.0"
+        description: "要同步的标签，例如 V2.2.0"
         required: true
 
 permissions:
