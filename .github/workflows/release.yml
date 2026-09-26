@@ -28,7 +28,7 @@ jobs:
         shell: pwsh
         run: |
           $version = python -c "from version import get_version; print(get_version())"
-          if ("${{ github.ref_name }}".TrimStart("vV") -cne $version) {
+          if (("${{ github.ref_name }}" -replace "^[vV]", "") -cne $version) {
             throw "version.py 里的版本 $version 和标签 ${{ github.ref_name }} 不一致"
           }
           "APP_VERSION=$version" >> $env:GITHUB_ENV
