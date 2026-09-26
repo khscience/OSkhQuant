@@ -32,7 +32,7 @@ from PyQt5.QtGui import QFont, QIcon, QColor, QPixmap, QPainter, QFontMetrics, Q
 from PyQt5 import sip
 from khPathUtils import get_stock_pool_path
 from khUiScale import get_ui_font_scale, get_preferred_ui_font_family, install_wheel_guard
-from security_type_utils import split_security_code
+from security_type_utils import is_listed_fund_code, split_security_code
 from tushare_config import load_tushare_settings
 from duckdb_storage.lock_retry import is_duckdb_lock_error, parse_duckdb_lock_error
 from duckdb_storage.lock_diagnostics import inspect_process_identity
@@ -1058,6 +1058,7 @@ class DuckDBViewer(QMainWindow):
         self.statusBar.addPermanentWidget(self.progress_bar)
 
         self.baostock_usage_label = QLabel("")
+        self.baostock_usage_label.setStyleSheet("padding-left: 12px; border-left: 1px solid #555555;")
         self.baostock_usage_label.setToolTip(
             "BaoStock 当天已用的请求次数（软件每天最多用 3 万次，按数据目录分别计数）。\n"
             "增量下载前复权数据会把本地整段历史重新拉一遍，全市场只更新日线约需 1.5 万次。"
@@ -2845,6 +2846,14 @@ def fit_dialog_height_to_content(dialog, tab_widget=None, max_height=1200):
             dialog.move(dialog.x(), max(available.top(), available.bottom() - frame.height()))
     except Exception:
         pass
+
+
+def _baostock_unsupported_code(stock_code: str) -> bool:
+    """BaoStock 只提供 A 股股票和指数，场内基金（ETF / LOF 等）和可转债都返回空。"""
+    if is_listed_fund_code(stock_code):
+        return True
+    code, market = split_security_code(stock_code)
+    return (market == "SH" and code.startswith("11")) or (market == "SZ" and code.startswith("12"))
 
 
 class BaoStockRequestTracker:
@@ -4806,10 +4815,7 @@ class BaoStockImportDialog(QDialog):
             ('中证500', 'zz500'),
             ('创业板', 'cyb'),
             ('科创板', 'kcb'),
-            ('沪深ETF', 'hs_etf'),
-            ('沪深场内基金（含ETF/LOF）', 'hs_fund'),
-            ('沪深转债', 'hs_convertible_bonds'),
-            ('T0型ETF', 't0_etf'),
+            # BaoStock 不提供 ETF / LOF 等场内基金和可转债行情，这几个预设放在 Tushare 导入里
             ('常用指数', 'common_index'),
         ]
         for i, (name, key) in enumerate(presets):
@@ -4881,7 +4887,7 @@ class BaoStockImportDialog(QDialog):
         period_layout.addWidget(self.period_5m_end, 1, 4)
 
         self.warmup_hint_label = QLabel(
-            "提示：开始日期要早于回测开始日期，给均线、MACD 等指标留出预热期（例如用 60 日均线，至少往前多下 3 个月）。BaoStock 只有日线和 5 分钟线，没有 1 分钟和 Tick。"
+            "提示：开始日期要早于回测开始日期，给均线、MACD 等指标留出预热期（例如用 60 日均线，至少往前多下 3 个月）。BaoStock 只有股票和指数的日线、5 分钟线，没有 1 分钟、Tick，也不提供 ETF / LOF 等场内基金和可转债（请用 Tushare）。"
         )
         self.warmup_hint_label.setWordWrap(True)
         self.warmup_hint_label.setStyleSheet("color: #8a5a00;")
@@ -5032,10 +5038,7 @@ class BaoStockImportDialog(QDialog):
             ('中证500', 'zz500'),
             ('创业板', 'cyb'),
             ('科创板', 'kcb'),
-            ('沪深ETF', 'hs_etf'),
-            ('沪深场内基金（含ETF/LOF）', 'hs_fund'),
-            ('沪深转债', 'hs_convertible_bonds'),
-            ('T0型ETF', 't0_etf'),
+            # BaoStock 不提供 ETF / LOF 等场内基金和可转债行情，这几个预设放在 Tushare 导入里
             ('常用指数', 'common_index'),
         ]
         for i, (name, key) in enumerate(presets):
@@ -5355,6 +5358,25 @@ class BaoStockImportDialog(QDialog):
                 self.start_btn.setEnabled(True)
                 self.stop_btn.setEnabled(False)
                 return
+            # BaoStock 只提供 A 股股票和指数：ETF / LOF 等场内基金和可转债的请求都返回空，
+            # 先跳过，免得白白消耗请求次数
+            skipped = [code for code in stocks if _baostock_unsupported_code(code)]
+            if skipped:
+                stocks = [code for code in stocks if not _baostock_unsupported_code(code)]
+                preview = "、".join(skipped[:5]) + ("等" if len(skipped) > 5 else "")
+                self.log(
+                    f"BaoStock 不提供 ETF、LOF 等场内基金和可转债行情，已跳过 {len(skipped)} 个：{preview}。"
+                    "这类标的请用「Tushare导入」下载（基金需要 fund_daily 权限）。"
+                )
+                if not stocks:
+                    QMessageBox.information(
+                        self, "提示",
+                        "所选标的都是场内基金（ETF / LOF 等）或可转债，BaoStock 不提供这类行情。\n"
+                        "请改用「Tushare导入」下载。",
+                    )
+                    self.start_btn.setEnabled(True)
+                    self.stop_btn.setEnabled(False)
+                    return
             periods_config = self.get_periods_config()
             if not periods_config:
                 QMessageBox.warning(self, "提示", "请至少选择一个数据周期")
@@ -6575,7 +6597,7 @@ class TushareImportDialog(QDialog):
         period_layout.addWidget(self.period_5m_end, 2, 4)
 
         self.warmup_hint_label = QLabel(
-            "提示：开始日期要早于回测开始日期，给均线、MACD 等指标留出预热期（例如用 60 日均线，至少往前多下 3 个月）。1 分钟线需要 Tushare 的 stk_mins 权限；指数只有日线。"
+            "提示：开始日期要早于回测开始日期，给均线、MACD 等指标留出预热期（例如用 60 日均线，至少往前多下 3 个月）。1 分钟线需要 Tushare 的 stk_mins 权限，ETF 等场内基金需要 fund_daily 权限；指数只有日线。"
         )
         self.warmup_hint_label.setWordWrap(True)
         self.warmup_hint_label.setStyleSheet("color: #8a5a00;")

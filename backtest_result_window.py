@@ -437,8 +437,8 @@ class BacktestResultWindow(QMainWindow):
     def load_icon(self):
         """加载窗口图标"""
         try:
-            # 首先尝试直接加载相对路径
-            icon_path = "./icons/stock_icon.png"
+            # 图标随程序文件一起分发（打包版在 _internal\\icons）
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons", "stock_icon.png")
             
             if os.path.exists(icon_path):
                 self.setWindowIcon(QIcon(icon_path))
@@ -716,21 +716,24 @@ class BacktestResultWindow(QMainWindow):
 
         # 缺少基准时的提示条（数据加载后按 benchmark.csv 判断是否显示）
         self.benchmark_warning_bar = QWidget()
+        warning_font_px = int(14 * self.font_scale)
         self.benchmark_warning_bar.setStyleSheet(
             "QWidget { background-color: #4a3b1a; border-radius: 4px; }"
-            "QLabel { color: #f0c674; background: transparent; }"
+            f"QLabel {{ color: #f0c674; background: transparent; font-size: {warning_font_px}px; }}"
+            f"QPushButton {{ font-size: {warning_font_px}px; }}"
         )
         warning_layout = QHBoxLayout(self.benchmark_warning_bar)
         warning_layout.setContentsMargins(10, 6, 10, 6)
         warning_label = QLabel(
-            "缺少基准指数数据，收益曲线里没有基准线，也不计算 α、β。补完基准数据后重新运行回测即可。"
+            "缺少基准指数数据：收益曲线里的基准线是一条平线，α、β 和基准收益没有参考意义。"
+            "补完基准数据后重新运行回测即可。"
         )
         warning_label.setWordWrap(True)
         warning_layout.addWidget(warning_label, 1)
         supplement_btn = QPushButton("补基准数据")
         supplement_btn.setStyleSheet(
             "QPushButton { background-color: #6b5420; color: #ffffff; border: none; "
-            "border-radius: 4px; padding: 4px 12px; }"
+            f"border-radius: 4px; padding: 4px 12px; font-size: {warning_font_px}px; }}"
             "QPushButton:hover { background-color: #7d6326; }"
         )
         supplement_btn.clicked.connect(self._open_benchmark_supplement)

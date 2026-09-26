@@ -35,6 +35,11 @@ def default_pack_root(repo_root: Optional[Path] = None) -> Path:
         cache_home = os.environ.get("XDG_CACHE_HOME")
         base = Path(cache_home).expanduser() if cache_home else Path.home() / ".cache"
         return base / "khquant" / "parquet_cache_pack"
+    if repo_root is None and getattr(sys, "frozen", False):
+        # 打包版安装目录对普通用户不可写，缓存放到 %LOCALAPPDATA%\\KhQuantOS\\temp
+        from kh_app_identity import local_appdata_dir
+
+        return Path(local_appdata_dir("temp", "parquet_cache_pack"))
     root = repo_root or Path(__file__).resolve().parents[1]
     return Path(root) / "temp" / "parquet_cache_pack"
 

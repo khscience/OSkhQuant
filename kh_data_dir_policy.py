@@ -26,7 +26,7 @@ OS_MARKER_NAME = ".khquant_os_data.json"
 CS_DEFAULT_DATA_DIRS = (r"D:\khData",)
 MARKET_DIRS = ("SH", "SZ", "BJ")
 
-SHARED_WRITE_WARNING = "OS 回测和数据管理期间，CS 的补数和实盘策略可能读写失败。"
+SHARED_WRITE_WARNING = "开源版回测和数据管理期间，CS 的补数和实盘策略可能读写失败。"
 
 
 class SharedDataDirWriteRefused(PermissionError):
@@ -136,9 +136,17 @@ def claim_if_new(path, reason: str = "OS 首次写入") -> bool:
     return True
 
 
+def _short_path(path, limit: int = 60) -> str:
+    """路径太长时中间用省略号截短（路径没有空格，对话框里没法自动换行）。"""
+    text = str(path)
+    if len(text) <= limit:
+        return text
+    return text[: limit // 2 - 2] + "…" + text[-(limit // 2 - 1):]
+
+
 def shared_dir_write_message(path, operation: str) -> str:
     return (
-        f"当前数据目录 {path} 可能也在被看海量化 CS 版使用。\n\n"
+        f"当前数据目录可能也在被看海量化 CS 版使用：\n{_short_path(path)}\n\n"
         f"{SHARED_WRITE_WARNING}\n"
         f"「{operation}」会以写方式打开这个目录里的数据库，期间 CS 无法读写这些库。"
     )

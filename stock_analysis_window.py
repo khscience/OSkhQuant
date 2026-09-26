@@ -171,7 +171,7 @@ class StockAnalysisWindow(QMainWindow):
     def _load_icon(self):
         """加载窗口图标"""
         try:
-            icon_path = "./icons/stock_icon.png"
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons", "stock_icon.png")
             if os.path.exists(icon_path):
                 self.setWindowIcon(QIcon(icon_path))
         except:

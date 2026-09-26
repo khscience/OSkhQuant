@@ -3409,8 +3409,8 @@ class KhQuantGUI(QMainWindow):
             
             # 更新并保存配置到临时文件
             try:
-                # 确保配置目录存在
-                config_dir = os.path.join(os.path.dirname(__file__), "configs")
+                # 确保配置目录存在：%LOCALAPPDATA%\\KhQuantOS\\configs（安装目录对普通用户不可写）
+                config_dir = local_appdata_dir("configs")
                 os.makedirs(config_dir, exist_ok=True)
                 
                 # 创建临时配置文件，使用固定名称而不是时间戳
@@ -5022,7 +5022,7 @@ class KhQuantGUI(QMainWindow):
             file_name, _ = QFileDialog.getSaveFileName(
                 self,
                 "保存日志",
-                os.path.join(os.path.dirname(__file__), "logs", f"log_{int(time.time())}.txt"),
+                os.path.join(LOGS_DIR, f"log_{int(time.time())}.txt"),
                 "Text Files (*.txt);;All Files (*)"
             )
             
@@ -7475,8 +7475,25 @@ class _DarkTitleBarFilter(QObject):
         return False
 
 
+def use_writable_work_dir():
+    """打包版把当前目录切到 %LOCALAPPDATA%\KhQuantOS。
+
+    从开始菜单启动时当前目录是安装目录，普通用户不可写；内核里按当前目录写的
+    临时文件（DuckDB 溢写目录 temp、默认数据目录 ./stock_data）才不会写失败。
+    """
+    if not _IS_FROZEN_RUNTIME:
+        return
+    try:
+        work_dir = local_appdata_dir()
+        os.makedirs(work_dir, exist_ok=True)
+        os.chdir(work_dir)
+    except OSError as exc:
+        logging.warning(f"切换工作目录失败，继续使用当前目录: {exc}")
+
+
 def main():
     try:
+        use_writable_work_dir()
         force_primary_screen_dpi()
         app = QApplication(sys.argv)
 

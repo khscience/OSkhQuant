@@ -916,8 +916,8 @@ class SettingsDialog(QDialog):
         path_layout.addWidget(duckdb_desc)
 
         copy_cs_button = QPushButton("复制 CS 数据…")
-        copy_cs_button.setFixedWidth(140)
         copy_cs_button.setStyleSheet(duckdb_browse_button.styleSheet())
+        copy_cs_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         copy_cs_button.setToolTip("把看海量化 CS 版的数据复制一份到开源版的目录，之后两边互不锁库")
         copy_cs_button.clicked.connect(self._open_data_copy_dialog)
         path_layout.addWidget(copy_cs_button, 0, Qt.AlignLeft)
