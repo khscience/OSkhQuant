@@ -53,7 +53,8 @@ jobs:
         run: |
           $name = "khQuantOS_Setup_V$env:APP_VERSION.exe"
           $hash = (Get-FileHash "Output\$name" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $name" | Out-File -Encoding ascii "Output\SHA256SUMS.txt"
+          # LF 换行，Linux / Git Bash 的 sha256sum -c 才能直接核对
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) "Output\SHA256SUMS.txt"), "$hash  $name`n")
           Get-Content "Output\SHA256SUMS.txt"
       - uses: actions/upload-artifact@v4
         with:
