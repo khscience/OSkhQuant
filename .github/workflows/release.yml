@@ -36,6 +36,9 @@ jobs:
         run: python -m pytest tests -q
       - name: PyInstaller 打包
         run: pyinstaller --noconfirm khQuant_inno.spec
+      - name: 打包版冒烟测试
+        shell: pwsh
+        run: ./packaging/smoke_test.ps1
       - name: Inno Setup 生成安装包
         shell: pwsh
         run: |
