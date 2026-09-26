@@ -1,5 +1,5 @@
 # coding: utf-8
-"""Shared path helpers for strategy/config files.
+r"""Shared path helpers for strategy/config files.
 
 开源版的用户目录全部取自 kh_app_identity（%LOCALAPPDATA%\KhQuantOS 等），
 与 CS 版的 KhQuant 目录互不影响。
@@ -252,7 +252,7 @@ def _local_appdata_backtest_dir() -> str:
 
 
 def get_backtest_results_dir(create: bool = True) -> str:
-    """Return the primary backtest result directory.
+    r"""Return the primary backtest result directory.
 
     打包版写到 %LOCALAPPDATA%\KhQuantOS\backtest_results，普通用户无需写入
     Program Files；源码模式沿用项目目录下的 backtest_results。

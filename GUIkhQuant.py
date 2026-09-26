@@ -6865,6 +6865,11 @@ class KhQuantGUI(QMainWindow):
 
     def _suggest_download_if_empty(self, data_dir):
         """数据目录里除了基准以外没有行情库时，引导用户去数据管理下载。"""
+        # 基准在后台下载，下完时「复制 V2.1 的策略」等对话框可能还开着。新提示框会
+        # 叠在同一位置，用户正要点下面那个框时容易误点，所以等它们关掉再问。
+        if QApplication.activeModalWidget() is not None:
+            QTimer.singleShot(1000, lambda: self._suggest_download_if_empty(data_dir))
+            return
         stock_dbs = 0
         for market in ('SH', 'SZ', 'BJ'):
             market_dir = os.path.join(data_dir, market)
@@ -7476,7 +7481,7 @@ class _DarkTitleBarFilter(QObject):
 
 
 def use_writable_work_dir():
-    """打包版把当前目录切到 %LOCALAPPDATA%\KhQuantOS。
+    r"""打包版把当前目录切到 %LOCALAPPDATA%\KhQuantOS。
 
     从开始菜单启动时当前目录是安装目录，普通用户不可写；内核里按当前目录写的
     临时文件（DuckDB 溢写目录 temp、默认数据目录 ./stock_data）才不会写失败。

@@ -35,6 +35,17 @@ def test_frozen_parquet_cache_root_is_user_writable(tmp_path, monkeypatch):
     assert str(root).startswith(str(tmp_path))
 
 
+def test_installer_reads_v21_real_uninstall_key():
+    # V2.1 和 CS 的安装脚本写的是 AppId={{GUID}}，Inno 实际建的卸载键是 {GUID}}_is1，
+    # 在 WOW6432Node 下（Windows 沙盒装 V2.1.4 实测）；手写的“看海量化回测平台_is1”
+    # 卸载 V2.1 后还留着，不能用来判断
+    source = _source("installer.iss")
+    assert "'{#LegacyAppId}}_is1'" in source
+    assert "ReadLegacyVersion(HKLM32, Version)" in source
+    lookups = [line for line in source.splitlines() if "RegQueryStringValue" in line]
+    assert lookups and not any("看海量化回测平台_is1" in line for line in lookups)
+
+
 @pytest.mark.parametrize("code, unsupported", [
     ("510300.SH", True), ("513050.SH", True), ("159915.SZ", True), ("161725.SZ", True),
     ("113050.SH", True), ("110059.SH", True), ("123107.SZ", True), ("127056.SZ", True),
