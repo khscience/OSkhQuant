@@ -67,3 +67,13 @@ def test_shared_dir_message_keeps_long_path_readable():
     assert first_lines[0].endswith("：")
     assert len(first_lines[1]) <= 60 and "…" in first_lines[1]
     assert policy.shared_dir_write_message("D:\\khData", "WAL 修复").split("\n")[1] == "D:\\khData"
+
+
+def test_main_releases_windows_while_qapplication_alive():
+    # 打包版关闭时偶发 sip 里 0xc0000005：窗口与对话框的引用环在 QApplication
+    # 析构之后才被回收。事件循环结束后要先销毁窗口、回收引用环，再返回
+    source = _source("GUIkhQuant.py")
+    tail = source.split("exit_code = app.exec_()", 1)[1].split("return exit_code", 1)[0]
+    assert "widget.deleteLater()" in tail
+    assert "QApplication.sendPostedEvents(None, QEvent.DeferredDelete)" in tail
+    assert "splash = window = None" in tail and "gc.collect()" in tail

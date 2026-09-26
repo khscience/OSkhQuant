@@ -7725,6 +7725,21 @@ def main():
             
             # 运行事件循环
             exit_code = app.exec_()
+            # 趁 QApplication 还在，先销毁窗口并回收引用环，再让 main() 返回。
+            # 否则窗口、首次引导的下载对话框及其线程和 lambda 之间的引用环要等
+            # 垃圾回收，若发生在 QApplication 析构之后，会在 sip 里访问已释放的
+            # 对象而崩溃（打包版关闭时偶发 0xc0000005，Windows 沙盒实测）。
+            try:
+                import gc
+                from PyQt5 import sip
+                for widget in (splash, window):
+                    if widget is not None and not sip.isdeleted(widget):
+                        widget.deleteLater()
+                QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+                splash = window = None
+                gc.collect()
+            except Exception as exc:
+                logging.warning(f"退出前释放窗口时出错: {exc}")
             # 单实例锁必须覆盖整个进程生命周期。这里不提前释放，交由操作系统
             # 在进程真正退出时关闭句柄，避免 Qt/日志仍在收尾时新实例抢先启动。
             return exit_code

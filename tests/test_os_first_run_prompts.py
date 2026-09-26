@@ -57,3 +57,19 @@ def test_empty_data_prompt_skipped_when_stock_data_exists(qt_app, tmp_path, monk
     (tmp_path / "SZ" / "000001.db").write_bytes(b"")
     gui_module.KhQuantGUI._suggest_download_if_empty(_harness(), str(tmp_path))
     assert shown == []
+
+
+def test_baostock_dialog_buttons_stay_outside_scroll_area(qt_app, tmp_path):
+    # 屏幕较矮时滚动区域里的内容会超出窗口，按钮必须固定在滚动区域外面
+    from types import SimpleNamespace
+
+    from PyQt5.QtWidgets import QScrollArea
+    from duckdb_storage.viewer import BaoStockImportDialog
+
+    dialog = BaoStockImportDialog(SimpleNamespace(data_root=str(tmp_path)))
+    for btn in (dialog.start_btn, dialog.close_btn, dialog.indicator_start_btn, dialog.indicator_close_btn):
+        parent = btn.parentWidget()
+        while parent is not None and parent is not dialog:
+            assert not isinstance(parent, QScrollArea), btn.text()
+            parent = parent.parentWidget()
+    dialog.deleteLater()

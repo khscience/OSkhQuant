@@ -4990,7 +4990,10 @@ class BaoStockImportDialog(QDialog):
         self.close_btn.clicked.connect(self.close)
         btn_layout.addWidget(self.close_btn)
 
-        layout.addLayout(btn_layout)
+        # 按钮固定在滚动区域下面：屏幕较矮（1080p 缩放 125%、笔记本）时内容会超出，
+        # 放在滚动区域里的「开始导入」要往下滚才看得到
+        btn_layout.setContentsMargins(layout.contentsMargins())
+        outer_layout.addLayout(btn_layout)
 
     def _build_indicator_tab(self):
         # 指标页分组较多，整体高度可能超过窗口，用滚动区域包裹避免分组被压扁
@@ -5166,7 +5169,9 @@ class BaoStockImportDialog(QDialog):
         self.indicator_close_btn.clicked.connect(self.close)
         btn_layout.addWidget(self.indicator_close_btn)
 
-        layout.addLayout(btn_layout)
+        # 与行情页一样固定在滚动区域下面
+        btn_layout.setContentsMargins(layout.contentsMargins())
+        outer_layout.addLayout(btn_layout)
 
     def on_method_changed(self):
         self.preset_frame.setVisible(self.preset_radio.isChecked())
