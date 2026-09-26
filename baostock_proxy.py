@@ -8,6 +8,11 @@ BaoStock 官方 Python 包直接使用原始 TCP socket 连接
 在受限网络环境下，DNS 或直连 TCP 可能失败；本模块会在这种情况下
 自动尝试通过本机 HTTP 代理建立 CONNECT 隧道，并对 baostock 的
 socket 创建逻辑做轻量 monkey patch。
+
+官方 send_msg 的收包循环没有超时，服务器或代理断开连接时 recv 一直返回
+空字节，循环永远不结束（首次启动补基准时实测卡死）。这里一并替换成带读
+超时、总时限并识别断开的版本；失败时返回 None，baostock 各接口按
+“网络接收错误”返回，由调用方重试或提示。
 """
 
 from __future__ import annotations
@@ -16,11 +21,27 @@ import os
 import socket
 import struct
 import random
+import time
+import zlib
 from typing import Iterable, Optional, Tuple
 from urllib.parse import urlparse
 
 
 _PATCHED = False
+
+
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# 单次 recv 多久收不到任何字节算网络卡死；整次请求（含大区间 K 线）的总时限
+BAOSTOCK_READ_TIMEOUT = _env_seconds("KHQUANT_BAOSTOCK_READ_TIMEOUT", 60.0)
+BAOSTOCK_REQUEST_DEADLINE = _env_seconds("KHQUANT_BAOSTOCK_REQUEST_DEADLINE", 300.0)
+_MESSAGE_END = b"<![CDATA[]]>\n"
 
 
 def _resolve_google_dns(hostname: str) -> Optional[str]:
@@ -197,18 +218,83 @@ def enable_baostock_proxy() -> bool:
         my_socket = None
         try:
             my_socket = _create_socket(cons.BAOSTOCK_SERVER_IP, cons.BAOSTOCK_SERVER_PORT)
+            my_socket.settimeout(BAOSTOCK_READ_TIMEOUT)
         except Exception:
             print("服务器连接失败，请稍后再试。")
         setattr(context, "default_socket", my_socket)
 
     def _patched_get_default_socket():
         try:
-            return _create_socket(cons.BAOSTOCK_SERVER_IP, cons.BAOSTOCK_SERVER_PORT)
+            sock = _create_socket(cons.BAOSTOCK_SERVER_IP, cons.BAOSTOCK_SERVER_PORT)
+            sock.settimeout(BAOSTOCK_READ_TIMEOUT)
+            return sock
         except Exception:
             print("服务器连接失败，请稍后再试。")
             return None
 
     socketutil.SocketUtil.connect = _patched_connect
     socketutil.get_default_socket = _patched_get_default_socket
+    socketutil.send_msg = _make_send_msg(cons, context)
     _PATCHED = True
     return True
+
+
+def _make_send_msg(cons, context):
+    """与官方 send_msg 的收发和解包一致，只是不会无限等待。"""
+
+    def _drop_socket(sock):
+        # 半截响应还留在连接里，这条连接不能再用；清掉后接口返回“网络接收错误”，
+        # 下载进程据此换新进程重新登录，界面里的补基准则提示失败。
+        try:
+            sock.close()
+        except Exception:
+            pass
+        setattr(context, "default_socket", None)
+
+    def send_msg(msg):
+        if not hasattr(context, "default_socket"):
+            print("you don't login.")
+            return None
+        sock = getattr(context, "default_socket")
+        if sock is None:
+            return None
+        try:
+            if sock.gettimeout() is None:
+                sock.settimeout(BAOSTOCK_READ_TIMEOUT)
+            deadline = time.monotonic() + BAOSTOCK_REQUEST_DEADLINE
+            sock.sendall(bytes(msg + "\n", encoding="utf-8"))
+            chunks = []
+            tail = b""
+            while True:
+                if time.monotonic() > deadline:
+                    print(f"BaoStock 请求超过 {BAOSTOCK_REQUEST_DEADLINE:.0f} 秒仍未完成，已断开本次连接。")
+                    _drop_socket(sock)
+                    return None
+                recv = sock.recv(8192)
+                if not recv:
+                    print("BaoStock 服务器断开了连接，请稍后再试。")
+                    _drop_socket(sock)
+                    return None
+                chunks.append(recv)
+                tail = (tail + recv)[-len(_MESSAGE_END):]
+                if tail == _MESSAGE_END:
+                    break
+            receive = b"".join(chunks)
+            head_bytes = receive[0:cons.MESSAGE_HEADER_LENGTH]
+            head_str = bytes.decode(head_bytes)
+            head_arr = head_str.split(cons.MESSAGE_SPLIT)
+            if head_arr[1] in cons.COMPRESSED_MESSAGE_TYPE_TUPLE:
+                head_inner_length = int(head_arr[2])
+                body = receive[cons.MESSAGE_HEADER_LENGTH:cons.MESSAGE_HEADER_LENGTH + head_inner_length]
+                return head_str + bytes.decode(zlib.decompress(body))
+            return bytes.decode(receive)
+        except (socket.timeout, OSError) as exc:
+            print(f"BaoStock 网络超时或中断（{BAOSTOCK_READ_TIMEOUT:.0f} 秒无数据）：{exc}")
+            _drop_socket(sock)
+            return None
+        except Exception as ex:
+            print(ex)
+            print("接收数据异常，请稍后再试。")
+            return None
+
+    return send_msg

@@ -322,6 +322,14 @@ def _baostock_download_worker(task_queue: Queue, result_queue: Queue, progress_q
     try:
         import baostock as bs
 
+        # 官方 socket 没有超时、断线时收包循环不会结束；统一换成带超时的连接
+        try:
+            from baostock_proxy import enable_baostock_proxy
+        except ImportError:
+            enable_baostock_proxy = None
+        if enable_baostock_proxy is not None:
+            enable_baostock_proxy()
+
         lg = bs.login()
         if lg.error_code != "0":
             progress_queue.put({"type": "fatal", "msg": f"BaoStock登录失败: {lg.error_msg}"})

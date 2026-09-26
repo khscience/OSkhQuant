@@ -7726,9 +7726,9 @@ def main():
             # 运行事件循环
             exit_code = app.exec_()
             # 趁 QApplication 还在，先销毁窗口并回收引用环，再让 main() 返回。
-            # 否则窗口、首次引导的下载对话框及其线程和 lambda 之间的引用环要等
-            # 垃圾回收，若发生在 QApplication 析构之后，会在 sip 里访问已释放的
-            # 对象而崩溃（打包版关闭时偶发 0xc0000005，Windows 沙盒实测）。
+            # 否则窗口、对话框及其线程和 lambda 之间的引用环要等垃圾回收，若发生
+            # 在 QApplication 析构之后，会在 sip 里访问已释放的对象而崩溃（打包版
+            # 关闭时偶发 0xc0000005，开源版在 Windows 沙盒实测复现）。
             try:
                 import gc
                 from PyQt5 import sip

@@ -3214,6 +3214,14 @@ class BaoStockImportThread(QThread):
         import pandas as pd
         from datetime import datetime, timedelta
 
+        # 在界面进程里直接连 BaoStock：官方 socket 没有超时、断线时收包循环
+        # 不会结束，会让「补基准」一直卡住。换成带超时的连接。
+        try:
+            from baostock_proxy import enable_baostock_proxy
+            enable_baostock_proxy()
+        except ImportError:
+            pass
+
         benchmark_code = '000300.SH'
         end_date = datetime.now()
         start_date = end_date - timedelta(days=365 * 20)
