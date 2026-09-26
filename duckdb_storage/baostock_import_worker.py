@@ -317,6 +317,34 @@ def _prepare_adjusted_columns(adj_df, suffix: str):
     return frame.sort_values("time")
 
 
+# 登录遇到网络类错误（服务器限流时连接被断开、读超时）先在本进程里等一等再重试。
+# 登录失败会被主进程当作致命错误、让整批任务失败；也不能立刻重登加重限流。
+_LOGIN_RETRY_DELAYS = (10.0, 30.0, 60.0)
+# 进程已退出、任务停在「数据已就绪」多久仍没收到结果，就判定结果丢失并重试
+_LOST_RESULT_GRACE_SECONDS = 30.0
+
+
+def _is_network_login_error(login_result) -> bool:
+    # BaoStock 网络类错误码 10002001～10002008（连接失败/超时、接收断开/错误/超时等）
+    code = str(getattr(login_result, "error_code", "") or "")
+    message = str(getattr(login_result, "error_msg", "") or "")
+    return code.startswith("100020") or "网络" in message
+
+
+def _login_with_backoff(bs, progress_queue, delays=_LOGIN_RETRY_DELAYS, sleep=time.sleep):
+    login_result = bs.login()
+    for delay in delays:
+        if login_result.error_code == "0" or not _is_network_login_error(login_result):
+            return login_result
+        progress_queue.put({
+            "type": "status",
+            "msg": f"BaoStock 登录暂时失败（{login_result.error_msg}），{delay:.0f} 秒后重试",
+        })
+        sleep(delay)
+        login_result = bs.login()
+    return login_result
+
+
 def _baostock_download_worker(task_queue: Queue, result_queue: Queue, progress_queue: Queue):
     """子进程 worker：登录 baostock，执行任务，返回序列化 DataFrame。"""
     try:
@@ -330,7 +358,7 @@ def _baostock_download_worker(task_queue: Queue, result_queue: Queue, progress_q
         if enable_baostock_proxy is not None:
             enable_baostock_proxy()
 
-        lg = bs.login()
+        lg = _login_with_backoff(bs, progress_queue)
         if lg.error_code != "0":
             progress_queue.put({"type": "fatal", "msg": f"BaoStock登录失败: {lg.error_msg}"})
             return
@@ -766,8 +794,10 @@ class MultiProcessBaoStockImporter:
                 meta["stage"] = "running"
             elif event_type == "data_ready":
                 meta["stage"] = "data_ready"
+                meta["stage_at"] = time.monotonic()
             elif event_type in ("progress", "error"):
                 meta["stage"] = "result_sent"
+                meta["stage_at"] = time.monotonic()
         if event_type == "fatal":
             self._fatal_error = str(event.get("msg") or "BaoStock 工作进程致命错误")
         return True
@@ -976,6 +1006,30 @@ class MultiProcessBaoStockImporter:
                     self._failure_result(
                         task_id,
                         f"工作进程异常退出（PID {meta.get('pid')}）",
+                        "worker_exit",
+                    )
+                )
+                meta["stage"] = "failed_pending_delivery"
+
+        # 已报「数据已就绪 / 结果已发出」的任务不受运行超时约束。它的进程若在结果
+        # 送达前被结束（例如主进程为同一进程上一个任务的网络错误换进程重登，
+        # _terminate_worker_pid 已把它移出 self.workers，上面的检查看不到），
+        # 结果就丢了，调度线程会一直等下去。进程已不在且超过宽限时间仍没收到
+        # 结果，按进程退出重试；原结果若晚到，会因 attempt 不一致被当作过期丢弃。
+        live_pids = {worker.pid for worker in self.workers if worker.is_alive()}
+        for task_id, meta in list(self._task_meta.items()):
+            pid = meta.get("pid")
+            since = float(meta.get("stage_at") or meta.get("started_at") or now)
+            if (
+                meta.get("stage") in ("data_ready", "result_sent")
+                and pid
+                and pid not in live_pids
+                and now - since > _LOST_RESULT_GRACE_SECONDS
+            ):
+                self._synthetic_results.append(
+                    self._failure_result(
+                        task_id,
+                        f"工作进程在结果送达前退出（PID {pid}）",
                         "worker_exit",
                     )
                 )
