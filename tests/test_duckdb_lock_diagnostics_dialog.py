@@ -515,6 +515,7 @@ def test_status_refuses_clean_conclusion_when_no_handle_was_read(
     viewer = QWidget()
     viewer.data_root = str(tmp_path)
     dialog = dialog_module.DatabaseOccupancyDialog(viewer)
+    thread = dialog._scan_thread
 
     try:
         dialog._on_scan_finished(
@@ -529,6 +530,12 @@ def test_status_refuses_clean_conclusion_when_no_handle_was_read(
         assert "诊断未完成" in text
         assert "未发现该数据目录的打开句柄" not in text
     finally:
+        # 构造时已启动扫描线程（假线程会等 5 秒）。不等它结束的话，下面的
+        # deleteLater 可能到后面某个测试处理 DeferredDelete 时才执行，析构仍在
+        # 运行的线程，Qt 以 "QThread: Destroyed while thread is still running" 直接 abort。
+        thread.release.set()
+        if not sip.isdeleted(thread):
+            thread.wait(3000)
         dialog.deleteLater()
         viewer.deleteLater()
         qt_app.processEvents()
@@ -542,6 +549,7 @@ def test_status_reports_no_occupancy_when_scan_actually_succeeded(
     viewer = QWidget()
     viewer.data_root = str(tmp_path)
     dialog = dialog_module.DatabaseOccupancyDialog(viewer)
+    thread = dialog._scan_thread
 
     try:
         dialog._on_scan_finished(
@@ -556,6 +564,9 @@ def test_status_reports_no_occupancy_when_scan_actually_succeeded(
         assert "未发现该数据目录的打开句柄" in text
         assert "诊断未完成" not in text
     finally:
+        thread.release.set()
+        if not sip.isdeleted(thread):
+            thread.wait(3000)
         dialog.deleteLater()
         viewer.deleteLater()
         qt_app.processEvents()
