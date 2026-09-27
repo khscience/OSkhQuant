@@ -31,9 +31,13 @@ def khHandlebar(data: Dict) -> List[Dict]:  # 主策略函数
 
     for stock_code in stock_list:  # 遍历每只股票
         current_price = khPrice(data, stock_code, "open")  # 获取当前开盘价
-        ma_short = khMA(stock_code, ma_s, end_time=current_date_str)  # 计算短期均线
-        ma_long = khMA(stock_code, ma_l, end_time=current_date_str)   # 计算长期均线
-            
+        try:
+            ma_short = khMA(stock_code, ma_s, end_time=current_date_str)  # 计算短期均线
+            ma_long = khMA(stock_code, ma_l, end_time=current_date_str)   # 计算长期均线
+        except ValueError:
+            # 上市不久或本地数据不够，历史K线不足以计算均线：今天先跳过这只股票
+            continue
+
         has_position = khHas(data, stock_code)  # 检查是否持有该股票
         
         if ma_short > ma_long and not has_position:  # 金叉且无持仓

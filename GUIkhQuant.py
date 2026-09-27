@@ -6960,6 +6960,23 @@ class KhQuantGUI(QMainWindow):
 
         return user_strategies_dir
 
+    @staticmethod
+    def _message_text_with_paths(lines, paths):
+        """把多行文字转成消息框用的富文本，paths 里的路径整行显示、不折断。
+
+        Qt 的换行规则允许在 “C:” 之后、中文字符之间断行，用户名较长或是中文时，
+        路径会被折成两截；放进 white-space:pre 的独立块里就只会整行显示。
+        """
+        import html
+        blocks = []
+        for line in lines:
+            text = html.escape(line)
+            if line in paths:
+                blocks.append(f'<div style="white-space:pre">{text}</div>')
+            else:
+                blocks.append(f'<div>{text or "&nbsp;"}</div>')
+        return "".join(blocks)
+
     def check_and_migrate_legacy_strategies(self):
         """检测 V2.1 的策略目录，提示把旧策略复制一份过来（原文件不动）"""
         legacy_dir = self.get_legacy_strategies_dir()
@@ -6987,11 +7004,16 @@ class KhQuantGUI(QMainWindow):
         self.apply_dark_titlebar(msg_box)
         msg_box.setWindowTitle("复制 V2.1 的策略")
         msg_box.setIcon(QMessageBox.Question)
-        msg_box.setText(
-            f"检测到 V2.1 的策略目录中有 {len(legacy_files)} 个文件：\n{legacy_dir}\n\n"
-            f"要把它们复制到开源版的策略目录吗？\n{new_dir}\n\n"
-            f"只复制，不改动也不删除 V2.1 目录里的文件，V2.1 仍可照常使用。"
-        )
+        msg_box.setTextFormat(Qt.RichText)
+        msg_box.setText(self._message_text_with_paths([
+            f"检测到 V2.1 的策略目录中有 {len(legacy_files)} 个文件：",
+            legacy_dir,
+            "",
+            "要把它们复制到开源版的策略目录吗？",
+            new_dir,
+            "",
+            "只复制，不改动也不删除 V2.1 目录里的文件，V2.1 仍可照常使用。",
+        ], paths=(legacy_dir, new_dir)))
         migrate_btn = msg_box.addButton("复制过来", QMessageBox.AcceptRole)
         later_btn = msg_box.addButton("稍后提醒", QMessageBox.RejectRole)
         never_btn = msg_box.addButton("不再提醒", QMessageBox.DestructiveRole)
@@ -7033,7 +7055,7 @@ class KhQuantGUI(QMainWindow):
                 self.log_message(f"迁移失败 {name}: {e}", "WARNING")
                 failed.append(name)
 
-        summary_lines = [f"已复制到：\n{new_dir}", ""]
+        summary_lines = ["已复制到：", new_dir, ""]
         summary_lines.append(f"成功: {len(migrated)}")
         if renamed:
             summary_lines.append(f"重命名: {len(renamed)}（目标目录存在同名文件）")
@@ -7047,7 +7069,8 @@ class KhQuantGUI(QMainWindow):
         self.apply_dark_titlebar(msg)
         msg.setWindowTitle("复制完成")
         msg.setIcon(QMessageBox.Information)
-        msg.setText("\n".join(summary_lines))
+        msg.setTextFormat(Qt.RichText)
+        msg.setText(self._message_text_with_paths(summary_lines, paths=(new_dir, legacy_dir)))
         msg.exec_()
 
         # 迁移过后不再提醒

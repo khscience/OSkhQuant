@@ -1504,7 +1504,10 @@ class BacktestResultWindow(QMainWindow):
                 progress.setValue(idx + 1)
                 QApplication.processEvents()
         finally:
+            # 用完即销毁：只 close() 的话隐藏的对话框会一直挂在结果窗口下，
+            # 每打开一次结果就多留一个原生窗口，曾出现过残留的空白小框。
             progress.close()
+            progress.deleteLater()
 
     def load_data(self):
         """加载回测数据"""
