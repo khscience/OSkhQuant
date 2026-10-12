@@ -112,16 +112,8 @@ def _normalize_url_text(url: str) -> str:
 
 
 def _normalize_api_url(url: str) -> str:
-    """规范化自定义 Tushare API 根地址；留空时使用官方 HTTPS 接口。"""
-    raw_url = normalize_tushare_api_url(_normalize_url_text(url)).rstrip("/")
-    if not raw_url:
-        return ""
-    # 兼容误把接口名一并粘贴到设置中的历史输入。
-    if raw_url.lower().endswith("/daily"):
-        raw_url = raw_url[:-6].rstrip("/")
-    if not raw_url.lower().startswith(("http://", "https://")):
-        raw_url = "https://" + raw_url
-    return raw_url
+    """留空使用默认接口；显式地址直接使用，不猜测或删改路径。"""
+    return normalize_tushare_api_url(url)
 
 
 def is_tushare_index_code(ts_code: str) -> bool:
@@ -233,7 +225,7 @@ class TushareImporter:
         self.use_proxy = use_proxy
         self.proxy_url = _normalize_url_text(proxy_url)
         
-        # 处理可能的误填，去掉多余的接口名并补齐协议。
+        # 明确填写的 HTTP(S) 地址优先；格式错误由传输层明确报错。
         self.api_url   = _normalize_api_url(api_url)
         self._pro      = None  # 延迟初始化
         self._http_client = None  # 供批量下载收尾时显式关闭会话

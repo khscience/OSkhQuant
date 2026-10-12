@@ -46,7 +46,7 @@ DEFAULTS = {
     "duckdb_data_path": "",
     "strategy_dir": "",
     "tushare_token": "",
-    # 留空时使用 Tushare SDK 自带的数据接口；仅镜像/私有服务需要显式填写。
+    # 只有留空时使用官方 HTTPS 接口；显式地址保留用户填写的协议和路径。
     "tushare_api_url": "",
     "tushare_use_proxy": False,
     "tushare_proxy_url": "",

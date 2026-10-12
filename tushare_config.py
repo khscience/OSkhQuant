@@ -10,17 +10,9 @@ from dataclasses import dataclass
 import kh_settings as global_settings
 
 
-# 留空表示使用官方 HTTPS JSON 接口；旧官方域名配置也归一到此默认值。
+# 只有留空才使用官方 HTTPS JSON 接口；明确填写的地址按原值使用。
 # 自定义 API 地址按根地址 POST，不追加 /daily 等接口名。
 DEFAULT_TUSHARE_API_URL = ""
-_LEGACY_INVALID_API_URLS = frozenset({
-    "api.tushare.pro",
-    "http://api.tushare.pro",
-    "https://api.tushare.pro",
-    "api.waditu.com/dataapi",
-    "http://api.waditu.com/dataapi",
-    "https://api.waditu.com/dataapi",
-})
 _TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
@@ -58,11 +50,8 @@ def validate_tushare_token(token: object) -> tuple[bool, str]:
 
 
 def normalize_tushare_api_url(value: object) -> str:
-    """规范化共享配置中的 API 地址，并迁移 v3.3.8 的错误官方默认值。"""
-    text = str(value or "").replace("：", ":").strip().rstrip("/")
-    if text.lower() in _LEGACY_INVALID_API_URLS:
-        return ""
-    return text
+    """只清理首尾空白，不改写用户指定的协议、主机、路径或末尾斜杠。"""
+    return str(value or "").strip()
 
 
 def load_tushare_settings() -> TushareRuntimeSettings:

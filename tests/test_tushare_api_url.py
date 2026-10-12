@@ -33,12 +33,36 @@ def _install_fake_transport(monkeypatch):
     monkeypatch.setattr(transport.requests, "Session", Session)
 
 
-def test_normalize_api_url_preserves_selected_server():
-    assert _normalize_api_url("") == TUSHARE_DEFAULT_URL
-    assert _normalize_api_url("api.tushare.pro/") == TUSHARE_DEFAULT_URL
-    assert _normalize_api_url("http://api.waditu.com/dataapi") == TUSHARE_DEFAULT_URL
-    assert _normalize_api_url("https：//new.example.test/daily") == "https://new.example.test"
-    assert _normalize_api_url("http://tushare.xyz/") == "http://tushare.xyz"
+@pytest.mark.parametrize("url", [
+    "http://api.tushare.pro", "https://api.tushare.pro/",
+    "http://api.waditu.com/dataapi", "https://api.waditu.com/dataapi/",
+    "http://gateway.example:8123/api/daily/", "https://gateway.example/api/daily",
+])
+def test_explicit_api_url_reaches_wire_unchanged(monkeypatch, url):
+    from tushare_config import normalize_tushare_api_url
+
+    _install_fake_transport(monkeypatch)
+    saved = normalize_tushare_api_url("  " + url + "  ")
+    assert saved == url
+    importer = TushareImporter("test-token", api_url=saved)
+    importer._call("daily", ts_code="000001.SZ")
+    assert importer.api_url == url
+    assert importer._pro._session.calls[0][0] == url
+
+
+@pytest.mark.parametrize("url", ["", "  ", None])
+def test_only_empty_api_url_selects_official_https(monkeypatch, url):
+    _install_fake_transport(monkeypatch)
+    importer = TushareImporter("test-token", api_url=url)
+    importer._call("daily", ts_code="000001.SZ")
+    assert importer.api_url == TUSHARE_DEFAULT_URL
+    assert importer._pro._session.calls[0][0] == "https://api.tushare.pro"
+
+
+def test_missing_scheme_is_reported_instead_of_guessed(monkeypatch):
+    _install_fake_transport(monkeypatch)
+    with pytest.raises(ValueError, match="HTTP"):
+        TushareImporter("test-token", api_url="api.tushare.pro/")._get_pro()
 
 
 def test_proxy_disabled_bypasses_custom_api_host(monkeypatch):
@@ -57,10 +81,10 @@ def test_api_url_is_bound_to_each_data_api_instance(monkeypatch):
     official = TushareImporter(token="official", api_url="http://api.tushare.pro")
     mirror = TushareImporter(token="mirror", api_url="https://mirror.example.test/api")
     official_pro, mirror_pro = official._get_pro(), mirror._get_pro()
-    assert official_pro._url == "https://api.tushare.pro"
+    assert official_pro._url == "http://api.tushare.pro"
     assert mirror_pro._url == "https://mirror.example.test/api"
     assert not official._call("daily", ts_code="000001.SZ").empty
-    assert official_pro._session.calls[0][0] == "https://api.tushare.pro"
+    assert official_pro._session.calls[0][0] == "http://api.tushare.pro"
     assert official_pro._session.calls[0][1]["json"]["api_name"] == "daily"
     assert official_pro._session.calls[0][1]["allow_redirects"] is False
     assert mirror_pro._session.calls == []

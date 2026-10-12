@@ -74,7 +74,7 @@ class TushareHTTPClient:
         if parsed.scheme not in {"https", "http"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("Tushare API 地址必须是无凭据、无查询参数的 HTTP(S) 接口地址")
         self._token = token
-        self._url = api_url.rstrip("/")
+        self._url = api_url
         self._session = session or requests.Session()
         # Configuring one provider must not change QMT/other providers' proxies.
         self._session.trust_env = False

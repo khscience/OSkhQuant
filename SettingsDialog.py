@@ -1304,6 +1304,7 @@ class SettingsDialog(QDialog):
         api_url_label.setFixedWidth(label_width)
         self.tushare_api_url_edit = QLineEdit()
         self.tushare_api_url_edit.setPlaceholderText("留空使用 Tushare 官方 HTTPS 接口")
+        self.tushare_api_url_edit.setToolTip("填写完整的 http:// 或 https:// 地址时，按所填协议和路径连接。")
         self.tushare_api_url_edit.setStyleSheet(lineedit_style)
         self.tushare_api_url_edit.setText(
             normalize_tushare_api_url(self.settings.value('tushare_api_url', ''))
@@ -1531,7 +1532,7 @@ class SettingsDialog(QDialog):
         use_proxy = self.tushare_proxy_check.isChecked()
         proxy_url = self._normalize_url_text(self.tushare_proxy_url_edit.text())
         api_url   = normalize_tushare_api_url(
-            self._normalize_url_text(self.tushare_api_url_edit.text())
+            self.tushare_api_url_edit.text()
         )
         self.tushare_proxy_url_edit.setText(proxy_url)
         self.tushare_api_url_edit.setText(api_url)
@@ -1841,7 +1842,7 @@ class SettingsDialog(QDialog):
 
             # 保存 API 地址（留空表示使用 Tushare 官方 HTTPS 接口）
             api_url = normalize_tushare_api_url(
-                self._normalize_url_text(self.tushare_api_url_edit.text())
+                self.tushare_api_url_edit.text()
             )
             self.tushare_api_url_edit.setText(api_url)
             self.settings.setValue('tushare_api_url', api_url)
