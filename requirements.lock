@@ -1,0 +1,44 @@
+# OSkhQuant 运行时依赖锁定文件（由 scripts/os_build/make_requirements_lock.py 生成）
+# 解释器: Python 3.11.9（win32）
+# 版本取自跑通六套金标准的实际环境，不要手工修改；升级依赖后须重跑金标准再重新生成。
+baostock==0.9.1
+beautifulsoup4==4.13.3
+bs4==0.0.2
+certifi==2025.7.9
+charset-normalizer==3.4.1
+colorama==0.4.6
+contourpy==1.3.1
+cycler==0.12.1
+duckdb==1.4.3
+et_xmlfile==2.0.0
+fonttools==4.55.3
+holidays==0.69
+idna==2.10
+kiwisolver==1.4.8
+lxml==5.3.2
+matplotlib==3.10.0
+mplcursors==0.6
+numpy==2.2.6
+openpyxl==3.1.5
+packaging==24.2
+pandas==2.3.1
+pillow==11.3.0
+psutil==6.1.1
+pyparsing==3.2.0
+PyQt5==5.15.11
+PyQt5-Qt5==5.15.2
+PyQt5_sip==12.16.1
+python-dateutil==2.9.0.post0
+pytz==2024.2
+requests==2.32.4
+simplejson==3.20.1
+six==1.17.0
+soupsieve==2.6
+tabulate==0.9.0
+tqdm==4.67.1
+tushare==1.4.25
+typing_extensions==4.14.1
+tzdata==2024.2
+urllib3==2.5.0
+websocket-client==1.8.0
+xlrd==2.0.1

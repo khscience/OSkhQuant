@@ -1,0 +1,7 @@
+# OSkhQuant 打包构建依赖（在 requirements.lock 之外额外安装）
+altgraph==0.17.4
+pefile==2023.2.7
+pyinstaller==6.14.2
+pyinstaller-hooks-contrib==2025.5
+pywin32-ctypes==0.2.3
+setuptools==65.5.0

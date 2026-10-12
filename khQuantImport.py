@@ -14,28 +14,47 @@ import datetime
 from datetime import datetime as dt, date, timedelta
 from typing import Dict, List, Optional, Union, Tuple, Any
 
+# 添加用户自定义包目录到sys.path
+# 如果是从exe启动，确保在策略执行时能找到用户用pip下载的第三方包
+if sys.platform.startswith("win"):
+    if getattr(sys, 'frozen', False):
+        _pkg_base_dir = os.path.dirname(sys.executable)
+    else:
+        _pkg_base_dir = os.path.dirname(os.path.abspath(__file__))
+    _user_packages_dir = os.path.join(_pkg_base_dir, "user_packages")
+    if _user_packages_dir not in sys.path:
+        # 只要存在就加入，以防以后才安装包
+        sys.path.insert(0, _user_packages_dir)
+
 # ===== 数据处理库 =====
 import numpy as np
 import pandas as pd
 
 # ===== 量化库 =====
-from xtquant import xtdata
-try:
-    from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
-except ImportError:
-    # 如果没有交易模块，提供占位符
-    XtQuantTrader = None
-    XtQuantTraderCallback = None
+# 开源版不含 xtquant / miniQMT。保留这三个名字，让旧策略的
+# `from khQuantImport import *` 不因缺名报错；真正调用 xtdata 时会给出明确提示。
+from kh_xtdata_stub import xtdata
+XtQuantTrader = None
+XtQuantTraderCallback = None
 
 # ===== 项目内部工具 =====
 import khQTTools as _khq
 from khQTTools import (
     generate_signal, calculate_max_buy_volume, KhQuTools, khMA,
     # 新增的独立函数，可以直接使用，无需实例化类
-    is_trade_time, is_trade_day, get_trade_days_count
+    is_trade_time, is_trade_day, get_trade_days_count,
+    clear_khDuckDB_cache,
+    clear_khHistory_cache,
 )
 # 同时将 khQTTools 的其他常用工具函数暴露出来（如 khHistory 等）
 from khQTTools import *
+
+# ===== 缠论工具库 =====
+import khChanLunTools as _khcl
+from khChanLunTools import (
+    is_bottom_fractal, is_top_fractal, find_all_fractals,
+    get_trend_direction, get_fractal_price, check_fractal_break
+)
 
 # ===== 框架核心 =====
 from khFrame import KhQuantFramework
@@ -43,6 +62,26 @@ from khFrame import KhQuantFramework
 # ===== 指标库（MyTT） =====
 import MyTT as _mytt
 from MyTT import *  # 暴露 MA/RSI 等指标函数
+
+_CURRENT_FRAMEWORK = None
+_KHGET_TIME_KEYS = frozenset((
+    "date", "date_str", "time", "time_str", "datetime",
+    "datetime_str", "date_num", "timestamp", "datetime_obj",
+))
+_KHGET_STOCK_KEYS = frozenset(("first_stock", "stocks"))
+_KHGET_ACCOUNT_KEYS = frozenset(("cash", "total_asset", "market_value"))
+
+def _set_current_framework(framework):
+    global _CURRENT_FRAMEWORK
+    _CURRENT_FRAMEWORK = framework
+
+def khRequestNextDailyTrigger() -> bool:
+    if _CURRENT_FRAMEWORK and hasattr(_CURRENT_FRAMEWORK, "request_next_daily_trigger"):
+        try:
+            return bool(_CURRENT_FRAMEWORK.request_next_daily_trigger())
+        except Exception:
+            return False
+    return False
 
 # ===== Tick数据字段映射 =====
 # Tick数据和K线数据字段名不同，需要映射
@@ -401,7 +440,52 @@ def khGet(data: Dict, key: str) -> Any:
         Any: 对应的数据值
     """
     # 时间相关
-    if key in ["date", "date_str", "time", "time_str", "datetime", "datetime_str", "date_num", "timestamp", "datetime_obj"]:
+    # Fast path for the framework hot loop. current_data already carries
+    # normalized metadata, so avoid constructing parser objects on every khGet.
+    try:
+        if key in _KHGET_TIME_KEYS:
+            time_info = data.get("__current_time__", {}) if hasattr(data, "get") else {}
+            if time_info:
+                if key in ["date", "date_str"]:
+                    return time_info.get("date", "")
+                if key == "date_num":
+                    return str(time_info.get("date", "")).replace("-", "")
+                if key in ["time", "time_str"]:
+                    return time_info.get("time", "")
+                if key in ["datetime", "datetime_str"]:
+                    return time_info.get("datetime", "")
+                if key == "timestamp":
+                    return time_info.get("timestamp")
+                if key == "datetime_obj":
+                    dt_obj = time_info.get("_dt")
+                    if dt_obj is not None:
+                        return dt_obj
+                    dt_text = time_info.get("datetime", "")
+                    if dt_text:
+                        try:
+                            return dt.strptime(dt_text, "%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            pass
+
+        elif key in _KHGET_STOCK_KEYS:
+            stock_list = data.get("__stock_list__") if hasattr(data, "get") else None
+            if stock_list is not None:
+                if key == "first_stock":
+                    return stock_list[0] if stock_list else None
+                return list(stock_list)
+
+        elif key in _KHGET_ACCOUNT_KEYS:
+            account = data.get("__account__", {}) if hasattr(data, "get") else {}
+            return account.get(key, 0)
+
+        elif key == "positions":
+            positions = data.get("__positions__") if hasattr(data, "get") else None
+            if positions is not None:
+                return positions.copy() if hasattr(positions, "copy") else positions
+    except Exception:
+        pass
+
+    if key in _KHGET_TIME_KEYS:
         time_info = TimeInfo(data)
         if key in ["date", "date_str"]:
             return time_info.date_str
@@ -417,7 +501,7 @@ def khGet(data: Dict, key: str) -> Any:
             return time_info.datetime_obj
     
     # 股票池相关
-    elif key in ["first_stock", "stocks"]:
+    elif key in _KHGET_STOCK_KEYS:
         pool = StockPoolParser(data)
         if key == "first_stock":
             return pool.first()
@@ -425,7 +509,7 @@ def khGet(data: Dict, key: str) -> Any:
             return pool.get_all()
     
     # 账户相关
-    elif key in ["cash", "total_asset", "market_value"]:
+    elif key in _KHGET_ACCOUNT_KEYS:
         account = data.get("__account__", {})
         return account.get(key, 0)
     
@@ -453,6 +537,14 @@ def khPrice(data: Dict, stock_code: str, field: str = 'close') -> float:
         float: 股票价格，如果获取失败返回0.0
     """
     try:
+        try:
+            stock_data = data.get(stock_code)
+            fast_get = getattr(stock_data, "_kh_fast_get_float", None)
+            if fast_get is not None:
+                return fast_get(field)
+        except Exception:
+            pass
+
         stocks = StockDataParser(data)
         price = stocks.get_price(stock_code, field)
         
@@ -509,6 +601,56 @@ def khPrice(data: Dict, stock_code: str, field: str = 'close') -> float:
         logging.error(f"获取股票 {stock_code} 价格时出错: {str(e)}")
         return 0.0
 
+def khIndex(data: Dict, stock_code: str, field: str) -> float:
+    """获取股票指标数据的便捷函数
+    
+    语义上区分于 khPrice，专门用于获取自定义的指标（如 MA, RSI, MACD 等）。
+    底层直接包装调用 khPrice，共享其处理逻辑和容错机制。
+    
+    Args:
+        data: 策略数据字典
+        stock_code: 股票代码
+        field: 指标字段名（例如 'MA_5', 'RSI'）
+        
+    Returns:
+        float: 指标数值，如果获取失败或数据无效返回 0.0
+    """
+    return khPrice(data, stock_code, field)
+
+def khAddExtraFields(context: Dict, fields: List[str]) -> None:
+    """动态配置需要额外加载的数据字段（在策略 init 函数中使用）
+    
+    Args:
+        context: 策略的 context 字典
+        fields: 需要额外加载的字段列表，如 ['RSI_14', 'MA_5']
+    """
+    try:
+        framework = context.get("__framework__")
+        if framework and hasattr(framework, 'config'):
+            config_dict = framework.config.config_dict
+            
+            # 确保 data.fields 结构存在
+            if "data" not in config_dict:
+                config_dict["data"] = {}
+            if "fields" not in config_dict["data"]:
+                config_dict["data"]["fields"] = ["time", "open", "high", "low", "close", "volume"]
+                
+            current_fields = config_dict["data"]["fields"]
+            added_fields = []
+            
+            for field in fields:
+                if field not in current_fields:
+                    current_fields.append(field)
+                    added_fields.append(field)
+                    
+            if added_fields and hasattr(framework, 'trader_callback') and getattr(framework, 'trader_callback', None):
+                try:
+                    logging.info(f"策略 init 注入自定义指标字段: {added_fields}")
+                except Exception:
+                    pass
+    except Exception as e:
+        logging.error(f"添加额外字段时出错: {str(e)}")
+
 def khHas(data: Dict, stock_code: str) -> bool:
     """检查是否持有某股票的便捷函数
     
@@ -536,6 +678,142 @@ def get_default_risk_params() -> Dict:
     }
 
 
+# ===== 挂单管理API =====
+def khGetPendingOrders(data: Dict, code: str = None) -> List[Dict]:
+    """获取当前挂单列表
+
+    Args:
+        data: 策略数据字典
+        code: 股票代码（可选），如果指定则只返回该股票的挂单
+
+    Returns:
+        挂单列表，每个挂单包含以下字段：
+        - order_id: 订单ID
+        - code: 股票代码
+        - action: 交易方向 (buy/sell)
+        - price: 限价
+        - volume: 委托数量
+        - remaining_volume: 剩余数量
+        - order_type: 订单类型 (limit/stop/stop_limit)
+        - status: 订单状态
+        - create_time: 创建时间
+    """
+    try:
+        framework = data.get("__framework__")
+        if framework and hasattr(framework, 'pending_order_mgr') and framework.pending_order_mgr:
+            return framework.pending_order_mgr.get_pending_orders(code)
+        return []
+    except Exception as e:
+        logging.error(f"获取挂单列表时出错: {str(e)}")
+        return []
+
+
+def khCancelOrder(data: Dict, order_id: str) -> bool:
+    """撤销指定挂单
+
+    Args:
+        data: 策略数据字典
+        order_id: 要撤销的订单ID
+
+    Returns:
+        是否撤销成功
+    """
+    try:
+        framework = data.get("__framework__")
+        if framework and hasattr(framework, 'pending_order_mgr') and framework.pending_order_mgr:
+            return framework.pending_order_mgr.cancel_order(order_id)
+        return False
+    except Exception as e:
+        logging.error(f"撤销挂单时出错: {str(e)}")
+        return False
+
+
+def khCancelOrdersByCode(data: Dict, code: str) -> int:
+    """撤销指定股票的所有挂单
+
+    Args:
+        data: 策略数据字典
+        code: 股票代码
+
+    Returns:
+        撤销的挂单数量
+    """
+    try:
+        framework = data.get("__framework__")
+        if framework and hasattr(framework, 'pending_order_mgr') and framework.pending_order_mgr:
+            return framework.pending_order_mgr.cancel_orders_by_code(code)
+        return 0
+    except Exception as e:
+        logging.error(f"撤销股票挂单时出错: {str(e)}")
+        return 0
+
+
+def khCancelAllOrders(data: Dict) -> int:
+    """撤销所有挂单
+
+    Args:
+        data: 策略数据字典
+
+    Returns:
+        撤销的挂单数量
+    """
+    try:
+        framework = data.get("__framework__")
+        if framework and hasattr(framework, 'pending_order_mgr') and framework.pending_order_mgr:
+            return framework.pending_order_mgr.cancel_all_orders()
+        return 0
+    except Exception as e:
+        logging.error(f"撤销所有挂单时出错: {str(e)}")
+        return 0
+
+
+def khGetPendingSummary(data: Dict) -> Dict:
+    """获取挂单汇总信息
+
+    Args:
+        data: 策略数据字典
+
+    Returns:
+        挂单汇总字典，包含：
+        - total_count: 总挂单数
+        - buy_count: 买入挂单数
+        - sell_count: 卖出挂单数
+        - total_buy_volume: 买入挂单总数量
+        - total_sell_volume: 卖出挂单总数量
+    """
+    try:
+        framework = data.get("__framework__")
+        if framework and hasattr(framework, 'pending_order_mgr') and framework.pending_order_mgr:
+            return framework.pending_order_mgr.get_pending_summary()
+        return {
+            "total_count": 0,
+            "buy_count": 0,
+            "sell_count": 0,
+            "total_buy_volume": 0,
+            "total_sell_volume": 0
+        }
+    except Exception as e:
+        logging.error(f"获取挂单汇总时出错: {str(e)}")
+        return {}
+
+
+def khIsMatchEngineEnabled(data: Dict) -> bool:
+    """检查撮合引擎是否启用
+
+    Args:
+        data: 策略数据字典
+
+    Returns:
+        撮合引擎是否启用
+    """
+    try:
+        framework = data.get("__framework__")
+        if framework and hasattr(framework, 'match_engine_enabled'):
+            return framework.match_engine_enabled
+        return False
+    except Exception:
+        return False
+
 
 # ===== 导出所有符号 =====
 __all__ = [
@@ -560,13 +838,23 @@ __all__ = [
     
     # 新增类和函数
     'TimeInfo', 'StockDataParser', 'PositionParser', 'StockPoolParser',
-    'StrategyContext', 'parse_context', 'khGet', 'khPrice', 'khHas',
-    'get_default_risk_params',
-
+    'StrategyContext', 'parse_context', 'khGet', 'khPrice', 'khIndex', 'khHas',
+    'khAddExtraFields', 'get_default_risk_params',
+    
+    # 缠论工具函数
+    'is_bottom_fractal', 'is_top_fractal', 'find_all_fractals',
+    'get_trend_direction', 'get_fractal_price', 'check_fractal_break',
+    
     # 指标函数（MyTT）与项目内均线
-    'MA', 'RSI', 'khMA'
-]
+    'MA', 'RSI', 'khMA',
 
-# 自动并入 khQTTools 与 MyTT 的所有公共符号，便于 from khQuantImport import * 统一入口
+    # 挂单管理API（撮合引擎）
+    'khGetPendingOrders', 'khCancelOrder', 'khCancelOrdersByCode',
+    'khCancelAllOrders', 'khGetPendingSummary', 'khIsMatchEngineEnabled',
+    'khRequestNextDailyTrigger',
+] 
+
+# 自动并入 khQTTools、khChanLunTools 与 MyTT 的所有公共符号，便于 from khQuantImport import * 统一入口
 __all__ += [name for name in dir(_khq) if not name.startswith('_') and name not in __all__]
+__all__ += [name for name in dir(_khcl) if not name.startswith('_') and name not in __all__]
 __all__ += [name for name in dir(_mytt) if not name.startswith('_') and name not in __all__]

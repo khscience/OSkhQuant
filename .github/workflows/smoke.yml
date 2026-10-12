@@ -1,0 +1,26 @@
+name: 打包版冒烟测试
+
+# 按 requirements.lock 和 khQuant_inno.spec 打包，离屏启动 exe，确认打包版能正常建出主窗口。
+# 发布流程（release.yml）里也有同样的检查；这里可以单独手动运行。
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 安装依赖（锁定版本）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.lock -r requirements-build.lock
+      - name: PyInstaller 打包
+        run: pyinstaller --noconfirm khQuant_inno.spec
+      - name: 打包版冒烟测试
+        shell: pwsh
+        run: ./packaging/smoke_test.ps1
