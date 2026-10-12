@@ -163,8 +163,8 @@ def test_history_shows_strategy_file_name_instead_of_hash():
 
     harness = SimpleNamespace(extract_strategy_name=lambda dir_name: BacktestHistoryManager.extract_strategy_name(None, dir_name))
     dir_name = "strategy_2849c87a_20250601_20260918_20260927_200834"
-    win = {"strategy_file": r"C:\Users\KH\Documents\KhQuant_OS\strategies\【1-MA策略案例】双均线多股票_使用khMA函数.py"}
-    posix = {"strategy_file": "/home/kh/strategies/my_strategy.py"}
+    win = {"strategy_file": r"C:\Users\Example\Documents\KhQuant_OS\strategies\【1-MA策略案例】双均线多股票_使用khMA函数.py"}
+    posix = {"strategy_file": "/home/example/strategies/my_strategy.py"}
     assert BacktestHistoryManager.strategy_display_name(harness, win, dir_name) == "【1-MA策略案例】双均线多股票_使用khMA函数"
     assert BacktestHistoryManager.strategy_display_name(harness, posix, dir_name) == "my_strategy"
     assert BacktestHistoryManager.strategy_display_name(harness, {"strategy_file": ""}, dir_name) == "strategy_2849c87a"

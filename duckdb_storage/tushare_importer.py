@@ -5,7 +5,7 @@ Tushare 数据导入核心模块
 功能：
 - 封装 tushare API 调用，API 地址可由外部配置（默认官方地址）
 - 支持可选代理（代理开关）
-  不使用代理时自动设置 NO_PROXY 绕过系统代理，直连 tushare 域名
+  使用独立会话，不修改进程全局代理；官方接口默认使用 HTTPS
 - 乘法前复权：前复权价 = 原始价 × (当日 adj_factor / 最新 adj_factor)
   注意：end_date 必须传最新实际交易日，否则前复权基准日不是今天，结果偏高
 
@@ -23,13 +23,12 @@ import datetime
 import logging
 import math
 import time
-from urllib.parse import urlparse
 
 import pandas as pd
 import requests
 
 from tushare_config import DEFAULT_TUSHARE_API_URL, normalize_tushare_api_url
-from security_type_utils import is_listed_fund_code
+from security_type_utils import is_listed_fund_code, is_etf_code, is_convertible_bond_code
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +48,7 @@ def _safe_error_text(error: object, token: str = "") -> str:
         message = message.replace(token, "***")
     return message
 
-# 空字符串表示使用 Tushare SDK 自带的数据接口；仅自定义服务才覆盖实例地址。
+# 空字符串表示使用 Tushare 官方 HTTPS 接口；自定义服务保留自己的根地址。
 TUSHARE_DEFAULT_URL = DEFAULT_TUSHARE_API_URL
 
 # 日线时间偏移（09:30:00，与 miniQMT 保持一致）
@@ -83,7 +82,9 @@ _PERMANENT_API_ERROR_MARKERS = (
 
 
 def _is_retryable_api_error(error: Exception) -> bool:
-    """仅重试网络瞬断、限流和服务端临时异常，避免放大永久性错误。"""
+    """优先使用传输层分类；只对明确的临时错误执行有限重试。"""
+    if hasattr(error, 'retryable'):
+        return bool(error.retryable)
     message = str(error or "").strip().lower()
     if any(marker in message for marker in _PERMANENT_API_ERROR_MARKERS):
         return False
@@ -111,7 +112,7 @@ def _normalize_url_text(url: str) -> str:
 
 
 def _normalize_api_url(url: str) -> str:
-    """规范化自定义 Tushare API 根地址；留空时保留 SDK 默认行为。"""
+    """规范化自定义 Tushare API 根地址；留空时使用官方 HTTPS 接口。"""
     raw_url = normalize_tushare_api_url(_normalize_url_text(url)).rstrip("/")
     if not raw_url:
         return ""
@@ -131,36 +132,6 @@ def is_tushare_index_code(ts_code: str) -> bool:
         or (market == "SZ" and code.startswith("399"))
         or (market == "BJ" and code.startswith("899"))
     )
-
-
-def _setup_proxy(use_proxy: bool, proxy_url: str = "", api_url: str = "") -> None:
-    """配置或清除代理环境变量。"""
-    if use_proxy and proxy_url:
-        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-            os.environ[key] = proxy_url
-        # 不绕过 tushare 域名
-        os.environ.pop("NO_PROXY",  None)
-        os.environ.pop("no_proxy",  None)
-    else:
-        # 不使用代理时清除之前可能设置的代理变量，防止残留
-        for key in (
-            "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
-            "ALL_PROXY", "all_proxy",
-        ):
-            os.environ.pop(key, None)
-        # 确保 tushare 域名不走系统代理
-        existing_domains = set(
-            d.strip() for d in os.environ.get("NO_PROXY", "").split(",") if d.strip()
-        )
-        tushare_domains = {"api.tushare.pro", "tushare.pro", "tushare.xyz"}
-        custom_hostname = urlparse(_normalize_api_url(api_url)).hostname
-        if custom_hostname:
-            tushare_domains.add(custom_hostname)
-        missing = tushare_domains - existing_domains
-        if missing:
-            all_domains = sorted(existing_domains | tushare_domains)
-            os.environ["NO_PROXY"] = ",".join(all_domains)
-            os.environ["no_proxy"] = os.environ["NO_PROXY"]
 
 
 def _prepare_adj_factor_frame(df_factor: pd.DataFrame) -> pd.DataFrame:
@@ -256,7 +227,7 @@ class TushareImporter:
             token     : tushare token（在 https://tushare.pro 注册获取）
             use_proxy : 是否使用代理
             proxy_url : 代理地址，如 http://127.0.0.1:7890
-            api_url   : 自定义 API 数据接口根地址；留空使用 Tushare SDK 默认值
+            api_url   : 自定义 API 数据接口根地址；留空使用 Tushare 官方 HTTPS 接口
         """
         self.token     = token
         self.use_proxy = use_proxy
@@ -265,40 +236,26 @@ class TushareImporter:
         # 处理可能的误填，去掉多余的接口名并补齐协议。
         self.api_url   = _normalize_api_url(api_url)
         self._pro      = None  # 延迟初始化
+        self._http_client = None  # 供批量下载收尾时显式关闭会话
         self.request_count = 0
         self.request_times = []  # 记录最近的请求时间戳
         # 部分自定义服务在权限不足时返回 HTTP 4xx。Tushare SDK 使用
         # ``if response`` 判断，会把这类响应静默变成空 DataFrame。这里缓存
         # 已确认的权限错误和合法空响应，避免对每只股票重复做协议诊断。
         self._custom_api_denied: dict[str, str] = {}
-        self._custom_empty_checked: set[str] = set()
 
     # ------------------------------------------------------------------
     # 内部辅助
     # ------------------------------------------------------------------
 
     def _get_pro(self):
-        """初始化并返回 tushare pro_api 实例（延迟创建，只创建一次）。"""
-        if self._pro is not None:
-            return self._pro
-
-        try:
-            import tushare as ts
-        except ImportError as e:
-            raise ImportError(f"未安装 tushare，请执行: pip install tushare  ({e})")
-
-        _setup_proxy(self.use_proxy, self.proxy_url, self.api_url)
-
-        self._pro = ts.pro_api(self.token)
-
-        # tushare 1.x 把服务地址保存在 DataApi 的私有属性中。必须写到
-        # 当前实例，不能修改 DataApi 类变量：类变量会让并行下载中的不同
-        # importer 互相覆盖 API 地址，也会污染进程内其他 Tushare 调用。
-        if self.api_url:
-            setattr(self._pro, "_DataApi__http_url", self.api_url)
-            logger.info(f"[TushareImporter] 使用自定义 API 地址: {self.api_url}")
-        else:
-            logger.info("[TushareImporter] 使用 Tushare SDK 默认 API 地址")
+        """创建实例独立的 HTTP 客户端；官方默认 HTTPS，保留自定义根地址。"""
+        if self._pro is None:
+            from .tushare_transport import OFFICIAL_TUSHARE_API_URL, TushareHTTPClient
+            self._pro = self._http_client = TushareHTTPClient(
+                self.token, self.api_url or OFFICIAL_TUSHARE_API_URL,
+                use_proxy=self.use_proxy, proxy_url=self.proxy_url,
+            )
         return self._pro
 
     def _record_request(self) -> None:
@@ -308,62 +265,6 @@ class TushareImporter:
         self.request_times.append(now)
         self.request_times = [value for value in self.request_times if now - value <= 60]
 
-    def _diagnose_custom_empty(self, method_name: str, kwargs: dict) -> pd.DataFrame | None:
-        """识别自定义端点把 HTTP 4xx 吞成空表的情况。
-
-        官方端点和已经确认过的合法空响应不额外请求。自定义端点第一次出现
-        空表时，按照 Tushare 通用 HTTP 协议直连根地址检查一次：权限错误会
-        明确抛出；若根地址实际返回了数据，则直接采用该数据。
-        """
-        if not self.api_url:
-            return None
-        if method_name in self._custom_api_denied:
-            raise TushareAPIError(self._custom_api_denied[method_name])
-        if method_name in self._custom_empty_checked:
-            return None
-
-        self._record_request()
-        try:
-            response = requests.post(
-                self.api_url,
-                json={
-                    "api_name": method_name,
-                    "token": self.token,
-                    "params": kwargs,
-                    "fields": "",
-                },
-                headers={"Accept-Encoding": "gzip"},
-                timeout=30,
-            )
-            payload = response.json()
-        except Exception as exc:
-            message = _safe_error_text(exc, self.token)
-            raise TushareAPIError(
-                f"{method_name} 接口返回空，且自定义端点诊断失败: "
-                f"{type(exc).__name__}: {message}"
-            ) from exc
-
-        code = payload.get("code")
-        if code not in (0, "0"):
-            message = _safe_error_text(
-                str(payload.get("msg") or f"服务端返回错误 code={code}").strip(),
-                self.token,
-            )
-            self._custom_api_denied[method_name] = message
-            raise TushareAPIError(message)
-
-        self._custom_empty_checked.add(method_name)
-        data = payload.get("data") or {}
-        fields = data.get("fields") or []
-        items = data.get("items") or []
-        if fields and items:
-            logger.warning(
-                "tushare [%s] SDK 路径返回空，但根地址返回 %d 条，已自动采用根地址结果",
-                method_name,
-                len(items),
-            )
-            return pd.DataFrame(items, columns=fields)
-        return None
 
     def _call(self, method_name: str, **kwargs) -> pd.DataFrame:
         """统一调用 pro 接口。
@@ -375,14 +276,15 @@ class TushareImporter:
         last_error = None
         for attempt in range(1, attempts + 1):
             if method_name in self._custom_api_denied:
-                raise TushareAPIError(self._custom_api_denied[method_name])
+                error = TushareAPIError(self._custom_api_denied[method_name])
+                error.code = 'PERMISSION_DENIED'
+                raise error
             self._record_request()
 
             try:
                 pro = self._get_pro()
-                func = getattr(pro, method_name)
-                df = func(**kwargs)
-                # Tushare SDK/代理端点在空结果时可能返回 None、[]，部分镜像也
+                df = getattr(pro, method_name)(**kwargs)
+                # 兼容注入的 SDK/测试客户端返回 None、[]，部分镜像也
                 # 可能返回 records/dict；统一成 DataFrame，避免上层访问 .empty
                 # 时把正常空结果误判成线程异常。
                 if df is None:
@@ -399,15 +301,13 @@ class TushareImporter:
                         f"Tushare {method_name} 返回了不支持的数据类型: "
                         f"{type(df).__name__}"
                     )
-                if df.empty:
-                    direct = self._diagnose_custom_empty(method_name, kwargs)
-                    if direct is not None:
-                        return direct
                 return df
             except Exception as e:
                 last_error = e
                 retryable = _is_retryable_api_error(e)
                 safe_error = _safe_error_text(e, self.token)
+                if self.api_url and getattr(e, 'code', '') in {'HTTP_401', 'HTTP_403'}:
+                    self._custom_api_denied[method_name] = safe_error
                 if not retryable or attempt >= attempts:
                     err_str = safe_error
                     if "权限" in err_str or "抱歉，您没有访问该接口的权限" in err_str:
@@ -423,15 +323,18 @@ class TushareImporter:
                     f"tushare [{method_name}] 临时失败，第 {attempt}/{attempts} 次: {safe_error}; "
                     f"{delay:.1f} 秒后重试"
                 )
-                # 镜像站 SSL/连接异常后重建 SDK 实例，避免复用异常连接状态。
-                self._pro = None
+                # 会话由 requests 管理；正式空返回不重试、不另发探测请求。
                 if delay > 0:
                     time.sleep(delay)
 
         safe_last_error = _safe_error_text(last_error, self.token)
-        raise TushareAPIError(
+        error = TushareAPIError(
             f"Tushare {method_name} 接口调用失败（已尝试 {attempt} 次）: {safe_last_error}"
-        ) from None
+        )
+        error.code = getattr(last_error, 'code', 'API_ERROR')
+        error.api_code = getattr(last_error, 'api_code', None)
+        error.retryable = _is_retryable_api_error(last_error)
+        raise error from None
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -451,6 +354,8 @@ class TushareImporter:
             if not token_ok:
                 return False, f"连接失败: {token_message}"
 
+            if self._pro is not None:
+                self._pro.close()
             self._pro = None  # 强制重新初始化，确保使用最新 api_url
             checks = (
                 ("daily", {"ts_code": "000001.SZ", "start_date": "20240102", "end_date": "20240102"}),
@@ -461,7 +366,7 @@ class TushareImporter:
                 if not isinstance(frame, pd.DataFrame) or frame.empty:
                     return False, f"连接失败: {api_name} 接口返回空数据"
 
-            endpoint = self.api_url or "Tushare SDK 默认地址"
+            endpoint = self.api_url or "Tushare 官方 HTTPS 接口"
             return True, f"连接成功，daily/index_daily 均可用（{endpoint}）"
             
         except Exception as e:
@@ -484,7 +389,9 @@ class TushareImporter:
         month_ago = (datetime.date.today() - datetime.timedelta(days=30)).strftime("%Y%m%d")
         
         method = "index_daily" if is_tushare_index_code(ts_code) else "daily"
-        if method == "daily" and is_listed_fund_code(ts_code):
+        if is_convertible_bond_code(ts_code):
+            method = "cb_daily"
+        elif method == "daily" and is_listed_fund_code(ts_code):
             method = "fund_daily"
                 
         df = self._call(method, ts_code=ts_code, start_date=month_ago, end_date=today)
@@ -503,6 +410,8 @@ class TushareImporter:
         Returns:
             DataFrame 含 trade_date, adj_factor，按日期降序且日期唯一
         """
+        if is_convertible_bond_code(ts_code):
+            raise TushareAPIError("Tushare 可转债仅支持不复权日线，请取消前/后复权选项")
         method = "adj_factor"
         if is_listed_fund_code(ts_code):
             method = "fund_adj"
@@ -642,10 +551,15 @@ class TushareImporter:
             DataFrame 含 time(datetime64), open, high, low, close, volume, amount, preClose
             按 time 升序，重复行已去除
         """
-        TARGET_TRADE_DAYS = 4000  # 安全上限，4000 交易日 ≈ 16.3 年
+        is_bond = is_convertible_bond_code(ts_code)
+        # cb_daily 单次上限 2000；1200 交易日折算后不足 2000 个自然日。
+        TARGET_TRADE_DAYS = 1200 if is_bond else 4000
+        amount_scale = 10000 if is_bond else 1000
 
         method = "daily"
-        if is_listed_fund_code(ts_code):
+        if is_bond:
+            method = "cb_daily"
+        elif is_listed_fund_code(ts_code):
             method = "fund_daily"
 
         try:
@@ -654,7 +568,8 @@ class TushareImporter:
         except ValueError:
             logger.warning(f"[download_daily] 日期格式错误: {start_date} ~ {end_date}，单次请求")
             return self._normalize_daily(
-                self._call(method, ts_code=ts_code, start_date=start_date, end_date=end_date)
+                self._call(method, ts_code=ts_code, start_date=start_date, end_date=end_date),
+                amount_scale=amount_scale,
             )
 
         if d_start > d_end:
@@ -669,7 +584,7 @@ class TushareImporter:
 
             df_chunk = self._call(method, ts_code=ts_code, start_date=s, end_date=e)
             if df_chunk is not None and not df_chunk.empty:
-                chunks.append(self._normalize_daily(df_chunk))
+                chunks.append(self._normalize_daily(df_chunk, amount_scale=amount_scale))
 
         return self._merge_chunks(chunks, time_col="time")
 
@@ -742,20 +657,23 @@ class TushareImporter:
             DataFrame 含 time(datetime64), open, high, low, close, volume, amount
             按 time 升序，重复行已去除
         """
+        if is_convertible_bond_code(ts_code):
+            raise TushareAPIError("Tushare 可转债仅支持不复权日线，不支持分钟线")
+        if is_tushare_index_code(ts_code):
+            raise TushareAPIError("当前 Tushare 导入入口仅支持指数日线")
+        if is_listed_fund_code(ts_code) and not is_etf_code(ts_code):
+            raise TushareAPIError("当前 Tushare 分钟线仅支持股票和 ETF；LOF 等其他基金请使用日线")
+        method = "etf_mins" if is_etf_code(ts_code) else "stk_mins"
         bars_per_day = _BARS_PER_DAY.get(freq, 241)
         # 8000 条上限，× 1.2 安全余量，向下取整得目标交易日数
         target_trade_days = max(1, int(8000 / bars_per_day / 1.2))
 
-        # tushare 对股票和 ETF 分钟线都使用 stk_mins 接口
-        method = "stk_mins"
 
         try:
             t_start = datetime.datetime.strptime(start_date[:19], "%Y-%m-%d %H:%M:%S")
             t_end   = datetime.datetime.strptime(end_date[:19],   "%Y-%m-%d %H:%M:%S")
         except ValueError:
             logger.warning(f"[download_minutes] 日期格式错误: {start_date} ~ {end_date}，单次请求")
-            # tushare 对股票和 ETF 分钟线都使用 stk_mins 接口
-            method = "stk_mins"
             return self._normalize_minutes(
                 self._call(method, ts_code=ts_code, freq=freq,
                            start_date=start_date, end_date=end_date)
@@ -766,10 +684,7 @@ class TushareImporter:
             return pd.DataFrame()
 
         chunks = []
-        # tushare 对股票和 ETF 分钟线都使用 stk_mins 接口
-        method = "stk_mins"
                 
-        method = "stk_mins"
         for b_start, b_end in self._batch_by_minutes(t_start, t_end, target_trade_days):
             s = b_start.strftime("%Y-%m-%d %H:%M:%S")
             e = b_end.strftime("%Y-%m-%d %H:%M:%S")
@@ -981,7 +896,7 @@ class TushareImporter:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _normalize_daily(df: pd.DataFrame) -> pd.DataFrame:
+    def _normalize_daily(df: pd.DataFrame, *, amount_scale: float = 1000) -> pd.DataFrame:
         """将 tushare daily 返回格式标准化为 DuckDB 存储格式。"""
         if df is None or df.empty:
             return pd.DataFrame()
@@ -1010,9 +925,9 @@ class TushareImporter:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # amount：tushare daily 单位为千元，转换为元（与分钟线及 miniQMT 保持一致）
+        # amount：股票/基金/指数日线为千元，可转债日线为万元；统一保存元。
         if "amount" in df.columns:
-            df["amount"] = pd.to_numeric(df["amount"], errors="coerce") * 1000
+            df["amount"] = pd.to_numeric(df["amount"], errors="coerce") * amount_scale
 
         # 按时间升序（tushare 返回降序）
         if "time" not in df.columns:
@@ -1027,7 +942,7 @@ class TushareImporter:
 
     @staticmethod
     def _normalize_minutes(df: pd.DataFrame) -> pd.DataFrame:
-        """将 tushare stk_mins 返回格式标准化为 DuckDB 存储格式。"""
+        """将 tushare stk_mins / etf_mins 返回格式标准化为 DuckDB 存储格式。"""
         if df is None or df.empty:
             return pd.DataFrame()
 

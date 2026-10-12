@@ -2,7 +2,7 @@
 
 VERSION_INFO = {
     "version": "2.2.0",          # 当前版本号（开源版，V2.x 系列）
-    "build_date": "2026-09-26",  # 构建日期
+    "build_date": "2026-10-12",  # 构建日期
     "channel": "stable",         # 更新通道
     "app_name": "看海量化回测平台（开源版）" # 应用名称
 }

@@ -6568,7 +6568,7 @@ class TushareImportDialog(QDialog):
         period_layout.addWidget(self.period_5m_end, 2, 4)
 
         self.warmup_hint_label = QLabel(
-            "提示：开始日期要早于回测开始日期，给均线、MACD 等指标留出预热期（例如用 60 日均线，至少往前多下 3 个月）。1 分钟线需要 Tushare 的 stk_mins 权限，ETF 等场内基金需要 fund_daily 权限；指数只有日线。"
+            "提示：开始日期要早于回测开始日期，给均线、MACD 等指标留出预热期（例如用 60 日均线，至少往前多下 3 个月）。股票分钟线需要 stk_mins 权限，ETF 分钟线需要 etf_mins 权限；基金日线需要 fund_daily 权限。指数、LOF 等其他基金仅支持日线；可转债仅支持不复权日线，请取消前/后复权选项。"
         )
         self.warmup_hint_label.setWordWrap(True)
         self.warmup_hint_label.setStyleSheet("color: #8a5a00;")

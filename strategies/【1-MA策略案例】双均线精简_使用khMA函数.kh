@@ -48,9 +48,7 @@
             "preClose",
             "suspendFlag"
         ],
-        "stock_list": [
-            "000001.SZ"
-        ]
+        "stock_list": []
     },
     "market_callback": {
         "pre_market_enabled": false,

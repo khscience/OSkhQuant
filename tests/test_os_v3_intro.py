@@ -151,8 +151,8 @@ def test_comparison_focuses_on_v3_features_and_cases_disclaimer(qt_app):
         dialog.deleteLater()
 
 
-def test_bundled_example_configs_use_small_stock_pools():
-    """随包示例和 V2.1 一样只用一两只股票，新用户下载少量数据就能跑出交易。"""
+def test_bundled_example_configs_require_users_to_choose_stocks():
+    """随包配置不替用户指定交易标的；教程引导用户加载后自行填写。"""
     import json
 
     folder = os.path.join(ROOT, "strategies")
@@ -162,5 +162,4 @@ def test_bundled_example_configs_use_small_stock_pools():
         with open(os.path.join(folder, name), encoding="utf-8") as handle:
             config = json.load(handle)
         stocks = config["data"]["stock_list"]
-        assert 1 <= len(stocks) <= 2, (name, len(stocks))
-        assert set(stocks) <= {"000001.SZ", "000002.SZ"}, (name, stocks)
+        assert stocks == [], (name, stocks)

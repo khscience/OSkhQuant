@@ -9,7 +9,7 @@ import logging
 import threading
 
 import requests
-from PyQt5.QtCore import QObject, Qt, QTimer, QUrl, pyqtSignal
+from PyQt5.QtCore import QObject, Qt, QUrl, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import QMessageBox
 
@@ -20,11 +20,13 @@ RELEASES_URL = "https://github.com/khscience/OSkhQuant/releases/latest"
 
 
 class UpdateManager(QObject):
+    update_available = pyqtSignal(dict)
     check_finished = pyqtSignal(bool, str)  # (成功/失败, 消息)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent = parent
+        self.update_available.connect(self._dispatch_update_dialog, Qt.QueuedConnection)
         self.auto_check = True
         try:
             from version import get_channel, get_version, get_version_info
@@ -88,7 +90,7 @@ class UpdateManager(QObject):
                 version_info = data.get('data', {}) or {}
                 if self.compare_versions(version_info.get('version', ''), current_version):
                     logging.info(f"发现新版本: {version_info.get('version')}")
-                    QTimer.singleShot(0, lambda vi=version_info: self._show_update_dialog(vi))
+                    self.update_available.emit(version_info)
                     self.check_finished.emit(True, f"发现新版本：{version_info.get('version')}")
                 else:
                     self.check_finished.emit(True, "当前已是最新版本")
@@ -97,6 +99,10 @@ class UpdateManager(QObject):
                 self.check_finished.emit(False, f"检查更新时出错: {exc}")
 
         threading.Thread(target=_do_check, daemon=True).start()
+
+    @pyqtSlot(dict)
+    def _dispatch_update_dialog(self, version_info):
+        self._show_update_dialog(version_info)
 
     def _show_update_dialog(self, version_info):
         """提示有新版本（从不强制）；用户选择后在浏览器里打开下载页。"""

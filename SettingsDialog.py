@@ -1303,7 +1303,7 @@ class SettingsDialog(QDialog):
         api_url_label.setStyleSheet("color: #E0E0E0;")
         api_url_label.setFixedWidth(label_width)
         self.tushare_api_url_edit = QLineEdit()
-        self.tushare_api_url_edit.setPlaceholderText("留空使用 Tushare SDK 默认地址")
+        self.tushare_api_url_edit.setPlaceholderText("留空使用 Tushare 官方 HTTPS 接口")
         self.tushare_api_url_edit.setStyleSheet(lineedit_style)
         self.tushare_api_url_edit.setText(
             normalize_tushare_api_url(self.settings.value('tushare_api_url', ''))
@@ -1371,7 +1371,7 @@ class SettingsDialog(QDialog):
         tushare_layout.addLayout(proxy_url_row)
 
         hint_label = QLabel(
-            "Token 本地编码保存。分钟线需在 tushare.pro 开通 stk_mins 权限；复权因子需约 2000 积分。"
+            "Token 本地编码保存。股票分钟线需 stk_mins 权限，ETF 分钟线需 etf_mins 权限；基金日线需 fund_daily 权限。可转债仅支持不复权日线。"
             " <a href='https://tushare.pro' style='color: #4da6ff; text-decoration: underline;'>前往官网 ↗</a>"
             "<br><span style='color: #888888;'>（网络代理为可选项，不勾选时直连；仅当网络环境无法直连时勾选并配置）</span>"
         )
@@ -1839,7 +1839,7 @@ class SettingsDialog(QDialog):
                 token_b64 = ''
             self.settings.setValue('tushare_token', token_b64)
 
-            # 保存 API 地址（留空表示使用 Tushare SDK 默认数据接口）
+            # 保存 API 地址（留空表示使用 Tushare 官方 HTTPS 接口）
             api_url = normalize_tushare_api_url(
                 self._normalize_url_text(self.tushare_api_url_edit.text())
             )

@@ -9,6 +9,9 @@ on:
       tag:
         description: "要同步的标签，例如 V2.2.0"
         required: true
+      expected_commit:
+        description: "已验收的发布提交（完整 40 位 SHA，两端标签必须一致）"
+        required: true
 
 permissions:
   contents: read
@@ -21,34 +24,66 @@ jobs:
       GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
       GITEE_REPO: mrkanhai/oskhquant
       TAG: ${{ inputs.tag }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: 检查令牌
         shell: pwsh
         run: |
           if (-not $env:GITEE_TOKEN) { throw "没有配置 GITEE_TOKEN" }
+          if ($env:TAG -notmatch '^[vV]2\.\d+\.\d+$') { throw "标签必须为 V2.x.y" }
+          if ($env:EXPECTED_COMMIT -notmatch '^[0-9a-f]{40}$') { throw "请填写已验收提交的完整 SHA" }
+          gh release view $env:TAG --repo ${{ github.repository }} --json tagName,isDraft,isPrerelease,assets > github-release.json
+          if ($LASTEXITCODE -ne 0) { throw "读取 GitHub Release 失败" }
+          $metadata = Get-Content -Raw github-release.json | ConvertFrom-Json
+          if ($metadata.isDraft -or $metadata.isPrerelease) { throw "GitHub 尚未正式发布，禁止同步草稿" }
       - name: 下载 GitHub Release 附件
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release | Out-Null
           gh release download $env:TAG --repo ${{ github.repository }} --dir release --pattern "*.exe" --pattern "SHA256SUMS.txt"
+          if ($LASTEXITCODE -ne 0) { throw "下载 Release 附件失败" }
+          python packaging/verify_release.py --metadata github-release.json --tag $env:TAG --expected-commit $env:EXPECTED_COMMIT --github-repo ${{ github.repository }} --gitee-repo $env:GITEE_REPO --directory release
+          if ($LASTEXITCODE -ne 0) { throw "发布提交或附件校验未通过，禁止上传" }
           Get-ChildItem release | Format-Table Name, Length
       - name: 创建 Gitee Release 并上传
         shell: pwsh
         run: |
           $api = "https://gitee.com/api/v5/repos/$env:GITEE_REPO"
+          # 已存在的 Release 不覆盖；避免重跑时创建重复项或损坏已发布附件。
+          $existing = $null
+          try {
+            $existing = Invoke-RestMethod -Uri "$api/releases/tags/$env:TAG"
+          } catch {
+            if ([int]$_.Exception.Response.StatusCode -ne 404) { throw }
+          }
+          if ($existing) { throw "Gitee 已存在该 Release，请核对已有附件后处理，不自动覆盖" }
           $release = Invoke-RestMethod -Method Post -Uri "$api/releases" -Body @{
             access_token     = $env:GITEE_TOKEN
             tag_name         = $env:TAG
             name             = "看海量化回测平台（开源版） $env:TAG"
             body             = "安装包与 GitHub Release 相同，校验见 SHA256SUMS.txt。更新内容见 CHANGELOG.md。需要 macOS / Linux、命令行或更多数据源？了解 V3：https://khsci.com/khQuant/#version-comparison"
-            target_commitish = "main"
+            target_commitish = $env:EXPECTED_COMMIT
             prerelease       = "false"
           }
-          foreach ($file in Get-ChildItem release) {
+          try {
+            foreach ($file in Get-ChildItem release) {
             Write-Host "上传 $($file.Name)（$([math]::Round($file.Length / 1MB, 1)) MB）"
             curl.exe --fail -sS -F "access_token=$env:GITEE_TOKEN" -F "file=@$($file.FullName)" `
               "$api/releases/$($release.id)/attach_files"
             if ($LASTEXITCODE -ne 0) {
-              throw "上传 $($file.Name) 失败（Gitee 对附件大小有限制，超限时请在 Release 说明里改放 GitHub 下载链接）"
+              throw "上传 $($file.Name) 失败（请核对 Gitee 附件大小限制）"
             }
+            }
+          } catch {
+            # 仅撤回本次刚创建且附件不完整的 Release，不动标签或已有 Release。
+            try {
+              Invoke-RestMethod -Method Delete -Uri "$api/releases/$($release.id)" -Body @{ access_token = $env:GITEE_TOKEN } | Out-Null
+            } catch {
+              Write-Warning "撤回失败：请在 Gitee 手工删除本次不完整 Release，ID=$($release.id)"
+            }
+            throw "Gitee 附件上传未完成，本次发布失败。"
           }

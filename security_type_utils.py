@@ -49,3 +49,17 @@ def is_listed_fund_code(stock_code: str) -> bool:
     if market == "BJ":
         return False
     return sh_fund or sz_fund
+
+
+def is_convertible_bond_code(stock_code: str) -> bool:
+    """Classify listed convertible bonds without treating stock/index codes as bonds."""
+    code, market = split_security_code(stock_code)
+    if len(code) != 6 or not code.isdigit():
+        return False
+    sh_bond = code.startswith(("110", "113", "118"))
+    sz_bond = code.startswith(("123", "127", "128"))
+    if market == "SH":
+        return sh_bond
+    if market == "SZ":
+        return sz_bond
+    return not market and (sh_bond or sz_bond)

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import sys
 import types
 
 import pandas as pd
@@ -14,109 +13,69 @@ from duckdb_storage.tushare_importer import (
     TUSHARE_DEFAULT_URL,
     TushareImporter,
     _normalize_api_url,
-    _setup_proxy,
 )
 
 
-class _FakeDataApi:
-    # 模拟 tushare 1.x 自带的旧默认值，测试 importer 不修改类变量。
-    _DataApi__http_url = "http://api.waditu.com/dataapi"
-
-    def __init__(self, token: str):
-        self.token = token
-        self.calls = []
-
-    def daily(self, **kwargs):
-        self.calls.append((self._DataApi__http_url, kwargs))
-        return pd.DataFrame([{"trade_date": "20240102"}])
-
-    def index_daily(self, **kwargs):
-        self.calls.append((self._DataApi__http_url, kwargs))
-        return pd.DataFrame([{"trade_date": "20240102"}])
-
-    def trade_cal(self, **kwargs):
-        self.calls.append((self._DataApi__http_url, kwargs))
-        return pd.DataFrame([{"cal_date": "20240101", "is_open": 1}])
-
-
-def _install_fake_tushare(monkeypatch):
-    tushare_module = types.ModuleType("tushare")
-    pro_module = types.ModuleType("tushare.pro")
-    client_module = types.ModuleType("tushare.pro.client")
-
-    tushare_module.__path__ = []
-    pro_module.__path__ = []
-    client_module.DataApi = _FakeDataApi
-    tushare_module.pro = pro_module
-    pro_module.client = client_module
-    tushare_module.pro_api = lambda token: _FakeDataApi(token)
-
-    monkeypatch.setitem(sys.modules, "tushare", tushare_module)
-    monkeypatch.setitem(sys.modules, "tushare.pro", pro_module)
-    monkeypatch.setitem(sys.modules, "tushare.pro.client", client_module)
+def _install_fake_transport(monkeypatch):
+    """Mock the wire once; exercise real importer URL and response handling."""
+    import duckdb_storage.tushare_transport as transport
+    class Session:
+        def __init__(self):
+            self.calls, self.proxies = [], {}
+            self.trust_env = True
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return types.SimpleNamespace(status_code=200, json=lambda: {
+                "code": 0, "data": {"fields": ["trade_date"], "items": [["20240102"]]},
+            })
+        def close(self):
+            pass
+    monkeypatch.setattr(transport.requests, "Session", Session)
 
 
 def test_normalize_api_url_preserves_selected_server():
     assert _normalize_api_url("") == TUSHARE_DEFAULT_URL
     assert _normalize_api_url("api.tushare.pro/") == TUSHARE_DEFAULT_URL
+    assert _normalize_api_url("http://api.waditu.com/dataapi") == TUSHARE_DEFAULT_URL
     assert _normalize_api_url("https：//new.example.test/daily") == "https://new.example.test"
     assert _normalize_api_url("http://tushare.xyz/") == "http://tushare.xyz"
 
 
 def test_proxy_disabled_bypasses_custom_api_host(monkeypatch):
-    for key in (
-        "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
-        "ALL_PROXY", "all_proxy",
-    ):
-        monkeypatch.setenv(key, "http://old-proxy.example.invalid:8080")
-    monkeypatch.setenv("NO_PROXY", "localhost")
-
-    _setup_proxy(False, api_url="https://new-api.example.test/dataapi")
-
-    for key in (
-        "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
-        "ALL_PROXY", "all_proxy",
-    ):
-        assert key not in os.environ
-    assert "new-api.example.test" in os.environ["NO_PROXY"].split(",")
+    _install_fake_transport(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "http://system-proxy.example:8080")
+    before = dict(os.environ)
+    direct = TushareImporter("token", api_url="https://custom.example/api")._get_pro()
+    proxied = TushareImporter("token", use_proxy=True, proxy_url="http://local.example:7890")._get_pro()
+    assert direct._session.trust_env is False and direct._session.proxies == {}
+    assert proxied._session.proxies == {"http": "http://local.example:7890", "https": "http://local.example:7890"}
+    assert dict(os.environ) == before
 
 
 def test_api_url_is_bound_to_each_data_api_instance(monkeypatch):
-    _install_fake_tushare(monkeypatch)
-
-    official = TushareImporter(token="official", api_url="https://api.tushare.pro")
+    _install_fake_transport(monkeypatch)
+    official = TushareImporter(token="official", api_url="http://api.tushare.pro")
     mirror = TushareImporter(token="mirror", api_url="https://mirror.example.test/api")
-
-    official_pro = official._get_pro()
-    mirror_pro = mirror._get_pro()
-
-    # v3.3.8 曾把官网域名错误写进 SDK 数据地址；旧配置必须自动迁移为
-    # SDK 自带的完整 dataapi 地址，且不能改动 DataApi 类变量。
-    assert official_pro._DataApi__http_url == "http://api.waditu.com/dataapi"
-    assert mirror_pro._DataApi__http_url == "https://mirror.example.test/api"
-    assert _FakeDataApi._DataApi__http_url == "http://api.waditu.com/dataapi"
-
-    result = official._call("daily", ts_code="000001.SZ")
-    assert not result.empty
-    assert official_pro.calls == [
-        ("http://api.waditu.com/dataapi", {"ts_code": "000001.SZ"})
-    ]
-    assert mirror_pro.calls == []
+    official_pro, mirror_pro = official._get_pro(), mirror._get_pro()
+    assert official_pro._url == "https://api.tushare.pro"
+    assert mirror_pro._url == "https://mirror.example.test/api"
+    assert not official._call("daily", ts_code="000001.SZ").empty
+    assert official_pro._session.calls[0][0] == "https://api.tushare.pro"
+    assert official_pro._session.calls[0][1]["json"]["api_name"] == "daily"
+    assert official_pro._session.calls[0][1]["allow_redirects"] is False
+    assert mirror_pro._session.calls == []
 
 
 def test_connection_rebuild_keeps_configured_url(monkeypatch):
-    _install_fake_tushare(monkeypatch)
+    _install_fake_transport(monkeypatch)
     importer = TushareImporter(token="token", api_url="https://new.example.test")
-
+    previous = importer._get_pro()
     ok, message = importer.test_connection()
-
-    assert ok is True
-    assert "https://new.example.test" in message
-    assert importer._pro._DataApi__http_url == "https://new.example.test"
-    assert [call[1]["ts_code"] for call in importer._pro.calls] == [
-        "000001.SZ",
-        "000300.SH",
-    ]
+    assert ok is True and "https://new.example.test" in message
+    assert importer._pro is not previous
+    calls = importer._pro._session.calls
+    assert all(call[0] == "https://new.example.test" for call in calls)
+    assert [call[1]["json"]["params"]["ts_code"] for call in calls] == ["000001.SZ", "000300.SH"]
 
 
 def test_connection_rejects_empty_required_market_endpoint(monkeypatch):

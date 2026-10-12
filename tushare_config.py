@@ -10,13 +10,16 @@ from dataclasses import dataclass
 import kh_settings as global_settings
 
 
-# 留空表示完全使用 Tushare SDK 自带的数据接口。不要把官网域名当成
-# ``DataApi.__http_url``：SDK 会继续在该地址后拼接 ``/daily`` 等接口名。
+# 留空表示使用官方 HTTPS JSON 接口；旧官方域名配置也归一到此默认值。
+# 自定义 API 地址按根地址 POST，不追加 /daily 等接口名。
 DEFAULT_TUSHARE_API_URL = ""
 _LEGACY_INVALID_API_URLS = frozenset({
     "api.tushare.pro",
     "http://api.tushare.pro",
     "https://api.tushare.pro",
+    "api.waditu.com/dataapi",
+    "http://api.waditu.com/dataapi",
+    "https://api.waditu.com/dataapi",
 })
 _TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
