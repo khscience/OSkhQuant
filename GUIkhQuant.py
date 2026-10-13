@@ -5692,7 +5692,7 @@ class KhQuantGUI(QMainWindow):
             return
         self._v3_debug_hint_shown = True
         self.log_message(
-            "提示：V3 内置 VSCode 编辑器，可以在策略代码里打断点、逐行查看变量，查错更快；"
+            "提示：V3 Windows 版集成 VS Code 启动与断点调试（需自行安装 VS Code），可以在策略代码里打断点、逐行查看变量；"
             "点工具栏「✨ 了解 V3」查看。",
             "INFO",
         )
@@ -6989,7 +6989,7 @@ class KhQuantGUI(QMainWindow):
             warning_text += "• 立即将这些文件移动到安全位置\n"
             warning_text += "• 重新选择策略文件和保存配置文件\n\n"
             warning_text += "📁 推荐保存位置：\n"
-            warning_text += f"• 用户文档目录: {os.path.expanduser('~/Documents/KHQuant/')}\n"
+            warning_text += f"• 用户文档目录: {os.path.dirname(self.get_user_strategies_dir())}\n"
             warning_text += f"• 桌面目录: {os.path.expanduser('~/Desktop/')}\n"
             warning_text += "• 用户策略目录: 点击[选择策略文件]时的默认目录\n"
             warning_text += "• 或任何您熟悉的其他文件夹"

@@ -127,6 +127,9 @@ def test_strategy_code_error_hints_v3_debugging_once(tmp_path):
     GUIkhQuant.KhQuantGUI._maybe_hint_v3_debugging(harness, strategy_error)
     GUIkhQuant.KhQuantGUI._maybe_hint_v3_debugging(harness, strategy_error)
     assert len(logs) == 1 and "V3" in logs[0] and "断点" in logs[0]
+    for phrase in ("Windows", "VS Code", "自行安装", "集成", "启动与断点调试"):
+        assert phrase in logs[0]
+    assert "内置" not in logs[0]
 
 
 def test_comparison_focuses_on_v3_features_and_cases_disclaimer(qt_app):
