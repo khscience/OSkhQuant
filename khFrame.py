@@ -2511,6 +2511,8 @@ class KhQuantFramework:
 
     def run(self):
         """启动框架"""
+        # 在初始化账户、行情和策略前失败，避免空池产生默认股票的回测结果。
+        self.get_stock_list()
         self.start_time = time.time()
         start_datetime = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
@@ -2684,33 +2686,23 @@ class KhQuantFramework:
             self._cleanup_runtime_state(stage="run_end")
 
     def get_stock_list(self):
-        """获取股票列表"""
-        stock_codes = []
-        try:
-            # 优先从配置文件中的stock_list读取
-            stock_codes = self.config.get_stock_list()
-            if stock_codes:
-                logging.info(f"从配置文件读取到 {len(stock_codes)} 支股票")
-            else:
-                # 兼容性处理：尝试从stock_list_file文件读取（如果存在）
-                stock_list_file = self.config.config_dict["data"].get("stock_list_file", "")
-                if stock_list_file and os.path.exists(stock_list_file):
-                    with open(stock_list_file, 'r', encoding='utf-8') as f:
-                        stock_codes = [line.strip() for line in f if line.strip()]
-                        logging.info(f"从兼容文件 {stock_list_file} 读取到 {len(stock_codes)} 支股票")
-                        # 将读取到的股票列表保存到配置文件中
-                        self.config.update_stock_list(stock_codes)
-                        self.config.save_config()
-                else:
-                    # 如果都没有，使用默认股票
-                    stock_codes = ["000001.SZ"]
-                    logging.warning("股票列表为空，使用默认股票: 000001.SZ")
+        """读取用户指定的股票池；空池或读取失败均中止运行。"""
+        from khConfig import require_stock_list
 
+        try:
+            stock_codes = self.config.get_stock_list()
+            data_config = self.config.config_dict.get("data", {})
+            # 只有未配置内嵌股票池的旧配置才读取外部文件；显式空池不能被覆盖。
+            if "stock_list" not in data_config and "stock_pool" not in data_config:
+                stock_list_file = data_config.get("stock_list_file", "")
+                if stock_list_file:
+                    with open(stock_list_file, "r", encoding="utf-8-sig") as f:
+                        stock_codes = [line.strip() for line in f if line.strip()]
         except Exception as e:
-            # 出现异常时使用默认股票
-            stock_codes = ["000001.SZ"]
-            logging.error(f"读取股票列表出错: {str(e)}，使用默认股票: 000001.SZ")
-        
+            raise RuntimeError(f"读取股票池失败：{e}") from e
+
+        stock_codes = require_stock_list(stock_codes)
+        logging.info(f"从配置读取到 {len(stock_codes)} 支股票")
         return stock_codes
 
     # ============================================================

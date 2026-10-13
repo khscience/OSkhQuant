@@ -18,6 +18,13 @@ def _is_truthy(value) -> bool:
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "on", "y")
 
+def require_stock_list(stock_codes):
+    """运行前确认股票池非空；不替用户选择股票。"""
+    if not stock_codes or not any(str(code or "").strip() for code in stock_codes):
+        raise ValueError("请先在股票池设置里添加股票")
+    return stock_codes
+
+
 class KhConfig:
     """配置管理类"""
     

@@ -3502,6 +3502,18 @@ class KhQuantGUI(QMainWindow):
             print(f"状态栏更新失败: {message}")  # 错误时至少输出到控制台
 
     def start_strategy(self):
+        # 点击开始时先校验，失败不创建线程、不写临时配置、不做行情初始化。
+        from khConfig import require_stock_list
+        try:
+            require_stock_list(self.get_stock_list())
+            runtime_config = self._build_runtime_config_for_run()
+            data_config = runtime_config.get("data", {})
+            require_stock_list(data_config.get("stock_list", data_config.get("stock_pool", [])))
+        except Exception as e:
+            QMessageBox.warning(self, "无法开始回测", str(e))
+            self.log_message(f"回测未启动：{e}", "ERROR")
+            return
+
         try:
             self.log_message("开始启动策略...", "INFO")
             
@@ -3525,7 +3537,6 @@ class KhQuantGUI(QMainWindow):
                     except Exception as e:
                         self.log_message(f"删除旧临时配置文件失败: {str(e)}", "WARNING")
                 
-                runtime_config = self._build_runtime_config_for_run()
                 self._current_runtime_config = runtime_config
                 with open(self.temp_config_path, "w", encoding="utf-8") as f:
                     json.dump(runtime_config, f, indent=4, ensure_ascii=False)
