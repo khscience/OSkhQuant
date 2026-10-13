@@ -26,6 +26,13 @@ def main_splitter_default_sizes(total_width):
     sizes.append(max(0, int(total_width) - sum(sizes)))
     return sizes
 
+
+def wrapped_label(text):
+    """自动换行的说明文字：栏宽被拖窄时整句换行显示，不会被截断。"""
+    label = QLabel(text)
+    label.setWordWrap(True)
+    return label
+
 # 周期 / 触发方式下拉框的悬停说明：各周期的数据从哪里下载
 PERIOD_SOURCE_TIP = (
     "日线、5 分钟线：可用 BaoStock（免费）或 Tushare 下载\n"
@@ -2761,28 +2768,28 @@ class KhQuantGUI(QMainWindow):
         # Tick触发配置页面（无需额外配置）
         tick_page = QWidget()
         tick_layout = QVBoxLayout()
-        tick_layout.addWidget(QLabel("Tick触发无需额外配置，每个Tick都会触发策略"))
+        tick_layout.addWidget(wrapped_label("Tick触发无需额外配置，每个Tick都会触发策略"))
         tick_layout.addStretch()
         tick_page.setLayout(tick_layout)
         
         # 1分钟K线触发配置页面
         k1_page = QWidget()
         k1_layout = QVBoxLayout()
-        k1_layout.addWidget(QLabel("1分钟K线触发无需额外配置，每形成一个1分钟K线就会触发策略"))
+        k1_layout.addWidget(wrapped_label("1分钟K线触发无需额外配置，每形成一个1分钟K线就会触发策略"))
         k1_layout.addStretch()
         k1_page.setLayout(k1_layout)
         
         # 5分钟K线触发配置页面
         k5_page = QWidget()
         k5_layout = QVBoxLayout()
-        k5_layout.addWidget(QLabel("5分钟K线触发无需额外配置，每形成一个5分钟K线就会触发策略"))
+        k5_layout.addWidget(wrapped_label("5分钟K线触发无需额外配置，每形成一个5分钟K线就会触发策略"))
         k5_layout.addStretch()
         k5_page.setLayout(k5_layout)
         
         # 日K线触发配置页面
         daily_page = QWidget()
         daily_layout = QVBoxLayout()
-        daily_layout.addWidget(QLabel("日K线触发无需额外配置，每个交易日按一根日K线触发一次策略（运行时当天日线已完整，时间显示的09:30只是日期标记）"))
+        daily_layout.addWidget(wrapped_label("日K线触发无需额外配置，每个交易日按一根日K线触发一次策略（运行时当天日线已完整，时间显示的09:30只是日期标记）"))
         daily_layout.addStretch()
         daily_page.setLayout(daily_layout)
         

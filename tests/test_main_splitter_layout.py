@@ -141,3 +141,15 @@ def test_baostock_defaults_to_one_download_process():
     viewer = (ROOT / "duckdb_storage" / "viewer.py").read_text(encoding="utf-8")
     assert "self.baostock_workers_spin.setValue(1)" in viewer
     assert "self.baostock_workers_spin.setRange(1, 4)" in viewer
+
+
+def test_trigger_descriptions_wrap_when_middle_panel_is_narrow():
+    """中栏默认收窄、还能拖得更窄：触发方式说明必须自动换行，不能被截断。"""
+    from PyQt5.QtWidgets import QApplication, QLabel
+    app = QApplication.instance() or QApplication([])
+    ns = _module_defs("GUIkhQuant.py", {"wrapped_label"}, {"QLabel": QLabel})
+    label = ns["wrapped_label"]("日K线触发无需额外配置，每个交易日按一根日K线触发一次策略")
+    assert label.wordWrap()
+    source = (ROOT / "GUIkhQuant.py").read_text(encoding="utf-8")
+    assert source.count('wrapped_label("') >= 4
+    assert 'addWidget(QLabel("日K线触发无需额外配置' not in source
