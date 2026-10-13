@@ -79,6 +79,7 @@ def test_bundled_examples_match_comparison_row():
     assert sorted(name[:-3] for name in examples) == sorted(name[:-3] for name in names if name.endswith(".kh"))
     row = next(row for row in kh_v3_intro.COMPARISON_ROWS if row[0] == "策略案例")
     assert row[1].startswith(f"{len(examples)} 个基础案例")
+    assert "持续更新的专栏策略案例" in row[2]
 
 
 def test_first_run_dialog_links_to_v3(qt_app, monkeypatch):
@@ -137,7 +138,8 @@ def test_comparison_focuses_on_v3_features_and_cases_disclaimer(qt_app):
     assert "获取方式" not in items
     assert "Web 回测" in items and "包管理" in items
     data_row = next(row for row in kh_v3_intro.COMPARISON_ROWS if row[0] == "数据来源")
-    for word in ("miniQMT", "QMT", "tx"):
+    assert "miniQMT" in data_row[2] and "同花顺" in data_row[2]
+    for word in ("HTTP 桥接", "tx"):
         assert word not in data_row[2]
     assert "更多数据源" in data_row[2]
     for word in ("不指定交易标的", "随机数", "算法", "不构成任何策略或投资建议"):
