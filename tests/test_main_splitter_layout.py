@@ -1,5 +1,5 @@
 # coding: utf-8
-"""主窗口三栏可拖动、按默认比例分配宽度；BaoStock 默认单进程下载。"""
+"""主窗口三栏可拖动、按默认比例分配宽度；BaoStock 默认单进程下载、最多 4 个进程。"""
 import ast
 from pathlib import Path
 from types import SimpleNamespace
@@ -140,4 +140,4 @@ def test_baostock_defaults_to_one_download_process():
                        "__init__", "num_workers") == 1
     viewer = (ROOT / "duckdb_storage" / "viewer.py").read_text(encoding="utf-8")
     assert "self.baostock_workers_spin.setValue(1)" in viewer
-    assert "self.baostock_workers_spin.setRange(1, 8)" in viewer
+    assert "self.baostock_workers_spin.setRange(1, 4)" in viewer

@@ -4384,9 +4384,15 @@ class KhQuantGUI(QMainWindow):
                         with open(data_config["stock_list_file"], 'r', encoding='utf-8') as f:
                             stock_codes = [line.strip() for line in f if line.strip()]
                         self.load_stock_list_from_config(stock_codes)
+                    else:
+                        self.load_stock_list_from_config([])
                 except Exception as e:
+                    self.load_stock_list_from_config([])
                     self.log_message(f"加载兼容性股票列表文件失败: {str(e)}", "WARNING")
-                
+            else:
+                # 配置里没有股票池：清空界面，与实际运行时的空股票池一致
+                self.load_stock_list_from_config([])
+
 
     def on_start_date_changed(self, date):
         """开始日期变化时更新结束日期的最小值"""
@@ -6166,10 +6172,11 @@ class KhQuantGUI(QMainWindow):
         return trigger_type_map[self.trigger_type_combo.currentIndex()]
         
     def load_stock_list_from_config(self, stock_list):
-        """从配置加载股票列表"""
-        if not stock_list:
-            return
-            
+        """从配置加载股票列表；配置里股票池为空时也要清空界面，不能留着上一个策略的股票。"""
+        stock_list = stock_list or []
+        # 上一个策略里删掉的股票记录不再适用
+        self.deleted_stocks = set()
+
         # 清空当前显示
         for cb in self.pool_checkboxes.values():
             was_blocked = cb.blockSignals(True)

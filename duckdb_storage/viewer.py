@@ -4945,9 +4945,9 @@ class BaoStockImportDialog(QDialog):
 
         btn_layout.addWidget(QLabel("下载进程数:"))
         self.baostock_workers_spin = QSpinBox()
-        self.baostock_workers_spin.setRange(1, 8)
+        self.baostock_workers_spin.setRange(1, 4)
         self.baostock_workers_spin.setValue(1)
-        self.baostock_workers_spin.setToolTip("BaoStock 并行下载进程数，默认 1 个最稳定。2 个更快；再多服务器容易限流、断开连接，请求次数也消耗更快。")
+        self.baostock_workers_spin.setToolTip("BaoStock 并行下载进程数，默认 1 个最稳定，最多 4 个。2 个更快；再多服务器容易限流、断开连接，请求次数也消耗更快。")
         self.baostock_workers_spin.setFixedWidth(60)
         btn_layout.addWidget(self.baostock_workers_spin)
 
