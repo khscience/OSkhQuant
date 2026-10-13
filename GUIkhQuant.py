@@ -14,6 +14,18 @@ from kh_app_identity import (
 
 WINDOW_TITLE = f"看海量化回测系统 V{SHORT_VERSION}"
 
+# 主窗口三栏（策略配置 / 触发与账户 / 系统日志）的默认宽度比例，用户拖动后的比例存在设置里
+MAIN_SPLITTER_RATIOS = (38, 27, 35)
+MAIN_SPLITTER_STATE_KEY = "mainSplitterState"
+
+
+def main_splitter_default_sizes(total_width):
+    """按默认比例把总宽度分给三栏。"""
+    total = sum(MAIN_SPLITTER_RATIOS)
+    sizes = [int(total_width * ratio / total) for ratio in MAIN_SPLITTER_RATIOS[:-1]]
+    sizes.append(max(0, int(total_width) - sum(sizes)))
+    return sizes
+
 # 周期 / 触发方式下拉框的悬停说明：各周期的数据从哪里下载
 PERIOD_SOURCE_TIP = (
     "日线、5 分钟线：可用 BaoStock（免费）或 Tushare 下载\n"
@@ -1601,7 +1613,25 @@ class KhQuantGUI(QMainWindow):
         """窗口显示事件"""
         super().showEvent(event)
         # 移除强制最大化，让窗口保持居中显示
-        
+        if not getattr(self, "_main_splitter_initialized", True):
+            self._main_splitter_initialized = True
+            # 等窗口尺寸定下来再分配三栏宽度
+            QTimer.singleShot(0, self._init_main_splitter_sizes)
+
+    def _init_main_splitter_sizes(self):
+        """恢复用户上次拖好的三栏宽度；没有记录或记录无效时按默认比例分配。"""
+        splitter = getattr(self, "main_splitter", None)
+        if splitter is None:
+            return
+        saved = self.settings.value(MAIN_SPLITTER_STATE_KEY)
+        try:
+            if saved and splitter.restoreState(saved) and all(size > 0 for size in splitter.sizes()):
+                return
+        except Exception:
+            pass
+        handles = splitter.handleWidth() * max(0, splitter.count() - 1)
+        splitter.setSizes(main_splitter_default_sizes(splitter.width() - handles))
+
     def changeEvent(self, event):
         """窗口状态变化事件，处理窗口还原时居中显示"""
         super().changeEvent(event)
@@ -1611,7 +1641,7 @@ class KhQuantGUI(QMainWindow):
                 self.center_window()
                 
     def _main_content_min_width(self):
-        """三列等宽排布时，左栏配置内容不出横向滚动条所需的窗口宽度（0 表示无法估算）。"""
+        """三栏按默认比例排布时，左栏配置内容不出横向滚动条所需的窗口宽度（0 表示无法估算）。"""
         area = getattr(self, "left_scroll_area", None)
         if sys.platform == "darwin" or area is None or area.widget() is None:
             return 0
@@ -1620,7 +1650,8 @@ class KhQuantGUI(QMainWindow):
         m = self.left_layout.contentsMargins()
         panel += m.left() + m.right()
         outer = self.ui_metrics["main_layout_margins"]
-        return 3 * panel + outer[0] + outer[2] + 2 * self.ui_metrics["main_layout_spacing"]
+        handles = 2 * 6  # 分隔条两根拖动柄
+        return int(panel * sum(MAIN_SPLITTER_RATIOS) / MAIN_SPLITTER_RATIOS[0]) + outer[0] + outer[2] + handles
 
     def center_window(self):
         """将窗口居中显示在主屏幕；返回 False 表示屏幕宽度放不下完整内容，应最大化显示"""
@@ -1816,16 +1847,22 @@ class KhQuantGUI(QMainWindow):
         middle_panel.setLayout(self.middle_layout)
         right_panel.setLayout(self.right_layout)
         
-        # 设置三个面板的最小宽度
+        # 三栏放进可拖动的分隔条：左栏配置项多给宽一些，中栏触发设置用不了太宽。
+        # 最小宽度比默认宽度小，留出拖动余地；左栏自带滚动区域，窄了也不会截断。
         panel_min_width = self.ui_metrics["main_panel_min_width"]
-        left_panel.setMinimumWidth(panel_min_width)
-        middle_panel.setMinimumWidth(panel_min_width)
-        right_panel.setMinimumWidth(panel_min_width)
+        left_panel.setMinimumWidth(int(panel_min_width * 0.7))
+        middle_panel.setMinimumWidth(int(panel_min_width * 0.6))
+        right_panel.setMinimumWidth(int(panel_min_width * 0.6))
 
-        # 添加三个面板到主布局
-        main_layout.addWidget(left_panel)
-        main_layout.addWidget(middle_panel)
-        main_layout.addWidget(right_panel)
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(6)
+        for index, panel in enumerate((left_panel, middle_panel, right_panel)):
+            self.main_splitter.addWidget(panel)
+            # 窗口变大变小时按同一比例分配宽度
+            self.main_splitter.setStretchFactor(index, MAIN_SPLITTER_RATIOS[index])
+        main_layout.addWidget(self.main_splitter)
+        self._main_splitter_initialized = False
 
         # 调整大小以适应内容
         # self.adjustSize()  # 删除此行，因为它会覆盖最大化设置
@@ -3855,7 +3892,9 @@ class KhQuantGUI(QMainWindow):
             # 保存窗口状态和位置
             self.settings.setValue("windowState", self.saveState())
             self.settings.setValue("geometry", self.saveGeometry())
-            
+            if getattr(self, "main_splitter", None) is not None:
+                self.settings.setValue(MAIN_SPLITTER_STATE_KEY, self.main_splitter.saveState())
+
             # 记录关闭时间
             end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             self.log_message(f"软件关闭时间: {end_time}", "INFO")

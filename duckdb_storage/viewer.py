@@ -2915,7 +2915,7 @@ class BaoStockImportThread(QThread):
         stocks: List[str],
         periods_config: Dict[str, dict],
         request_tracker=None,
-        num_workers: int = 2,
+        num_workers: int = 1,
         timeout_per_task: float = 120.0,
         force_overwrite: bool = False,
         include_front_adjusted: bool = True,
@@ -4946,8 +4946,8 @@ class BaoStockImportDialog(QDialog):
         btn_layout.addWidget(QLabel("下载进程数:"))
         self.baostock_workers_spin = QSpinBox()
         self.baostock_workers_spin.setRange(1, 8)
-        self.baostock_workers_spin.setValue(2)
-        self.baostock_workers_spin.setToolTip("BaoStock 并行下载进程数。建议 1~2；进程多了服务器容易限流、断开连接，请求次数也消耗更快。")
+        self.baostock_workers_spin.setValue(1)
+        self.baostock_workers_spin.setToolTip("BaoStock 并行下载进程数，默认 1 个最稳定。2 个更快；再多服务器容易限流、断开连接，请求次数也消耗更快。")
         self.baostock_workers_spin.setFixedWidth(60)
         btn_layout.addWidget(self.baostock_workers_spin)
 
@@ -5373,12 +5373,12 @@ class BaoStockImportDialog(QDialog):
                 return
 
             self._refresh_request_usage_label()
-            num_workers = 2
+            num_workers = 1
             try:
                 if hasattr(self, "baostock_workers_spin") and self.baostock_workers_spin:
                     num_workers = int(self.baostock_workers_spin.value())
             except Exception:
-                num_workers = 2
+                num_workers = 1
 
             self.import_thread = BaoStockImportThread(
                 self.manager,

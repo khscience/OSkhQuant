@@ -555,7 +555,7 @@ class MultiProcessBaoStockImporter:
     BaoStock 多进程下载器（主进程调度 + 子进程下载）
 
     使用方式：
-        importer = MultiProcessBaoStockImporter(num_workers=2)
+        importer = MultiProcessBaoStockImporter(num_workers=1)
         importer.start()
         importer.add_task(stock_code, bs_code, period, start, end)
         while not importer.is_done(): ...
@@ -564,7 +564,7 @@ class MultiProcessBaoStockImporter:
 
     def __init__(
         self,
-        num_workers: int = 2,
+        num_workers: int = 1,
         timeout_per_task: float = 120.0,
         max_task_retries: int = 0,
         retry_backoff: Optional[List[float]] = None,
