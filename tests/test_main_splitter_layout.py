@@ -153,3 +153,21 @@ def test_trigger_descriptions_wrap_when_middle_panel_is_narrow():
     source = (ROOT / "GUIkhQuant.py").read_text(encoding="utf-8")
     assert source.count('wrapped_label("') >= 4
     assert 'addWidget(QLabel("日K线触发无需额外配置' not in source
+
+
+def test_middle_and_right_panels_never_shrink_below_their_content():
+    """拖到最窄时中栏、右栏也要放得下自身控件（如盘前盘后那一行），不能被压扁截断。"""
+    from PyQt5.QtWidgets import QHBoxLayout, QLabel
+    app, ns, gui, init = _splitter_gui()
+    middle = gui.main_splitter.widget(1)
+    row = QHBoxLayout(middle)
+    row.addWidget(QLabel("触发盘前回调    运行时间:    08:30:00    触发盘后回调"))
+    middle.setMinimumWidth(10)
+    need = middle.minimumSizeHint().width()
+    init(gui)
+    app.processEvents()
+    assert middle.minimumWidth() >= need > 10
+    gui.main_splitter.setSizes([1500, 1, 499])
+    app.processEvents()
+    assert gui.main_splitter.sizes()[1] >= need
+    gui.main_splitter.close()

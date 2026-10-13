@@ -1630,6 +1630,11 @@ class KhQuantGUI(QMainWindow):
         splitter = getattr(self, "main_splitter", None)
         if splitter is None:
             return
+        # 中栏、右栏拖到最窄时也要放得下自身控件（如盘前盘后那一行），不能被压扁截断；
+        # 左栏有滚动区域，不受此限。内容在面板建好后才确定，所以在这里补设。
+        for index in (1, 2):
+            panel = splitter.widget(index)
+            panel.setMinimumWidth(max(panel.minimumWidth(), panel.minimumSizeHint().width()))
         saved = self.settings.value(MAIN_SPLITTER_STATE_KEY)
         try:
             if saved and splitter.restoreState(saved) and all(size > 0 for size in splitter.sizes()):
