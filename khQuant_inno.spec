@@ -117,7 +117,7 @@ analysis = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=['packaging/smoke_runtime.py'],
     excludes=excludes,
     noarchive=False,
 )
