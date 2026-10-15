@@ -10,6 +10,7 @@ import pytest
 from PyQt5.QtWidgets import QApplication, QMessageBox, QWidget
 
 import GUIkhQuant as gui_module
+import kh_quickstart
 
 
 @pytest.fixture(scope="module")
@@ -25,6 +26,7 @@ def _harness():
     harness._suggest_download_if_empty = (
         lambda data_dir: gui_module.KhQuantGUI._suggest_download_if_empty(harness, data_dir)
     )
+    harness.show_quickstart = lambda show_data_button=True: gui_module.KhQuantGUI.show_quickstart(harness, show_data_button)
     return harness
 
 
@@ -33,7 +35,7 @@ def test_empty_data_prompt_waits_for_open_modal(qt_app, tmp_path, monkeypatch):
     modal = {"widget": object()}
     monkeypatch.setattr(gui_module.QApplication, "activeModalWidget", staticmethod(lambda: modal["widget"]))
     monkeypatch.setattr(gui_module.QTimer, "singleShot", staticmethod(lambda ms, fn: scheduled.append((ms, fn))))
-    monkeypatch.setattr(QMessageBox, "exec_", lambda self: shown.append(self.windowTitle()) or 0)
+    monkeypatch.setattr(kh_quickstart.QuickStartDialog, "exec_", lambda self: shown.append(self.windowTitle()) or 0)
 
     harness = _harness()
     gui_module.KhQuantGUI._suggest_download_if_empty(harness, str(tmp_path))
@@ -46,13 +48,13 @@ def test_empty_data_prompt_waits_for_open_modal(qt_app, tmp_path, monkeypatch):
     # 关掉之后才问
     modal["widget"] = None
     scheduled.pop()[1]()
-    assert shown == ["还没有行情数据"] and scheduled == []
+    assert shown == ["新手上手"] and scheduled == []
 
 
 def test_empty_data_prompt_skipped_when_stock_data_exists(qt_app, tmp_path, monkeypatch):
     shown = []
     monkeypatch.setattr(gui_module.QApplication, "activeModalWidget", staticmethod(lambda: None))
-    monkeypatch.setattr(QMessageBox, "exec_", lambda self: shown.append(self.windowTitle()) or 0)
+    monkeypatch.setattr(kh_quickstart.QuickStartDialog, "exec_", lambda self: shown.append(self.windowTitle()) or 0)
     (tmp_path / "SZ").mkdir()
     (tmp_path / "SZ" / "000001.db").write_bytes(b"")
     gui_module.KhQuantGUI._suggest_download_if_empty(_harness(), str(tmp_path))

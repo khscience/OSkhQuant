@@ -1984,8 +1984,12 @@ class KhQuantGUI(QMainWindow):
         # 添加帮助按钮
         self._help_btn = QToolButton()
         self._help_btn.setText("?")
-        self._help_btn.setToolTip("打开使用教程")
-        self._help_btn.clicked.connect(self.open_help_tutorial)
+        self._help_btn.setToolTip("新手上手与使用教程")
+        help_menu = QMenu(self._help_btn)
+        help_menu.addAction("新手上手（视频教程）", lambda: self.show_quickstart(show_data_button=True))
+        help_menu.addAction("完整在线教程", self.open_help_tutorial)
+        self._help_btn.setMenu(help_menu)
+        self._help_btn.setPopupMode(QToolButton.InstantPopup)
         toolbar.addWidget(self._help_btn)
 
         # 「了解 V3」：工具栏最右边的彩色按钮，打开 V3 介绍与版本对比
@@ -7166,21 +7170,19 @@ class KhQuantGUI(QMainWindow):
         self.check_software_status()
         if stock_dbs:
             return
-        msg_box = QMessageBox(self)
-        self.apply_dark_titlebar(msg_box)
-        msg_box.setWindowTitle("还没有行情数据")
-        msg_box.setIcon(QMessageBox.Information)
-        msg_box.setText(
-            "数据目录里还没有股票行情，回测前需要先下载。\n\n"
-            "• 日线、5 分钟线：「数据管理 → BaoStock导入」，免费，不用注册账号\n"
-            "• 1 分钟线：「数据管理 → Tushare导入」，需要在设置里填 Token 并开通 stk_mins 权限\n\n"
-            "下载时开始日期要早于回测开始日期，给均线等指标留出预热期。"
-        )
-        open_btn = msg_box.addButton("打开数据管理", QMessageBox.AcceptRole)
-        msg_box.addButton("稍后", QMessageBox.RejectRole)
-        msg_box.exec_()
-        if msg_box.clickedButton() is open_btn:
+        # 还没有股票行情：弹「新手上手」，讲清下载数据、示例要先填股票池，并引导看视频教程
+        self.show_quickstart(show_data_button=True)
+
+    def show_quickstart(self, show_data_button=True):
+        """「新手上手」窗口；首次启动没有行情时自动弹出，也可从工具栏「?」打开。"""
+        from kh_quickstart import QuickStartDialog, RESULT_OPEN_DATA, RESULT_WATCH_VIDEO, open_quickstart_video
+        dialog = QuickStartDialog(self, show_data_button=show_data_button)
+        self.apply_dark_titlebar(dialog)
+        result = dialog.exec_()
+        if result == RESULT_OPEN_DATA:
             self.open_duckdb_viewer()
+        elif result == RESULT_WATCH_VIDEO:
+            open_quickstart_video()
 
     def get_user_strategies_dir(self):
         r"""获取用户策略文件目录路径：文档\KhQuant_OS\strategies
