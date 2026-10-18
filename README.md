@@ -1,22 +1,51 @@
-# 看海量化回测平台（开源版）2.2
+<p align="center">
+  <img src="icons/stock_icon.png" width="120" alt="khQuant">
+</p>
 
-**免费开源的 A 股量化回测软件。** 不用开户，不用装 QMT，下载安装包装好就能用：下载行情、写策略、跑回测、看报告，全在一个 Windows 桌面程序里完成。
+<h1 align="center">看海量化回测平台（开源版）</h1>
 
-想验证一个交易想法，通常要先凑数据、再搭回测框架、再自己算收益和回撤，事情还没开始就耗掉大半精力。看海量化回测平台（KHQuant）把这些都做好了：数据免费下载到本机，策略只写一个 Python 文件，点「开始运行」就出完整报告。
+<p align="center">
+  <b>免费开源的 A 股量化回测软件</b><br>
+  不用开户，不用装 QMT。下载数据、写策略、跑回测、看报告，一个桌面程序全部搞定。
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/version-2.2.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/platform-Windows-0078D6" alt="platform">
+  <img src="https://img.shields.io/badge/python-3.11-3776AB" alt="python">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey" alt="license"></a>
+  <a href="https://github.com/khscience/OSkhQuant/releases"><img src="https://img.shields.io/github/downloads/khscience/OSkhQuant/total?label=downloads" alt="downloads"></a>
+  <a href="https://github.com/khscience/OSkhQuant/stargazers"><img src="https://img.shields.io/github/stars/khscience/OSkhQuant?style=social" alt="stars"></a>
+</p>
+
+<p align="center">
+  <a href="#下载安装">下载安装</a> ·
+  <a href="https://khsci.com/khQuant/quickstart/">3 分钟上手视频</a> ·
+  <a href="https://khsci.com/khQuant/tutorial/">完整教程</a> ·
+  <a href="https://khsci.com/khQuant/">官网</a> ·
+  <a href="CHANGELOG.md">更新记录</a>
+</p>
+
+![回测报告](docs/images/backtest-report.png)
+
+## 简介
+
+想验证一个交易想法，通常要先凑数据、再搭回测框架、再自己算收益和回撤，事情还没开始就耗掉大半精力。
+
+看海量化回测平台（khQuant）把这些都做好了：数据免费下载到本机，策略只写一个 Python 文件，点「开始运行」就出完整报告。
+2.2 是开源版的大版本升级，回测内核与 V3.4.1.10 对齐，改为读取本地 DuckDB 数据，不再需要 QMT。
+
+> 从 V2.1 升级？先看 [docs/从V2.1迁移.md](docs/从V2.1迁移.md)。本次更新内容见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 功能特点
 
 - **上手快**：首次打开有引导，帮你选数据目录、下载沪深300基准；本机还没有行情时会弹出「新手上手」，四步跑通第一个回测，另配 3 分钟[快速上手视频](https://khsci.com/khQuant/quickstart/)。
 - **数据免费，存在本机**：BaoStock 不用注册就能下载日线和 5 分钟线；有 Tushare 账号和对应权限，还可以下 1 分钟线、ETF、可转债。数据存进本地 DuckDB，回测时直接读本机数据。
 - **按 A 股规则撮合**：T+0 / T+1、佣金、印花税、过户费、滑点、成交量限制都算进去；Tick / 1 分钟 / 5 分钟 / 日线四种触发周期，另有盘前、盘后回调。
 - **策略就是一个 Python 文件**：实现 `init` 和 `khHandlebar` 两个函数就能跑，随包的精简双均线示例去掉注释只有二三十行。`khHistory`、`khMA` 等函数负责取数和算指标，内置 MyTT 指标库和缠论工具，随包 4 个示例策略可以照着改。
-- **报告看得清楚**：收益曲线与基准对比、交易记录、日收益，夏普、索提诺、最大回撤、胜率、盈亏比等绩效指标，个股 K 线上标出每一笔买卖。
+- **报告看得清楚**：收益曲线与基准对比、回撤、每日盈亏、买卖分布、交易记录，夏普、索提诺、最大回撤、胜率、盈亏比等绩效指标，个股 K 线上标出每一笔买卖。
 - **和 V3 同一个回测内核**：2.2.0 对齐 V3.4.1.10，每次发版前用冻结数据逐笔核对成交、费用和收益；以后想要更多功能，策略可以直接搬到 V3。
 - **可以和 V2.1 同时安装**：程序、设置、数据、日志各用各的，互不干扰。
-
-> **需要更多功能？看看 V3**：Windows / macOS / Linux 三端通用、CLI 命令行模式、Web 回测工作台、更多数据源（持续集成中）、
-> 定时自动补数据、Windows 集成 VS Code 启动与断点调试（需自行安装）、Python 包管理、13 个策略案例（另有持续更新的专栏策略案例）。V3 和 2.2 用同一套回测内核，策略可以直接搬过去。
-> 对比见下方「开源版与 V3」一节，详情见官网：https://khsci.com/khQuant/#version-comparison
-
-> 从 V2.1 升级？先看 [docs/从V2.1迁移.md](docs/从V2.1迁移.md)。本次更新内容见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 下载安装
 
@@ -36,6 +65,8 @@
 引导结束后，如果本机还没有股票行情，软件会弹出「新手上手」，按下面四步就能跑通第一个回测。
 也可以打开[快速上手视频](https://khsci.com/khQuant/quickstart/)跟着做一遍；之后随时可从工具栏「?」→「新手上手（视频教程）」再打开。
 
+<p align="center"><img src="docs/images/quickstart.png" width="720" alt="新手上手"></p>
+
 1. **下载数据**：「数据管理 → BaoStock导入」，填要研究的股票代码，下载日线。开始日期要早于回测开始日期，给均线等指标留出预热期；
    1 分钟线和 ETF 用「Tushare导入」。
 2. **加载示例**：工具栏「加载配置」，选一个示例策略（在 `文档\KhQuant_OS\strategies`）。
@@ -43,7 +74,30 @@
    再「保存配置」。
 4. **开始运行**：回测区间要在已下载的数据范围内，点「开始运行」，看回测报告。案例参数包含随机数，比较两次结果前要先固定参数。
 
+## 写一个策略
+
+策略是一个 Python 文件，实现 `init`、`khHandlebar`，可选 `khPreMarket`、`khPostMarket`。下面是一个最小例子：
+
+```python
+from khQuantImport import *
+
+def init(stock_list, data):
+    pass
+
+def khHandlebar(data):
+    signals = []
+    price = khPrice(data, "000001.SZ", "close")
+    if not khHas(data, "000001.SZ") and price > 0:
+        signals.extend(generate_signal(data, "000001.SZ", price, 0.5, "buy", "示例买入"))
+    return signals
+```
+
+常用接口：`khHistory`、`khKline`、`khMA`、`khPrice`、`khGet`、`khHas`、`khDuckDB`、`khDuckWrite`、MyTT 指标、缠论工具。
+完整教程见 https://khsci.com/khQuant/tutorial/ 。V2.1 的 `xtdata` 接口在开源版里不可用，调用时会提示改用 `khHistory` 等本地接口。
+
 ## 数据来源与能力边界
+
+<p align="center"><img src="docs/images/baostock-import.png" width="560" alt="BaoStock 导入"></p>
 
 | 周期 | BaoStock | Tushare | 说明 |
 | :--- | :--- | :--- | :--- |
@@ -94,27 +148,6 @@
 DuckDB 同一个库文件同一时刻只允许一个进程写，有进程在写时别的进程连只读也打不开。
 下载或回测提示数据库被占用时，可以在「数据管理 → 占用诊断」里查看是哪个程序占着。
 
-## 策略开发
-
-策略是一个 Python 文件，实现 `init`、`khHandlebar`，可选 `khPreMarket`、`khPostMarket`：
-
-```python
-from khQuantImport import *
-
-def init(stock_list, data):
-    pass
-
-def khHandlebar(data):
-    signals = []
-    price = khPrice(data, "000001.SZ", "close")
-    if not khHas(data, "000001.SZ") and price > 0:
-        signals.extend(generate_signal(data, "000001.SZ", price, 0.5, "buy", "示例买入"))
-    return signals
-```
-
-常用接口：`khHistory`、`khKline`、`khMA`、`khPrice`、`khGet`、`khHas`、`khDuckDB`、`khDuckWrite`、MyTT 指标、缠论工具。
-完整教程见 https://khsci.com/khQuant/tutorial/ 。V2.1 的 `xtdata` 接口在开源版里不可用，调用时会提示改用 `khHistory` 等本地接口。
-
 ## 源码运行与打包
 
 ```bash
@@ -127,12 +160,26 @@ python GUIkhQuant.py
 - 打包：再安装 `requirements-build.lock` 和 Inno Setup 6，运行 `build_inno.bat`，安装包在 `Output\`。
 - 本仓库由看海量化主库的构建脚本生成，`PORT_BASE` 记录对应的主库提交。
 
-## 反馈
+## 文档与教程
+
+| 内容 | 链接 |
+| :--- | :--- |
+| 3 分钟快速上手视频 | https://khsci.com/khQuant/quickstart/ |
+| 完整图文与视频教程 | https://khsci.com/khQuant/tutorial/ |
+| 从 V2.1 迁移 | [docs/从V2.1迁移.md](docs/从V2.1迁移.md) |
+| 更新记录 | [CHANGELOG.md](CHANGELOG.md) |
+| 第三方组件 | [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) |
+
+## 反馈与交流
 
 问题和建议请提交 Issue：[GitHub](https://github.com/khscience/OSkhQuant/issues) · [Gitee](https://gitee.com/mrkanhai/oskhquant/issues)。
 请附上软件版本、操作步骤和日志（`%LOCALAPPDATA%\KhQuantOS\logs\app.log`）。
 
 作者：Mr.看海 · 微信公众号「看海的城堡」 · [知乎](https://www.zhihu.com/people/feng-zhu-38) · [B站](https://space.bilibili.com/3546667687086777)
+
+觉得这个项目有用，欢迎点个 Star，方便以后找到它，也能让更多人看到。
+
+[![Star History](https://api.star-history.com/svg?repos=khscience/OSkhQuant&type=Date)](https://star-history.com/#khscience/OSkhQuant&Date)
 
 ## 许可与免责
 
