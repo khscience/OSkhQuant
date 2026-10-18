@@ -1,9 +1,8 @@
 name: 测试
 
+# 发版前的测试在本机按 requirements.lock 运行；这里改为手动运行，需要时在 Actions 页面点「Run workflow」。
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   test:

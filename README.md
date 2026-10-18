@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/python-3.11-3776AB" alt="python">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey" alt="license"></a>
   <a href="https://github.com/khscience/OSkhQuant/releases"><img src="https://img.shields.io/github/downloads/khscience/OSkhQuant/total?label=downloads" alt="downloads"></a>
-  <a href="https://github.com/khscience/OSkhQuant/stargazers"><img src="https://img.shields.io/github/stars/khscience/OSkhQuant?style=social" alt="stars"></a>
+  <a href="https://github.com/khscience/OSkhQuant"><img src="https://img.shields.io/github/stars/khscience/OSkhQuant?style=social" alt="stars"></a>
 </p>
 
 <p align="center">

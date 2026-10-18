@@ -1,10 +1,11 @@
 name: 构建安装包
 
-# 推送 V2.x.y 标签（沿用 V2.1.4 的大写 V）时构建安装包，并创建 GitHub 草稿 Release（人工确认后再发布）。
+# 构建安装包，并创建 GitHub 草稿 Release（人工确认后再发布）。
+# 正式安装包在本机构建、装机验收后手工发布，本流程改为手动运行：
+# 在 Actions 页面运行时，「Use workflow from」选要构建的 V2.x.y 标签（沿用 V2.1.4 的大写 V）。
 # 附件用英文文件名：GitHub 会去掉附件名里的中文。
 on:
-  push:
-    tags: ["V2.*", "v2.*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
