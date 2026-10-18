@@ -3097,9 +3097,13 @@ class BaoStockImportThread(QThread):
             source_keys = set(source_times.dt.strftime("%Y%m%d"))
             all_source_keys = source_times_all.dt.strftime("%Y%m%d")
         else:
-            local_keys = set(local_times.astype("int64").tolist())
-            source_keys = set(source_times.astype("int64").tolist())
-            all_source_keys = source_times_all.astype("int64")
+            # 本地从 DuckDB 读出的是 datetime64[us]，来源解析后是 [ns]；
+            # 统一精度后再比，否则同一时刻也对不上，前复权全历史刷新永远失败。
+            from .incremental import market_time_keys
+
+            local_keys = set(market_time_keys(local_times).tolist())
+            source_keys = set(market_time_keys(source_times).tolist())
+            all_source_keys = market_time_keys(source_times_all)
         if all_source_keys.duplicated().any():
             raise RuntimeError("前复权刷新返回重复行情时间，已拒绝应用")
         missing = local_keys - source_keys

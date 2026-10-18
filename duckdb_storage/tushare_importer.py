@@ -54,10 +54,11 @@ TUSHARE_DEFAULT_URL = DEFAULT_TUSHARE_API_URL
 # 日线时间偏移（09:30:00，与 miniQMT 保持一致）
 _DAILY_TIME_OFFSET = pd.Timedelta(hours=9, minutes=30)
 
-# 各分钟频率每交易日 bar 数。1 分钟源包含 09:30 共 241 根；
-# 5 分钟完整交易日按本地 Tushare/miniQMT 实际落库结果为 48 根。
+# 各分钟频率每交易日 bar 数，只用于估算分批大小（取上限）。1 分钟含 09:30
+# 共 241 根；Tushare 官方 5 分钟同样含 09:30 集合竞价一根，共 49 根（BaoStock/
+# QMT 为 48 根）。完整日判定见 incremental.is_complete_bar_day。
 _BARS_PER_DAY: dict = {
-    "1min": 241, "5min": 48, "15min": 17, "30min": 9, "60min": 5,
+    "1min": 241, "5min": 49, "15min": 17, "30min": 9, "60min": 5,
 }
 
 # 官方 fund_adj 单次最多 2000 行，并明确支持 offset/limit 分页。

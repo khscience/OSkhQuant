@@ -41,6 +41,57 @@ EXPECTED_BARS_PER_DAY = {
     "tick": TICK_MIN_ROWS_PER_DAY,
 }
 
+# Tushare 官方 5 分钟线每天比 BaoStock/QMT 多一根 09:30（开盘集合竞价）K 线，
+# 共 49 根；不含这一根时为 48 根。两种口径都算完整日，导入时原样保存，
+# 不合并、不删除这一根，避免改写数据源原始行情。
+OPENING_AUCTION_BAR_PERIODS = frozenset({"5m"})
+OPENING_AUCTION_TIME = "09:30:00"
+
+
+def is_complete_bar_day(
+    period: object,
+    total_rows: int,
+    valid_rows: int,
+    opening_rows: int = 0,
+    opening_valid_rows: int = 0,
+) -> bool:
+    """K 线单日是否完整：唯一时间戳数恰为标准根数且全部有效。
+
+    5m 另外接受“标准根数 + 09:30 集合竞价一根”（Tushare 口径）。
+    ``opening_rows``/``opening_valid_rows`` 是当天 09:30 的唯一时间戳数
+    和其中字段完整的数量；旧的完整度接口不提供时按 0 处理，判断与原来一致。
+    """
+
+    period_value = _period_text(period)
+    expected = EXPECTED_BARS_PER_DAY[period_value]
+    if total_rows == expected and valid_rows == expected:
+        return True
+    return (
+        period_value in OPENING_AUCTION_BAR_PERIODS
+        and int(opening_rows or 0) == 1
+        and int(opening_valid_rows or 0) == 1
+        and total_rows == expected + 1
+        and valid_rows == expected + 1
+    )
+
+
+def market_time_keys(values):
+    """把行情时间转成纳秒整数键，用于跨来源逐时间点比对。
+
+    DuckDB 1.x 配 pandas 2.x 读出的 TIMESTAMP 是 ``datetime64[us]``，字符串
+    解析得到的是 ``datetime64[ns]``；直接 ``astype("int64")`` 两边会差 1000 倍，
+    同一时刻也对不上。这里先统一到纳秒再取整数。调用方负责先排除无效时间。
+    """
+
+    import pandas as pd
+
+    series = values if isinstance(values, pd.Series) else pd.Series(values)
+    parsed = pd.to_datetime(series, errors="coerce")
+    if getattr(parsed.dt, "tz", None) is not None:
+        parsed = parsed.dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
+    return parsed.astype("datetime64[ns]").astype("int64")
+
+
 RAW_PRICE_COLUMNS = ("open", "high", "low", "close")
 RAW_COMPLETENESS_COLUMNS = RAW_PRICE_COLUMNS + ("volume", "amount")
 ADJUSTMENT_SUFFIXES = ("front", "back", "front_ratio", "back_ratio")
@@ -555,6 +606,7 @@ def validate_overwrite_frame(
         raise ValueError("数据源返回含无效 time，拒绝整日覆写，原数据未改动")
     checked = frame.copy()
     checked["_trade_date"] = parsed_time.dt.strftime("%Y%m%d")
+    checked["_opening"] = parsed_time.dt.strftime("%H:%M:%S") == OPENING_AUCTION_TIME
     valid_mask = checked[list(required)].notna().all(axis=1)
     for column in required:
         numeric = pd.to_numeric(checked[column], errors="coerce")
@@ -593,6 +645,20 @@ def validate_overwrite_frame(
             ):
                 allowed_rows = evidence_rows
             incomplete = total_rows != allowed_rows or valid_rows != allowed_rows
+            if (
+                incomplete
+                and allowed_rows == expected_rows
+                and period_value in OPENING_AUCTION_BAR_PERIODS
+            ):
+                # Tushare 5m 含 09:30 集合竞价一根，共 49 根，同样是完整日。
+                opening = group["_opening"]
+                incomplete = not is_complete_bar_day(
+                    period_value,
+                    total_rows,
+                    valid_rows,
+                    int(group.loc[opening, "time"].nunique()),
+                    int(group.loc[opening & group["_valid"], "time"].nunique()),
+                )
         if incomplete:
             bad_days.append((date8, total_rows, valid_rows))
     if missing_dates or unexpected_dates or bad_days:
@@ -782,8 +848,8 @@ def validate_adjustment_coverage(
         raw_keys = raw_times.dt.strftime("%Y%m%d")
         adjusted_keys = adjusted_times.dt.strftime("%Y%m%d")
     else:
-        raw_keys = raw_times.astype("int64")
-        adjusted_keys = adjusted_times.astype("int64")
+        raw_keys = market_time_keys(raw_times)
+        adjusted_keys = market_time_keys(adjusted_times)
     if raw_keys.duplicated().any():
         raise ValueError("原始行情包含重复时间，无法安全应用复权")
     if adjusted_keys.duplicated().any():
@@ -839,7 +905,8 @@ def build_incremental_plan(
     """读取本地覆盖情况并生成真正的缺口下载区间。
 
     历史日线必须恰有 1 个时间戳，1m/5m 必须分别恰有 241/48 个不同
-    时间戳；所需价格列为空也视为部分日。tick 使用最低有效行数阈值，
+    时间戳（5m 含 09:30 集合竞价一根共 49 个也算完整，见
+    ``is_complete_bar_day``）；所需价格列为空也视为部分日。tick 使用最低有效行数阈值，
     若指定 tick_max_age_days 则只规划保留窗口内的交易日，默认不限制。
     默认不判断尚未收盘的当天，也永不把未来交易日加入下载计划。
     """
@@ -931,8 +998,12 @@ def build_incremental_plan(
                 total_rows >= expected_bars and valid_rows >= expected_bars
             )
         else:
-            is_complete = (
-                total_rows == expected_bars and valid_rows == expected_bars
+            is_complete = is_complete_bar_day(
+                period_value,
+                total_rows,
+                valid_rows,
+                int(stats.get("opening_rows", 0) or 0),
+                int(stats.get("opening_valid_rows", 0) or 0),
             )
         if is_complete:
             complete.append(date8)

@@ -2392,6 +2392,7 @@ class DuckDBManager:
                     column for column in requested_columns
                     if column not in schema_columns
                 ]
+                opening_expr = "strftime(time, '%H:%M:%S') = '09:30:00'"
                 if requested_columns and not missing_schema:
                     valid_expr = " AND ".join(
                         (
@@ -2410,10 +2411,23 @@ class DuckDBManager:
                     valid_count_sql = (
                         f"COUNT(DISTINCT CASE WHEN {valid_expr} THEN time END)"
                     )
+                    opening_valid_sql = (
+                        f"COUNT(DISTINCT CASE WHEN {opening_expr} AND {valid_expr} "
+                        "THEN time END)"
+                    ) if period_value == '5m' else "0"
                 elif requested_columns:
                     valid_count_sql = "0"
+                    opening_valid_sql = "0"
                 else:
                     valid_count_sql = "COUNT(DISTINCT time)"
+                    opening_valid_sql = (
+                        f"COUNT(DISTINCT CASE WHEN {opening_expr} THEN time END)"
+                    ) if period_value == '5m' else "0"
+                # Tushare 5m 每天多一根 09:30 集合竞价 K 线（共 49 根）。单独统计
+                # 这一根，供 incremental.is_complete_bar_day 判断是否仍是完整日。
+                opening_count_sql = (
+                    f"COUNT(DISTINCT CASE WHEN {opening_expr} THEN time END)"
+                ) if period_value == '5m' else "0"
 
                 where_parts = ["time IS NOT NULL"]
                 params = []
@@ -2427,19 +2441,26 @@ class DuckDBManager:
                 rows = conn.execute(f"""
                     SELECT strftime(time, '%Y%m%d') AS date_str,
                            COUNT(DISTINCT time) AS total_rows,
-                           {valid_count_sql} AS valid_rows
+                           {valid_count_sql} AS valid_rows,
+                           {opening_count_sql} AS opening_rows,
+                           {opening_valid_sql} AS opening_valid_rows
                     FROM {table_name}
                     WHERE {where_sql}
                     GROUP BY 1
                 """, params).fetchall()
-                return {
-                    str(date_value): {
+                result = {}
+                for date_value, total_rows, valid_rows, opening_rows, opening_valid_rows in rows:
+                    if not date_value:
+                        continue
+                    stats = {
                         'total_rows': int(total_rows or 0),
                         'valid_rows': int(valid_rows or 0),
                     }
-                    for date_value, total_rows, valid_rows in rows
-                    if date_value
-                }
+                    if period_value == '5m':
+                        stats['opening_rows'] = int(opening_rows or 0)
+                        stats['opening_valid_rows'] = int(opening_valid_rows or 0)
+                    result[str(date_value)] = stats
+                return result
         except Exception as exc:
             if raise_on_error or is_duckdb_lock_error(exc):
                 raise

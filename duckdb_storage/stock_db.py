@@ -848,15 +848,24 @@ class StockDB:
                         "整日覆写缺少必需行情字段: " + ", ".join(missing_raw)
                     )
                 valid_mask = df_save[list(required_raw)].notna().all(axis=1)
+                from .incremental import OPENING_AUCTION_TIME, is_complete_bar_day
+
+                opening_mask = (
+                    df_save["time"].dt.strftime("%H:%M:%S") == OPENING_AUCTION_TIME
+                )
                 day_stats = (
                     df_save.assign(
                         _trade_date=df_save["time"].dt.normalize(),
                         _raw_valid=valid_mask,
+                        _opening=opening_mask,
+                        _opening_valid=opening_mask & valid_mask,
                     )
                     .groupby("_trade_date", sort=True)
                     .agg(
                         total_rows=("time", "nunique"),
                         valid_rows=("_raw_valid", "sum"),
+                        opening_rows=("_opening", "sum"),
+                        opening_valid_rows=("_opening_valid", "sum"),
                     )
                 )
                 verified_short = {}
@@ -886,6 +895,15 @@ class StockDB:
                     if period != "1d" and date_key in verified_short:
                         allowed_rows = verified_short[date_key]
                     if total_rows != allowed_rows or valid_rows != allowed_rows:
+                        # Tushare 5m 含 09:30 集合竞价一根共 49 根，同样是完整日。
+                        if allowed_rows == expected_rows and is_complete_bar_day(
+                            period,
+                            total_rows,
+                            valid_rows,
+                            int(stats["opening_rows"]),
+                            int(stats["opening_valid_rows"]),
+                        ):
+                            continue
                         invalid_days.append((
                             pd.Timestamp(trade_date).strftime("%Y-%m-%d"),
                             total_rows,
