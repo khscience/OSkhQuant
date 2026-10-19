@@ -61,11 +61,17 @@ jobs:
             if ([int]$_.Exception.Response.StatusCode -ne 404) { throw }
           }
           if ($existing) { throw "Gitee 已存在该 Release，请核对已有附件后处理，不自动覆盖" }
+          # 说明直接沿用 GitHub Release 正文，两边一致；取不到时用简短说明兜底。
+          $notes = (gh release view $env:TAG --repo ${{ github.repository }} --json body --jq .body) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or -not $notes.Trim()) {
+            Write-Warning "未取到 GitHub Release 正文，改用简短说明"
+            $notes = "安装包与 GitHub Release 相同，校验见 SHA256SUMS.txt。更新内容见 CHANGELOG.md。需要 macOS / Linux、命令行或更多数据源？了解 V3：https://khsci.com/khQuant/#version-comparison"
+          }
           $release = Invoke-RestMethod -Method Post -Uri "$api/releases" -Body @{
             access_token     = $env:GITEE_TOKEN
             tag_name         = $env:TAG
             name             = "看海量化回测平台（开源版） $env:TAG"
-            body             = "安装包与 GitHub Release 相同，校验见 SHA256SUMS.txt。更新内容见 CHANGELOG.md。需要 macOS / Linux、命令行或更多数据源？了解 V3：https://khsci.com/khQuant/#version-comparison"
+            body             = $notes
             target_commitish = $env:EXPECTED_COMMIT
             prerelease       = "false"
           }
