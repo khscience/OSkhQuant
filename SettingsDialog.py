@@ -1304,7 +1304,11 @@ class SettingsDialog(QDialog):
         api_url_label.setFixedWidth(label_width)
         self.tushare_api_url_edit = QLineEdit()
         self.tushare_api_url_edit.setPlaceholderText("留空使用 Tushare 官方 HTTPS 接口")
-        self.tushare_api_url_edit.setToolTip("填写完整的 http:// 或 https:// 地址时，按所填协议和路径连接。")
+        self.tushare_api_url_edit.setToolTip(
+            "填写完整的 http:// 或 https:// 地址时，按所填协议和路径连接。\n"
+            "服务商提供的地址可以直接填写：程序会自动识别官方写法，"
+            "或「地址/接口名 + 请求头 X-API-Key」写法。"
+        )
         self.tushare_api_url_edit.setStyleSheet(lineedit_style)
         self.tushare_api_url_edit.setText(
             normalize_tushare_api_url(self.settings.value('tushare_api_url', ''))

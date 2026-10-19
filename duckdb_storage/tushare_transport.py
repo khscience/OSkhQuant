@@ -15,6 +15,24 @@ import requests
 
 OFFICIAL_TUSHARE_API_URL = "https://api.tushare.pro"
 
+# 接口写法：official = 官方 SDK（POST 到一个地址，token 在请求体）；
+# gateway = 服务商常见的「地址/接口名」+ 请求头 X-API-Key。auto 先按官方写法请求，
+# 地址返回 404/405（不认这种写法）时改用 gateway，并按地址记住，后续直接用。
+TUSHARE_PROTOCOLS = ("auto", "official", "gateway")
+GATEWAY_KEY_HEADER = "X-API-Key"
+_DETECTED_PROTOCOL: dict = {}
+
+# 服务端声明暂时不可用、可稍后重试的业务错误（区别于权限、参数等永久错误）。
+_TRANSIENT_BUSINESS_MARKERS = (
+    "upstream_pool_exhausted", "pool_exhausted", "数据当前不可用", "稍后重试",
+    "服务繁忙", "系统繁忙", "busy", "temporarily unavailable", "rate limit", "too many requests",
+)
+
+
+def _is_transient_business_error(message: str) -> bool:
+    text = str(message or "").lower()
+    return any(marker.lower() in text for marker in _TRANSIENT_BUSINESS_MARKERS)
+
 
 class TushareProtocolError(RuntimeError):
     def __init__(self, message: str, code: str = "API_ERROR", *, retryable: bool = False, api_code=None):
@@ -69,12 +87,17 @@ def _safe_metadata(value, token):
 
 
 class TushareHTTPClient:
-    def __init__(self, token: str, api_url: str, *, use_proxy=False, proxy_url="", session=None):
+    def __init__(self, token: str, api_url: str, *, use_proxy=False, proxy_url="", session=None,
+                 protocol: str = "auto"):
         parsed = urlsplit(api_url)
         if parsed.scheme not in {"https", "http"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("Tushare API 地址必须是无凭据、无查询参数的 HTTP(S) 接口地址")
+        protocol = str(protocol or "auto").strip().lower()
+        if protocol not in TUSHARE_PROTOCOLS:
+            raise ValueError(f"不支持的 Tushare 接口写法: {protocol}")
         self._token = token
         self._url = api_url
+        self._protocol = protocol
         self._session = session or requests.Session()
         # Configuring one provider must not change QMT/other providers' proxies.
         self._session.trust_env = False
@@ -93,35 +116,90 @@ class TushareHTTPClient:
     def close(self):
         self._session.close()
 
-    def query(self, api_name: str, **params) -> pd.DataFrame:
-        fields = params.pop("fields", "")
+    @property
+    def protocol(self) -> str:
+        """当前生效的接口写法；auto 尚未识别时按官方写法。"""
+        if self._protocol != "auto":
+            return self._protocol
+        return _DETECTED_PROTOCOL.get(self._url, "official")
+
+    def _send(self, method: str, url: str, **kwargs):
+        sender = self._session.post if method == "POST" else self._session.get
         try:
-            response = self._session.post(
-                self._url,
-                json={"api_name": api_name, "token": self._token, "params": params, "fields": fields},
-                headers={"Accept-Encoding": "gzip"}, timeout=(8, 35), allow_redirects=False,
-            )
+            return sender(url, timeout=(8, 35), allow_redirects=False, **kwargs)
         except requests.RequestException as exc:
             code = network_error_code(exc)
             raise TushareProtocolError(safe_text(exc, self._token), code,
                                        retryable=code != "NETWORK_ACCESS_DENIED") from None
+
+    def _http_error(self, api_name: str, response) -> TushareProtocolError:
         status = int(response.status_code)
-        if status != 200:
-            detail = ""
-            try:
-                body = response.json()
-                if isinstance(body, dict):
-                    detail = safe_text(body.get("msg", ""), self._token)[:300]
-            except ValueError:
-                pass
-            raise TushareProtocolError(
-                f"Tushare {api_name}: HTTP {status}" + (f" ({detail})" if detail else ""), f"HTTP_{status}",
-                retryable=status in {408, 429, 500, 502, 503, 504},
+        detail = ""
+        try:
+            body = response.json()
+            if isinstance(body, dict):
+                detail = safe_text(body.get("msg") or body.get("message") or body.get("error") or "", self._token)[:300]
+        except ValueError:
+            pass
+        return TushareProtocolError(
+            f"Tushare {api_name}: HTTP {status}" + (f" ({detail})" if detail else ""), f"HTTP_{status}",
+            retryable=status in {408, 429, 500, 502, 503, 504} or _is_transient_business_error(detail),
+        )
+
+    def query(self, api_name: str, **params) -> pd.DataFrame:
+        fields = params.pop("fields", "")
+        if self.protocol == "official":
+            response = self._send(
+                "POST", self._url,
+                json={"api_name": api_name, "token": self._token, "params": params, "fields": fields},
+                headers={"Accept-Encoding": "gzip"},
             )
+            status = int(response.status_code)
+            if status in {404, 405} and self._protocol == "auto":
+                # 地址不认官方写法：按服务商的「地址/接口名 + 请求头 Key」写法重发同一请求。
+                _DETECTED_PROTOCOL[self._url] = "gateway"
+                return self._query_gateway(api_name, params, fields)
+            if status != 200:
+                raise self._http_error(api_name, response)
+            if self._protocol == "auto":
+                _DETECTED_PROTOCOL.setdefault(self._url, "official")
+            return self._parse_response(api_name, response)
+        return self._query_gateway(api_name, params, fields)
+
+    def _query_gateway(self, api_name: str, params: dict, fields) -> pd.DataFrame:
+        query = {key: value for key, value in params.items() if value is not None}
+        if fields:
+            query["fields"] = fields
+        response = self._send(
+            "GET", f"{self._url.rstrip('/')}/{api_name}", params=query,
+            headers={GATEWAY_KEY_HEADER: self._token, "Accept-Encoding": "gzip"},
+        )
+        if int(response.status_code) != 200:
+            raise self._http_error(api_name, response)
+        return self._parse_response(api_name, response)
+
+    def _parse_response(self, api_name: str, response) -> pd.DataFrame:
         try:
             payload = response.json()
         except ValueError:
             raise TushareProtocolError(f"Tushare {api_name}: 返回非 JSON 数据", "INVALID_RESPONSE") from None
+        if isinstance(payload, dict) and "code" not in payload and "ok" in payload:
+            # 服务商写法：{ok, data, message/error}；data 为 {fields, items} 或记录列表。
+            if payload.get("ok") is not True:
+                message = payload.get("message") or payload.get("msg") or payload.get("error") or "服务返回失败"
+                message = safe_text(message, self._token)
+                raise TushareProtocolError(f"Tushare {api_name}: {message}", "API_ERROR",
+                                           retryable=_is_transient_business_error(message))
+            payload = {"code": 0, "msg": "", **{k: v for k, v in payload.items() if k not in {"ok", "code"}}}
+            data = payload.get("data")
+            if isinstance(data, list) and all(isinstance(row, dict) for row in data):
+                columns = list(dict.fromkeys(key for row in data for key in row))
+                payload["data"] = {"fields": columns, "items": [[row.get(c) for c in columns] for row in data]}
+            elif isinstance(data, dict) and isinstance(data.get("items"), list) and data["items"] \
+                    and all(isinstance(row, dict) for row in data["items"]) and not isinstance(data.get("fields"), list):
+                columns = list(dict.fromkeys(key for row in data["items"] for key in row))
+                payload["data"] = {**data, "fields": columns,
+                                   "items": [[row.get(c) for c in columns] for row in data["items"]]}
         if (not isinstance(payload, dict) or isinstance(payload.get("code"), bool)
                 or payload.get("code") not in (0, "0")):
             message = payload.get("msg", "响应缺少成功 code") if isinstance(payload, dict) else "响应不是对象"
@@ -130,8 +208,10 @@ class TushareHTTPClient:
             api_code = api_code if isinstance(api_code, (int, str)) and not isinstance(api_code, bool) else None
             if isinstance(api_code, str):
                 api_code = safe_text(api_code, self._token)[:100]
-            raise TushareProtocolError(f"Tushare {api_name}: {safe_text(message, self._token)}",
-                                       "API_ERROR", api_code=api_code)
+            message = safe_text(message, self._token)
+            raise TushareProtocolError(f"Tushare {api_name}: {message}",
+                                       "API_ERROR", api_code=api_code,
+                                       retryable=_is_transient_business_error(message))
         data = payload.get("data")
         if not isinstance(data, dict) or not isinstance(data.get("fields"), list) or not isinstance(data.get("items"), list):
             raise TushareProtocolError(f"Tushare {api_name}: 缺少 fields/items", "INVALID_RESPONSE")

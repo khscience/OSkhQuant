@@ -535,6 +535,14 @@ class TushareImportThread(QThread):
                         raise _AbortImport("任务已停止")
                     download_specs = self._plan_download_specs(raw_plan, period)
                     plan_expected_dates = raw_plan.expected_dates
+                    legacy_dates = tuple(getattr(raw_plan, "legacy_label_dates", ()) or ())
+                    if legacy_dates:
+                        self.log.emit(
+                            f"[{completed + 1}/{total}] [提示] {stock_code} {period} 有 "
+                            f"{len(legacy_dates)} 个交易日是按开始时间标注的旧分钟数据"
+                            f"（{legacy_dates[0]} ~ {legacy_dates[-1]}），本次不重新下载；"
+                            "如需统一为收盘时刻标注，请勾选「强制覆写已有数据」重新下载这段时间"
+                        )
                     if do_front or do_back:
                         adjustment_plan = self._run_lockable(
                             lambda: self._get_incremental_plan(

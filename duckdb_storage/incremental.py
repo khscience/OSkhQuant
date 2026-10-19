@@ -44,35 +44,41 @@ EXPECTED_BARS_PER_DAY = {
 # Tushare 官方 5 分钟线每天比 BaoStock/QMT 多一根 09:30（开盘集合竞价）K 线，
 # 共 49 根；不含这一根时为 48 根。两种口径都算完整日，导入时原样保存，
 # 不合并、不删除这一根，避免改写数据源原始行情。
-OPENING_AUCTION_BAR_PERIODS = frozenset({"5m"})
+# 1 分钟线标准 241 根含 09:30 一根；部分服务商不给这一根（统一为收盘时刻标注后是
+# 09:31…15:00 共 240 根），同样算完整日。
+OPENING_AUCTION_BAR_PERIODS = frozenset({"5m", "1m"})
 OPENING_AUCTION_TIME = "09:30:00"
+# 按开始时间标注的旧分钟数据特征：出现 13:00 这一根（收盘时刻标注的午后第一根是 13:01/13:05）。
+START_LABEL_MARKER_TIME = "13:00:00"
 
 
 def is_complete_bar_day(
     period: object,
     total_rows: int,
     valid_rows: int,
-    opening_rows: int = 0,
-    opening_valid_rows: int = 0,
+    opening_rows: Optional[int] = None,
+    opening_valid_rows: Optional[int] = None,
 ) -> bool:
     """K 线单日是否完整：唯一时间戳数恰为标准根数且全部有效。
 
-    5m 另外接受“标准根数 + 09:30 集合竞价一根”（Tushare 口径）。
-    ``opening_rows``/``opening_valid_rows`` 是当天 09:30 的唯一时间戳数
-    和其中字段完整的数量；旧的完整度接口不提供时按 0 处理，判断与原来一致。
+    5m 另外接受“48 根 + 09:30 集合竞价一根”（Tushare 官方口径，共 49 根）；
+    1m 另外接受“没有 09:30 那一根的 240 根”。``opening_rows``/``opening_valid_rows``
+    是当天 09:30 的唯一时间戳数和其中字段完整的数量；为 None（旧完整度接口未提供）
+    时只按标准根数判断，与原来一致。
     """
 
     period_value = _period_text(period)
     expected = EXPECTED_BARS_PER_DAY[period_value]
     if total_rows == expected and valid_rows == expected:
         return True
-    return (
-        period_value in OPENING_AUCTION_BAR_PERIODS
-        and int(opening_rows or 0) == 1
-        and int(opening_valid_rows or 0) == 1
-        and total_rows == expected + 1
-        and valid_rows == expected + 1
-    )
+    if opening_rows is None or period_value not in OPENING_AUCTION_BAR_PERIODS:
+        return False
+    opening_rows = int(opening_rows or 0)
+    opening_valid_rows = int(opening_valid_rows or 0)
+    if period_value == "5m":
+        return (opening_rows == 1 and opening_valid_rows == 1
+                and total_rows == expected + 1 and valid_rows == expected + 1)
+    return opening_rows == 0 and total_rows == expected - 1 and valid_rows == expected - 1
 
 
 def market_time_keys(values):
@@ -147,6 +153,9 @@ class IncrementalPlan:
     # 而是明确排除，避免每次扫描都生成一批必然失败的任务。默认值让旧
     # 的七字段手工构造保持完全兼容。
     ignored_retention_dates: Tuple[str, ...] = ()
+    # 按开始时间标注存进库的旧分钟数据（当天有 13:00 那一根）。不重新下载，也不把新数据
+    # 合并进同一天，避免两种标注混在一天里；需要统一时由用户勾选强制覆写整段重下。
+    legacy_label_dates: Tuple[str, ...] = ()
 
     @property
     def needs_download(self) -> bool:
@@ -650,7 +659,7 @@ def validate_overwrite_frame(
                 and allowed_rows == expected_rows
                 and period_value in OPENING_AUCTION_BAR_PERIODS
             ):
-                # Tushare 5m 含 09:30 集合竞价一根，共 49 根，同样是完整日。
+                # Tushare 5m 含 09:30 集合竞价一根共 49 根；1m 没有 09:30 那一根共 240 根，同样是完整日。
                 opening = group["_opening"]
                 incomplete = not is_complete_bar_day(
                     period_value,
@@ -989,20 +998,27 @@ def build_incremental_plan(
     missing = []
     partial = []
     anomalous = []
+    legacy_label = []
     for date8 in expected:
         stats = coverage.get(date8) or {}
         total_rows = int(stats.get("total_rows", 0) or 0)
         valid_rows = int(stats.get("valid_rows", 0) or 0)
+        if period_value in ("1m", "5m") and int(stats.get("start_label_rows", 0) or 0) > 0:
+            # 按开始时间标注的旧数据：不重新下载、不往这一天合并新标注的行。
+            legacy_label.append(date8)
+            complete.append(date8)
+            continue
         if period_value == "tick":
             is_complete = (
                 total_rows >= expected_bars and valid_rows >= expected_bars
             )
         else:
+            opening_rows = stats.get("opening_rows")
             is_complete = is_complete_bar_day(
                 period_value,
                 total_rows,
                 valid_rows,
-                int(stats.get("opening_rows", 0) or 0),
+                None if opening_rows is None else int(opening_rows or 0),
                 int(stats.get("opening_valid_rows", 0) or 0),
             )
         if is_complete:
@@ -1040,6 +1056,7 @@ def build_incremental_plan(
         ignored_open_dates=ignored_open,
         anomalous_dates=tuple(anomalous),
         ignored_retention_dates=tuple(ignored_retention),
+        legacy_label_dates=tuple(legacy_label),
     )
 
 

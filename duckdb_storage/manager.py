@@ -2393,6 +2393,8 @@ class DuckDBManager:
                     if column not in schema_columns
                 ]
                 opening_expr = "strftime(time, '%H:%M:%S') = '09:30:00'"
+                start_label_expr = "strftime(time, '%H:%M:%S') = '13:00:00'"
+                intraday = period_value in ('1m', '5m')
                 if requested_columns and not missing_schema:
                     valid_expr = " AND ".join(
                         (
@@ -2414,7 +2416,7 @@ class DuckDBManager:
                     opening_valid_sql = (
                         f"COUNT(DISTINCT CASE WHEN {opening_expr} AND {valid_expr} "
                         "THEN time END)"
-                    ) if period_value == '5m' else "0"
+                    ) if intraday else "0"
                 elif requested_columns:
                     valid_count_sql = "0"
                     opening_valid_sql = "0"
@@ -2422,12 +2424,16 @@ class DuckDBManager:
                     valid_count_sql = "COUNT(DISTINCT time)"
                     opening_valid_sql = (
                         f"COUNT(DISTINCT CASE WHEN {opening_expr} THEN time END)"
-                    ) if period_value == '5m' else "0"
-                # Tushare 5m 每天多一根 09:30 集合竞价 K 线（共 49 根）。单独统计
-                # 这一根，供 incremental.is_complete_bar_day 判断是否仍是完整日。
+                    ) if intraday else "0"
+                # Tushare 5m 每天多一根 09:30 集合竞价 K 线（共 49 根），部分服务商 1m 没有
+                # 09:30 那一根（共 240 根）。单独统计这一根，供 incremental.is_complete_bar_day
+                # 判断；13:00 那一根是按开始时间标注的旧分钟数据特征，供增量规划识别。
                 opening_count_sql = (
                     f"COUNT(DISTINCT CASE WHEN {opening_expr} THEN time END)"
-                ) if period_value == '5m' else "0"
+                ) if intraday else "0"
+                start_label_sql = (
+                    f"COUNT(DISTINCT CASE WHEN {start_label_expr} THEN time END)"
+                ) if intraday else "0"
 
                 where_parts = ["time IS NOT NULL"]
                 params = []
@@ -2443,22 +2449,24 @@ class DuckDBManager:
                            COUNT(DISTINCT time) AS total_rows,
                            {valid_count_sql} AS valid_rows,
                            {opening_count_sql} AS opening_rows,
-                           {opening_valid_sql} AS opening_valid_rows
+                           {opening_valid_sql} AS opening_valid_rows,
+                           {start_label_sql} AS start_label_rows
                     FROM {table_name}
                     WHERE {where_sql}
                     GROUP BY 1
                 """, params).fetchall()
                 result = {}
-                for date_value, total_rows, valid_rows, opening_rows, opening_valid_rows in rows:
+                for date_value, total_rows, valid_rows, opening_rows, opening_valid_rows, start_label_rows in rows:
                     if not date_value:
                         continue
                     stats = {
                         'total_rows': int(total_rows or 0),
                         'valid_rows': int(valid_rows or 0),
                     }
-                    if period_value == '5m':
+                    if intraday:
                         stats['opening_rows'] = int(opening_rows or 0)
                         stats['opening_valid_rows'] = int(opening_valid_rows or 0)
+                        stats['start_label_rows'] = int(start_label_rows or 0)
                     result[str(date_value)] = stats
                 return result
         except Exception as exc:

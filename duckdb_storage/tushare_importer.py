@@ -22,6 +22,7 @@ import os
 import datetime
 import logging
 import math
+import re
 import time
 
 import pandas as pd
@@ -60,6 +61,55 @@ _DAILY_TIME_OFFSET = pd.Timedelta(hours=9, minutes=30)
 _BARS_PER_DAY: dict = {
     "1min": 241, "5min": 49, "15min": 17, "30min": 9, "60min": 5,
 }
+
+_FREQ_MINUTES: dict = {"1min": 1, "5min": 5, "15min": 15, "30min": 30, "60min": 60}
+
+
+def align_minute_labels_to_bar_end(times: pd.Series, freq: str) -> tuple:
+    """把按开始时间标注的分钟线改成按结束时间（收盘时刻）标注，返回 (新时间, 改动的交易日数)。
+
+    本平台约定 K 线时间是这根 K 线的收盘时刻（BaoStock/QMT/Tushare 官方：5 分钟 09:35…11:30、
+    13:05…15:00）。部分服务商按开始时间标注（09:30…11:25、13:00…14:55），直接回测相当于
+    提前一根看到收盘价。逐交易日判断：出现 13:00 这一根（结束标注的午后第一根是 13:01/13:05，
+    不会是 13:00），或当天没有 11:30 和 15:00、却有它们的前一根，即视为开始标注，整天加一个周期。
+    结束标注的数据（含官方 09:30 集合竞价一根）保持不变。
+    """
+    minutes = _FREQ_MINUTES.get(str(freq or "").strip().lower())
+    if not minutes or times is None or times.empty:
+        return times, 0
+    step = pd.Timedelta(minutes=minutes)
+    morning_prior = (datetime.datetime(2000, 1, 1, 11, 30) - step).strftime("%H:%M")
+    close_prior = (datetime.datetime(2000, 1, 1, 15, 0) - step).strftime("%H:%M")
+    clock = times.dt.strftime("%H:%M")
+    result = times.copy()
+    shifted_days = 0
+    for _day, index in times.groupby(times.dt.normalize()).groups.items():
+        present = set(clock.loc[index])
+        start_labeled = "13:00" in present or (
+            "11:30" not in present and "15:00" not in present
+            and morning_prior in present and close_prior in present
+        )
+        if start_labeled:
+            result.loc[index] = times.loc[index] + step
+            shifted_days += 1
+    return result, shifted_days
+
+
+def _align_minute_frame(frame: pd.DataFrame, freq: str, ts_code: str = "") -> pd.DataFrame:
+    """下载入口用：统一分钟线时间标注，并保留各批次已有的属性。"""
+    if frame is None or frame.empty or "time" not in frame.columns:
+        return frame
+    aligned, shifted_days = align_minute_labels_to_bar_end(frame["time"], freq)
+    if not shifted_days:
+        return frame
+    frame = frame.copy()
+    frame["time"] = aligned
+    if frame["time"].duplicated().any():
+        raise TushareAPIError("DATA_QUALITY: 分钟线改为收盘时刻标注后出现重复时间")
+    frame.attrs["minute_label_shifted_days"] = shifted_days
+    logger.info(f"[download_minutes] {ts_code} {freq} 有 {shifted_days} 个交易日按开始时间标注，"
+                "已统一为收盘时刻标注")
+    return frame.sort_values("time").reset_index(drop=True)
 
 # 官方 fund_adj 单次最多 2000 行，并明确支持 offset/limit 分页。
 # 股票 adj_factor 官方说明单只股票可一次提取全部历史，因此不额外放大请求量；
@@ -312,6 +362,10 @@ class TushareImporter:
                     break
 
                 delay = base_delay * (2 ** (attempt - 1))
+                # 服务商在错误里给出建议等待秒数（如「建议等待30秒后重试」）时照做，最多 60 秒。
+                suggested = re.search(r"等待\s*(\d+(?:\.\d+)?)\s*秒", safe_error)
+                if suggested and base_delay > 0:
+                    delay = max(delay, min(float(suggested.group(1)), 60.0))
                 logger.warning(
                     f"tushare [{method_name}] 临时失败，第 {attempt}/{attempts} 次: {safe_error}; "
                     f"{delay:.1f} 秒后重试"
@@ -667,10 +721,10 @@ class TushareImporter:
             t_end   = datetime.datetime.strptime(end_date[:19],   "%Y-%m-%d %H:%M:%S")
         except ValueError:
             logger.warning(f"[download_minutes] 日期格式错误: {start_date} ~ {end_date}，单次请求")
-            return self._normalize_minutes(
+            return _align_minute_frame(self._normalize_minutes(
                 self._call(method, ts_code=ts_code, freq=freq,
                            start_date=start_date, end_date=end_date)
-            )
+            ), freq, ts_code)
 
         if t_start > t_end:
             logger.warning(f"[download_minutes] {ts_code}: start > end，返回空")
@@ -685,7 +739,7 @@ class TushareImporter:
             df_chunk = self._call(method, ts_code=ts_code, freq=freq,
                                   start_date=s, end_date=e)
             if df_chunk is not None and not df_chunk.empty:
-                chunks.append(self._normalize_minutes(df_chunk))
+                chunks.append(_align_minute_frame(self._normalize_minutes(df_chunk), freq, ts_code))
 
         return self._merge_chunks(chunks, time_col="time")
 

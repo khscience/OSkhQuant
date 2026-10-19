@@ -235,6 +235,7 @@ def test_manager_reports_auction_bar_so_incremental_plan_is_up_to_date(manager):
     )
     assert coverage[DAY8] == {
         "total_rows": 49, "valid_rows": 49, "opening_rows": 1, "opening_valid_rows": 1,
+        "start_label_rows": 0,
     }
     plan = build_incremental_plan(manager, STOCK, "5m", DAY8, DAY8, trade_days=[DAY8], now=NOW)
     assert plan.complete_dates == (DAY8,)
