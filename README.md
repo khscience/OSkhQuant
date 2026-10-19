@@ -16,7 +16,11 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/%E8%AE%B8%E5%8F%AF-CC%20BY--NC%204.0-6C757D?style=flat-square" alt="许可"></a>
   <a href="https://github.com/khscience/OSkhQuant/releases"><img src="https://img.shields.io/github/downloads/khscience/OSkhQuant/total?style=flat-square&label=%E4%B8%8B%E8%BD%BD&color=27AE60" alt="下载量"></a>
   <a href="https://github.com/khscience/OSkhQuant/stargazers"><img src="https://img.shields.io/github/stars/khscience/OSkhQuant?style=flat-square&label=Star&color=F2C94C" alt="Star"></a>
+  <a href="https://khsci.com/khQuant/"><img src="https://img.shields.io/badge/%E5%AE%98%E7%BD%91-khsci.com%2FkhQuant-E67E22?style=flat-square" alt="官网"></a>
 </p>
+
+<h3 align="center">🌐 官网：<a href="https://khsci.com/khQuant/">khsci.com/khQuant</a></h3>
+<p align="center"><sub>下载、图文与视频教程、版本对比、更新公告都在这里</sub></p>
 
 <p align="center">
   <a href="https://github.com/khscience/OSkhQuant/releases/latest"><b>⬇️ 下载安装包</b></a>
@@ -31,7 +35,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/backtest-report.png" alt="回测报告：收益曲线、回撤、每日盈亏、交易记录">
+  <img src="docs/images/main-window.png" alt="软件主界面：左侧策略与回测参数、股票池，中间触发方式与账户，右侧运行日志">
 </p>
 
 ---
@@ -114,7 +118,11 @@ def khHandlebar(data):
     return []
 ```
 
-随包附带 4 个示例策略（双均线 3 个、RSI 1 个），可以照着改。
+随包附带 4 个示例策略（双均线 3 个、RSI 1 个），可以照着改。点「开始运行」，跑完自动弹出回测报告：
+
+<p align="center">
+  <img src="docs/images/backtest-report.png" alt="回测报告：收益曲线与基准对比、回撤、每日盈亏、买卖分布、交易记录">
+</p>
 
 ## ⬇️ 下载安装
 
@@ -146,7 +154,7 @@ def khHandlebar(data):
 ## 🗂️ 数据来源
 
 <p align="center">
-  <img src="docs/images/baostock-import.png" width="520" alt="BaoStock 导入窗口">
+  <img src="docs/images/data-manager.png" alt="数据管理：本地股票列表、K 线数据查询、BaoStock 当日请求用量">
 </p>
 
 | 周期 | BaoStock（免费） | Tushare（需 Token） |
@@ -224,6 +232,7 @@ python GUIkhQuant.py
 ## 💬 反馈与交流
 
 - 遇到问题或有建议，欢迎提 Issue：[GitHub](https://github.com/khscience/OSkhQuant/issues) · [Gitee](https://gitee.com/mrkanhai/oskhquant/issues)。请附上软件版本、操作步骤和日志（`%LOCALAPPDATA%\KhQuantOS\logs\app.log`）。
+- 官网 **[khsci.com/khQuant](https://khsci.com/khQuant/)**：下载、教程、版本对比与更新公告。
 - 作者 **Mr.看海** · 微信公众号「看海的城堡」 · [知乎](https://www.zhihu.com/people/feng-zhu-38) · [B站](https://space.bilibili.com/3546667687086777)
 
 **如果这个项目对你有帮助，点个 ⭐ Star 吧**——方便你以后找到它，也能让更多人看到。
