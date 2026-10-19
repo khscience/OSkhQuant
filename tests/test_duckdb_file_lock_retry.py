@@ -61,7 +61,7 @@ def test_retry_helper_only_retries_lock_errors(monkeypatch):
     def operation():
         calls.append(1)
         if len(calls) < 3:
-            raise RuntimeError('IO Error: Cannot open file "I:\\khData\\SH\\600150.db": '
+            raise RuntimeError('IO Error: Cannot open file "D:\\KhQuantData\\SH\\600150.db": '
                                '另一个程序正在使用此文件，进程无法访问。')
         return "ok"
 
@@ -74,7 +74,7 @@ def test_retry_helper_only_retries_lock_errors(monkeypatch):
 
 def test_lock_error_parser_extracts_pid_and_path():
     exc = RuntimeError(
-        'IO Error: Cannot open file "i:\\khdata\\sh\\600150.db": 另一个程序正在使用此文件\n\n'
+        'IO Error: Cannot open file "d:\\khquantdata\\sh\\600150.db": 另一个程序正在使用此文件\n\n'
         'File is already open in \nC:\\Python311\\python.exe (PID 49916)'
     )
     assert is_duckdb_lock_error(exc)
@@ -82,7 +82,7 @@ def test_lock_error_parser_extracts_pid_and_path():
     assert info["pid"] == 49916
     assert info["stock"] == "600150.SH"
     assert info["period"] == "1d"
-    assert info["db_path"].lower().endswith(r"khdata\sh\600150.db")
+    assert info["db_path"].lower().endswith(r"khquantdata\sh\600150.db")
     assert info["process"] == r"C:\Python311\python.exe"
 
 

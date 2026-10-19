@@ -65,7 +65,7 @@ def test_database_related_process_filter(pid, name, command, expected):
             name=name,
             executable=command[0],
             command_line=command,
-            data_root=r"I:\khData",
+            data_root=r"D:\KhQuantData",
             gui_pid=100,
         )
         is expected
