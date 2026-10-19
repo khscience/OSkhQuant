@@ -1,0 +1,61 @@
+name: 同步代码到 Gitee
+
+# GitHub main 推送后，手动运行本流程，把 main 和 V 开头的版本标签同步到 Gitee 同名仓库。
+# 复用仓库 Secrets 里的 GITEE_TOKEN（Gitee 私人令牌）；只做快进推送，从不强推：
+# Gitee 上有 GitHub 没有的提交、或同名标签指向不同提交时直接失败，交给人工处理。
+on:
+  workflow_dispatch:
+    inputs:
+      push_tags:
+        description: "同时同步 V 开头的版本标签"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitee-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      GITEE_REPO: mrkanhai/oskhquant
+      GITEE_USER: mrkanhai
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: 检查令牌
+        run: |
+          if [ -z "$GITEE_TOKEN" ]; then echo "没有配置 GITEE_TOKEN"; exit 1; fi
+      - name: 核对 Gitee main 能否快进
+        run: |
+          git remote add gitee "https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
+          git fetch --no-tags gitee main
+          remote=$(git rev-parse FETCH_HEAD)
+          local=$(git rev-parse HEAD)
+          echo "GitHub main: $local"
+          echo "Gitee  main: $remote"
+          if [ "$remote" = "$local" ]; then echo "Gitee main 已是最新"; exit 0; fi
+          if ! git merge-base --is-ancestor "$remote" "$local"; then
+            echo "Gitee main 上有 GitHub main 没有的提交，不能快进，停止（不会强推）"
+            exit 1
+          fi
+      - name: 推送 main
+        run: git push gitee HEAD:refs/heads/main
+      - name: 推送版本标签
+        if: ${{ inputs.push_tags }}
+        run: |
+          tags=$(git tag --list 'V*')
+          if [ -z "$tags" ]; then echo "没有 V 开头的标签"; exit 0; fi
+          # 不带 --force：Gitee 上已有同名同提交的标签会跳过，指向不同提交的会报错停止。
+          git push gitee $(printf 'refs/tags/%s ' $tags)
+      - name: 回读
+        run: |
+          git ls-remote gitee refs/heads/main
+          git ls-remote --tags gitee 'refs/tags/V*' | tail -5
